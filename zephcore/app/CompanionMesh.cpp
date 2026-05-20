@@ -2365,7 +2365,11 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			// Self-telemetry request: return battery, GPS, and environment data
 			// Format: Cayenne LPP: [channel][type][data...]
 			// Response: [PUSH_CODE_TELEMETRY_RESPONSE][reserved][6-byte pubkey][telemetry_data]
-			uint8_t rsp[96];  // header(8)+batt(4)+gps(11)+env(11)+pwr(36)=70 worst case
+			// Worst-case size tracks POWER_MAX_CHANNELS so a future bump can't
+			// silently overflow this stack buffer. With current value 4:
+			// header(8) + batt(4) + gps(11) + env(temp4+hum3+press4=11)
+			// + power(POWER_MAX_CHANNELS * 12 = 48) + 8 byte safety pad = 90.
+			uint8_t rsp[8 + 4 + 11 + 11 + (12 * POWER_MAX_CHANNELS) + 8];
 			int i = 0;
 			rsp[i++] = PUSH_CODE_TELEMETRY_RESPONSE;
 			rsp[i++] = 0;  // reserved
@@ -2615,19 +2619,37 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 		// Format: [PACKET_CUSTOM_VARS][key1:val1,key2:val2,...]
 		uint8_t rsp[64];
 		char *dp = (char *)&rsp[1];
+		char *const rsp_end = (char *)&rsp[sizeof(rsp)];
 		rsp[0] = PACKET_CUSTOM_VARS;
 
-		// GPS settings
+		// snprintf returns the would-be length, NOT bytes actually written.
+		// We must check truncation and only advance dp on real progress —
+		// otherwise dp can outrun the initialized portion of rsp and
+		// writeFrame(rsp, dp-rsp) leaks adjacent stack to the phone.
+
 		bool first = true;
 		if (gps_is_available()) {
-			dp += snprintf(dp, 20, "gps:%d", gps_is_enabled() ? 1 : 0);
-			first = false;
+			size_t remaining = (size_t)(rsp_end - dp);
+			int n = snprintf(dp, remaining, "gps:%d", gps_is_enabled() ? 1 : 0);
+			if (n > 0 && (size_t)n < remaining) {
+				dp += n;
+				first = false;
+			}
 		}
 		uint32_t gps_interval = gps_get_poll_interval_sec();
 		if (gps_interval > 0) {
-			if (!first) *dp++ = ',';
-			dp += snprintf(dp, 20, "gps_interval:%u", gps_interval);
-			first = false;
+			size_t remaining = (size_t)(rsp_end - dp);
+			// Reserve 1 byte for the leading ',' if needed
+			if (!first && remaining > 0) {
+				*dp++ = ',';
+				remaining--;
+			}
+			int n = snprintf(dp, remaining, "gps_interval:%u", (unsigned)gps_interval);
+			if (n > 0 && (size_t)n < remaining) {
+				dp += n;
+			}
+			// If snprintf would have truncated, dp stays put — writeFrame
+			// sends only what we successfully wrote.
 		}
 		// Note: Environment sensors are auto-detected, no settings needed
 
