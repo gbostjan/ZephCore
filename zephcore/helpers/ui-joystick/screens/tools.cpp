@@ -67,28 +67,27 @@ bool ToolsScreen::handleInput(char key)
 	return false;
 }
 
-#define REPEATER_SCAN_WINDOW_MS   30000
+#define REPEATER_SCAN_WINDOW_MS   30000   /* duration of "scanning..." indicator */
+#define REPEATER_RESCAN_AFTER_MS  60000   /* auto re-scan on entry if last scan is older than this */
 
 static const int RMODE_LIST = 0;
 static const int RMODE_MODAL = 1;
 
 /* Statically allocated scan state shared across the one screen instance */
-static uint32_t s_scan_until;
-static bool s_scan_sent;
+static uint32_t s_scan_until;    /* k_uptime_get_32() when the "scanning..." window ends */
+static uint32_t s_last_scan_ms;  /* k_uptime_get_32() of last scan (0 = never scanned) */
 
 RepeatersScreen::RepeatersScreen(JoystickUITask *task, mesh::RTCClock *rtc)
 	: _task(task), _rtc(rtc), _selected(0),
 	  _mode(RMODE_LIST), _last_sel(-1), _marquee_start_ms(0), _modal_idx(0)
 {
-	s_scan_until = 0; s_scan_sent = false;
+	s_scan_until = 0; s_last_scan_ms = 0;
 }
 
-void RepeatersScreen::onEnter()
+void RepeatersScreen::doScan()
 {
-	/* One-shot discover per device boot — guarded by s_scan_sent. */
-	if (s_scan_sent) return;
-	s_scan_sent = true;
-	s_scan_until = k_uptime_get_32() + REPEATER_SCAN_WINDOW_MS;
+	s_last_scan_ms = k_uptime_get_32();
+	s_scan_until = s_last_scan_ms + REPEATER_SCAN_WINDOW_MS;
 	_task->clearDiscoverSignals();
 
 	uint8_t data[10];
@@ -102,6 +101,15 @@ void RepeatersScreen::onEnter()
 	if (pkt) {
 		_task->getMesh()->sendZeroHop(pkt);
 		ui_signal_tx();
+	}
+}
+
+void RepeatersScreen::onEnter()
+{
+	/* Re-scan on entry if we've never scanned, or the last scan is stale. */
+	uint32_t now = k_uptime_get_32();
+	if (s_last_scan_ms == 0 || (now - s_last_scan_ms) >= REPEATER_RESCAN_AFTER_MS) {
+		doScan();
 	}
 }
 
@@ -253,7 +261,8 @@ bool RepeatersScreen::handleInput(char c)
 		return true;
 	}
 	if (c == KEY_ENTER_LONG) {
-		s_scan_sent = false; s_scan_until = 0; _selected = 0;
+		_selected = 0;
+		doScan();
 		_task->showAlert("Rescanning...", 800);
 		return true;
 	}

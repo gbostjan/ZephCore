@@ -177,6 +177,8 @@ class RepeatersScreen : public UIScreen {
 	int _last_sel;
 	uint32_t _marquee_start_ms;
 	int _modal_idx;
+
+	void doScan();
 public:
 	RepeatersScreen(JoystickUITask *task, mesh::RTCClock *rtc);
 	int render(JoystickDisplay &display) override;
