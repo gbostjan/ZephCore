@@ -788,6 +788,18 @@ void CompanionMesh::queueLocalSentContactMessage(const ContactInfo &contact,
 	frame[i++] = TXT_TYPE_PLAIN;
 	put_le32(&frame[i], timestamp);
 	i += 4;
+
+	/* DM wire-text has no sender prefix (the sender is the pubkey field).
+	 * For local-sent mirrors the phone app would otherwise show them as a
+	 * message *from* the contact, indistinguishable from incoming. Prepend
+	 * a visible marker so the user can see at a glance which side sent it.
+	 * "(>>) " matches the joystick UI's own sent indicator in addPreview(). */
+	static const char kSentMarker[] = "(>>) ";
+	size_t marker_len = sizeof(kSentMarker) - 1;
+	if (i + marker_len <= sizeof(frame)) {
+		memcpy(&frame[i], kSentMarker, marker_len);
+		i += marker_len;
+	}
 	size_t text_len = strlen(text);
 	if (i + text_len > sizeof(frame)) {
 		text_len = sizeof(frame) - i;
@@ -820,6 +832,16 @@ void CompanionMesh::queueLocalSentChannelMessage(uint8_t channel_idx,
 	frame[i++] = TXT_TYPE_PLAIN;
 	put_le32(&frame[i], timestamp);
 	i += 4;
+
+	/* Channel wire-text is "<sender_name>: <body>" — the same prefix that
+	 * BaseChatMesh::sendGroupMessage applied before transmitting over LoRa.
+	 * The phone app parses up to the first ':' as the sender, the rest as
+	 * the body, so we need to mirror that format here or the message
+	 * shows up empty with the sender slot empty too. */
+	int n = snprintf((char *)&frame[i], sizeof(frame) - i, "%s: ", prefs.node_name);
+	if (n < 0) n = 0;
+	if ((size_t)n > sizeof(frame) - i) n = sizeof(frame) - i;
+	i += n;
 	size_t text_len = strlen(text);
 	if (i + text_len > sizeof(frame)) {
 		text_len = sizeof(frame) - i;
