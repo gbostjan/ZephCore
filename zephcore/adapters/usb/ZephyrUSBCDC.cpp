@@ -134,6 +134,20 @@ static void usbd_msg_callback(struct usbd_context *const ctx,
 		if (s_dtr_cb) {
 			s_dtr_cb(dtr_now);
 		}
+	} else if (msg->type == USBD_MSG_VBUS_REMOVED) {
+		/* Physical unplug — VBUS lost.  On a device-side cable yank the
+		 * host often never sends a clean DTR=0 line-state change, so the
+		 * CONTROL_LINE_STATE release above won't fire and the companion
+		 * would stay stuck on the USB interface (rejecting every BLE
+		 * connection until reboot).  Treat VBUS loss as a DTR drop so the
+		 * interface is handed back to BLE. */
+		LOG_INF("CDC ACM: VBUS removed (device unplug)");
+		if (s_dtr_active) {
+			s_dtr_active = false;
+			if (s_dtr_cb) {
+				s_dtr_cb(false);
+			}
+		}
 	}
 }
 
