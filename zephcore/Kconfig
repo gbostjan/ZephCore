@@ -51,6 +51,17 @@ source "$(ZEPHYR_BASE)/subsys/logging/Kconfig.template.log_config"
 
 menu "ZephCore"
 
+config ZEPHCORE_RESET_ON_FATAL_ERROR
+	bool "Reboot on fatal error"
+	default y
+	help
+	  Cold-reboot instead of halting when a fatal error occurs (CPU
+	  exception, stack overflow, k_panic, kernel oops).  Production default;
+	  turn it off (boards/common/debug.conf does) so a debugger can inspect
+	  the halted core.  Implemented via a k_sys_fatal_error_handler()
+	  override in helpers/fatal_reboot.c — Zephyr has no built-in Kconfig
+	  for this.
+
 menu "Device Role"
 
 choice ZEPHCORE_ROLE
@@ -65,6 +76,25 @@ config ZEPHCORE_ROLE_COMPANION
 	help
 	  BLE companion device that connects to ZephCore mobile app.
 	  Includes BLE stack, contact management, offline queue, channels.
+
+config ZEPHCORE_ROLE_REPEATER
+	bool "Repeater"
+	help
+	  LoRa mesh repeater with USB serial CLI interface.
+	  No BLE stack. Has ACL authentication, region filtering,
+	  neighbor tracking, and full CLI command set.
+
+config ZEPHCORE_ROLE_OBSERVER
+	bool "Observer (listen-only, WiFi+MQTT)"
+	help
+	  ESP32-only listen-only node. Receives LoRa packets without
+	  forwarding. Connects to WiFi (STA mode) and publishes received
+	  packets to an MQTT broker in meshcoretomqtt-compatible format.
+	  All parameters (WiFi SSID/PSK, MQTT host/port/TLS/user/pass,
+	  IATA location code) are configured at runtime via serial CLI
+	  and stored in LittleFS. No BLE, no advertising, no routing.
+
+endchoice
 
 config ZEPHCORE_COMPANION_USB
 	bool "Enable USB CDC companion transport"
@@ -86,25 +116,6 @@ config ZEPHCORE_COMPANION_USB
 
 	  For ESP32-S3 boards, USB_DEVICE_STACK_NEXT must be enabled first via
 	  boards/common/esp32s3_usb.conf before this becomes active.
-
-config ZEPHCORE_ROLE_REPEATER
-	bool "Repeater"
-	help
-	  LoRa mesh repeater with USB serial CLI interface.
-	  No BLE stack. Has ACL authentication, region filtering,
-	  neighbor tracking, and full CLI command set.
-
-config ZEPHCORE_ROLE_OBSERVER
-	bool "Observer (listen-only, WiFi+MQTT)"
-	help
-	  ESP32-only listen-only node. Receives LoRa packets without
-	  forwarding. Connects to WiFi (STA mode) and publishes received
-	  packets to an MQTT broker in meshcoretomqtt-compatible format.
-	  All parameters (WiFi SSID/PSK, MQTT host/port/TLS/user/pass,
-	  IATA location code) are configured at runtime via serial CLI
-	  and stored in LittleFS. No BLE, no advertising, no routing.
-
-endchoice
 
 if ZEPHCORE_ROLE_REPEATER
 

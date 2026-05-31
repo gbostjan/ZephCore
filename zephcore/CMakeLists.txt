@@ -422,6 +422,7 @@ target_sources(app PRIVATE
   adapters/sensors/ZephyrEnvSensors.cpp
   helpers/AdvertDataHelpers.cpp
   helpers/oled_power.c
+  helpers/fatal_reboot.c
 )
 
 # ========== Radio Driver Selection ==========
@@ -555,9 +556,13 @@ else()
   target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/adapters/transport
   )
-  # USB CDC companion transport (only in debug builds with logging).
+  # USB CDC companion transport.  Compiled whenever logging is on (USB can
+  # double as the log backend) OR the standalone companion-over-USB feature is
+  # enabled — this MUST match the ZEPHCORE_USB_STACK guard in main_companion.cpp
+  # (CONFIG_LOG || CONFIG_ZEPHCORE_COMPANION_USB), otherwise the call sites
+  # compile but the implementation is never linked (undefined references).
   # Pulls in the shared ZephyrUSBCDC module too (USBD lifecycle + DTR callback).
-  if(CONFIG_LOG)
+  if(CONFIG_LOG OR CONFIG_ZEPHCORE_COMPANION_USB)
     target_sources(app PRIVATE
       adapters/usb/ZephyrCompanionUSB.cpp
     )
