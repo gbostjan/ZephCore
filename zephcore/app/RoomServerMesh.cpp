@@ -39,20 +39,6 @@ static inline mesh::LoRaRadioBase& getRadioDriver(mesh::Radio* radio) {
     return *static_cast<mesh::LoRaRadioBase*>(radio);
 }
 
-/* Simple sort helper since <algorithm> is not available in Zephyr minimal C++ */
-template<typename T, typename Comparator>
-static void simple_sort(T* arr, int count, Comparator cmp) {
-    for (int i = 0; i < count - 1; i++) {
-        for (int j = i + 1; j < count; j++) {
-            if (cmp(arr[j], arr[i])) {
-                T temp = arr[i];
-                arr[i] = arr[j];
-                arr[j] = temp;
-            }
-        }
-    }
-}
-
 LOG_MODULE_REGISTER(zephcore_repeater, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZEPHCORE_REPEATER_UPLINK) && IS_ENABLED(CONFIG_MQTT_LIB)
@@ -72,7 +58,6 @@ static void uplink_time_sync_cb(uint32_t unix_ts)
 #define REQ_TYPE_KEEP_ALIVE         0x02
 #define REQ_TYPE_GET_TELEMETRY_DATA 0x03
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
-#define REQ_TYPE_GET_NEIGHBOURS     0x06
 #define REQ_TYPE_GET_OWNER_INFO     0x07
 
 #define RESP_SERVER_LOGIN_OK        0
@@ -96,9 +81,9 @@ static void uplink_time_sync_cb(uint32_t unix_ts)
 #define PUSH_ACK_TIMEOUT_FACTOR     2000
 #define POST_SYNC_DELAY_SECS        2
 
-/* Stats blob returned for REQ_TYPE_GET_STATUS on a room server.  Mirrors the
- * repeater's RepeaterStats but reports posted/pushed counts in the trailing
- * two fields (matches upstream MeshCore's ServerStats wire layout). */
+/* Stats blob returned for REQ_TYPE_GET_STATUS on a room server.  Reports
+ * posted/pushed counts in the trailing two fields (matches upstream
+ * MeshCore's ServerStats wire layout). */
 struct ServerStats {
     uint16_t batt_milli_volts;
     uint16_t curr_tx_queue_len;
@@ -131,29 +116,6 @@ static void radio_set_tx_power(uint8_t power_dbm) {
      * Instead, we log that TX power setting is requested. The actual power
      * is set in the board defconfig via CONFIG_LORA_TX_POWER. */
     LOG_INF("TX power %d dBm requested (configured via board defconfig)", power_dbm);
-}
-
-void RoomServerMesh::putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr) {
-#if MAX_NEIGHBOURS > 0
-    uint32_t oldest_timestamp = 0xFFFFFFFF;
-    NeighbourInfo* neighbour = &neighbours[0];
-
-    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
-        if (id.matches(neighbours[i].id)) {
-            neighbour = &neighbours[i];
-            break;
-        }
-        if (neighbours[i].heard_timestamp < oldest_timestamp) {
-            neighbour = &neighbours[i];
-            oldest_timestamp = neighbour->heard_timestamp;
-        }
-    }
-
-    neighbour->id = id;
-    neighbour->advert_timestamp = timestamp;
-    neighbour->heard_timestamp = getRTCClock()->getCurrentTime();
-    neighbour->snr = (int8_t)(snr * 4);
-#endif
 }
 
 int RoomServerMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp, uint8_t* payload, size_t payload_len) {
@@ -274,84 +236,6 @@ int RoomServerMesh::handleRequest(ClientInfo* sender, uint32_t sender_timestamp,
         }
     }
 
-    if (payload[0] == REQ_TYPE_GET_NEIGHBOURS) {
-#if MAX_NEIGHBOURS > 0
-        uint8_t request_version = payload[1];
-        if (request_version == 0) {
-            int reply_offset = 4;
-            uint8_t count = payload[2];
-            uint16_t offset;
-            memcpy(&offset, &payload[3], 2);
-            uint8_t order_by = payload[5];
-            uint8_t pubkey_prefix_length = payload[6];
-
-            if (pubkey_prefix_length > PUB_KEY_SIZE) {
-                pubkey_prefix_length = PUB_KEY_SIZE;
-            }
-
-            // Create sorted copy
-            int16_t neighbours_count = 0;
-            NeighbourInfo* sorted_neighbours[MAX_NEIGHBOURS];
-            for (int i = 0; i < MAX_NEIGHBOURS; i++) {
-                if (neighbours[i].heard_timestamp > 0) {
-                    sorted_neighbours[neighbours_count++] = &neighbours[i];
-                }
-            }
-
-            // Sort
-            if (order_by == 0) {
-                simple_sort(sorted_neighbours, (int)neighbours_count,
-                    [](const NeighbourInfo* a, const NeighbourInfo* b) {
-                        return a->heard_timestamp > b->heard_timestamp;
-                    });
-            } else if (order_by == 1) {
-                simple_sort(sorted_neighbours, (int)neighbours_count,
-                    [](const NeighbourInfo* a, const NeighbourInfo* b) {
-                        return a->heard_timestamp < b->heard_timestamp;
-                    });
-            } else if (order_by == 2) {
-                simple_sort(sorted_neighbours, (int)neighbours_count,
-                    [](const NeighbourInfo* a, const NeighbourInfo* b) {
-                        return a->snr > b->snr;
-                    });
-            } else if (order_by == 3) {
-                simple_sort(sorted_neighbours, (int)neighbours_count,
-                    [](const NeighbourInfo* a, const NeighbourInfo* b) {
-                        return a->snr < b->snr;
-                    });
-            }
-
-            // Build results
-            int results_count = 0;
-            int results_offset = 0;
-            uint8_t results_buffer[130];
-            for (int index = 0; index < count && index + offset < neighbours_count; index++) {
-                int entry_size = pubkey_prefix_length + 4 + 1;
-                if (results_offset + entry_size > (int)sizeof(results_buffer)) break;
-
-                auto neighbour = sorted_neighbours[index + offset];
-                uint32_t heard_seconds_ago = getRTCClock()->getCurrentTime() - neighbour->heard_timestamp;
-                memcpy(&results_buffer[results_offset], neighbour->id.pub_key, pubkey_prefix_length);
-                results_offset += pubkey_prefix_length;
-                memcpy(&results_buffer[results_offset], &heard_seconds_ago, 4);
-                results_offset += 4;
-                memcpy(&results_buffer[results_offset], &neighbour->snr, 1);
-                results_offset += 1;
-                results_count++;
-            }
-
-            memcpy(&reply_data[reply_offset], &neighbours_count, 2);
-            reply_offset += 2;
-            memcpy(&reply_data[reply_offset], &results_count, 2);
-            reply_offset += 2;
-            memcpy(&reply_data[reply_offset], results_buffer, results_offset);
-            reply_offset += results_offset;
-
-            return reply_offset;
-        }
-#endif
-    }
-
     if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
         sprintf((char*)&reply_data[4], "%s\n%s\n%s", FIRMWARE_VERSION, _prefs.node_name, _prefs.owner_info);
         return 4 + strlen((char*)&reply_data[4]);
@@ -452,23 +336,6 @@ bool RoomServerMesh::saveFilter(ClientInfo* client) {
     return client->isAdmin();  // only persist admins; guests/read-write re-login
 }
 
-static uint8_t max_loop_minimal[]  = { 0, /* 1-byte */  4, /* 2-byte */  2, /* 3-byte */  1 };
-static uint8_t max_loop_moderate[] = { 0, /* 1-byte */  2, /* 2-byte */  1, /* 3-byte */  1 };
-static uint8_t max_loop_strict[]   = { 0, /* 1-byte */  1, /* 2-byte */  1, /* 3-byte */  1 };
-
-bool RoomServerMesh::isLooped(const mesh::Packet* packet, const uint8_t max_counters[]) {
-    uint8_t hash_size = packet->getPathHashSize();
-    uint8_t hash_count = packet->getPathHashCount();
-    uint8_t n = 0;
-    const uint8_t* path = packet->path;
-    while (hash_count > 0) {
-        if (self_id.isHashMatch(path, hash_size)) n++;
-        hash_count--;
-        path += hash_size;
-    }
-    return n >= max_counters[hash_size];
-}
-
 void RoomServerMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size) {
     if (scope.isNull()) {
         sendFlood(pkt, delay_millis, path_hash_size);
@@ -493,29 +360,12 @@ void RoomServerMesh::sendFloodReply(mesh::Packet* packet, unsigned long delay_mi
     }
 }
 
-bool RoomServerMesh::allowPacketForward(const mesh::Packet* packet) {
-    if (_prefs.disable_fwd) return false;
-    if (packet->isRouteFlood()) {
-        if (packet->getPathHashCount() >= _prefs.flood_max) return false;
-        // un-scoped floods can be clamped to a lower hop limit than scoped (transport) floods
-        if (packet->getRouteType() == ROUTE_TYPE_FLOOD && packet->getPathHashCount() >= _prefs.flood_max_unscoped) return false;
-    }
-    if (packet->isRouteFlood() && recv_pkt_region == nullptr) return false;
-    if (packet->isRouteFlood() && _prefs.loop_detect != LOOP_DETECT_OFF) {
-        const uint8_t* maximums;
-        if (_prefs.loop_detect == LOOP_DETECT_MINIMAL) {
-            maximums = max_loop_minimal;
-        } else if (_prefs.loop_detect == LOOP_DETECT_MODERATE) {
-            maximums = max_loop_moderate;
-        } else {
-            maximums = max_loop_strict;
-        }
-        if (isLooped(packet, maximums)) {
-            MESH_DEBUG_PRINTLN("allowPacketForward: FLOOD packet loop detected!");
-            return false;
-        }
-    }
-    return true;
+/* A room server is an endpoint, not a repeater: it never forwards other nodes'
+ * transit traffic (no flood relaying, no neighbour/loop-detect machinery).  Its
+ * own replies still go out via sendDirect()/sendFloodReply(); this only governs
+ * relaying of pass-through packets. */
+bool RoomServerMesh::allowPacketForward(const mesh::Packet* /*packet*/) {
+    return false;
 }
 
 const char* RoomServerMesh::getLogDateTime() {
@@ -725,25 +575,6 @@ void RoomServerMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
     }
 }
 
-static bool isShare(const mesh::Packet* packet) {
-    if (packet->hasTransportCodes()) {
-        return packet->transport_codes[0] == 0 && packet->transport_codes[1] == 0;
-    }
-    return false;
-}
-
-void RoomServerMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
-                                const uint8_t* app_data, size_t app_data_len) {
-    mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
-
-    if (packet->getPathHashCount() == 0 && !isShare(packet)) {
-        AdvertDataParser parser(app_data, app_data_len);
-        if (parser.isValid() && parser.getType() == ADV_TYPE_REPEATER) {
-            putNeighbour(id, timestamp, packet->getSNR());
-        }
-    }
-}
-
 void RoomServerMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx,
                                   const uint8_t* secret, uint8_t* data, size_t len) {
     int i = matching_peer_indexes[sender_idx];
@@ -908,76 +739,12 @@ bool RoomServerMesh::onPeerPathRecv(mesh::Packet* packet, int sender_idx, const 
     return false;
 }
 
-void RoomServerMesh::onControlDataRecv(mesh::Packet* packet) {
-    uint8_t type = packet->payload[0] & 0xF0;
-    if (type == CTL_TYPE_NODE_DISCOVER_REQ && packet->payload_len >= 6 &&
-        !_prefs.disable_fwd && discover_limiter.allow(getRTCClock()->getCurrentTime())) {
-        int i = 1;
-        uint8_t filter = packet->payload[i++];
-        uint32_t tag;
-        memcpy(&tag, &packet->payload[i], 4);
-        i += 4;
-        uint32_t since = 0;
-        if (packet->payload_len >= i + 4) {
-            memcpy(&since, &packet->payload[i], 4);
-            i += 4;
-        }
-
-        if ((filter & (1 << ADV_TYPE_REPEATER)) != 0 && _prefs.discovery_mod_timestamp >= since) {
-            bool prefix_only = packet->payload[0] & 1;
-            uint8_t data[6 + PUB_KEY_SIZE];
-            data[0] = CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_REPEATER;
-            data[1] = packet->_snr;
-            memcpy(&data[2], &tag, 4);
-            memcpy(&data[6], self_id.pub_key, PUB_KEY_SIZE);
-            auto resp = createControlData(data, prefix_only ? 6 + 8 : 6 + PUB_KEY_SIZE);
-            if (resp) {
-                sendZeroHop(resp, getRetransmitDelay(resp) * 4);
-            }
-        }
-    } else if (type == CTL_TYPE_NODE_DISCOVER_RESP && packet->payload_len >= 6) {
-        uint8_t node_type = packet->payload[0] & 0x0F;
-        if (node_type != ADV_TYPE_REPEATER) return;
-        if (packet->payload_len < 6 + PUB_KEY_SIZE) return;
-
-        /* Only accept responses matching our pending discover tag */
-        if (pending_discover_tag == 0 || millisHasNowPassed(pending_discover_until)) {
-            pending_discover_tag = 0;
-            return;
-        }
-        uint32_t tag;
-        memcpy(&tag, &packet->payload[2], 4);
-        if (tag != pending_discover_tag) return;
-
-        mesh::Identity id(&packet->payload[6]);
-        if (id.matches(self_id)) return;
-        putNeighbour(id, getRTCClock()->getCurrentTime(), packet->getSNR());
-    }
-}
-
-void RoomServerMesh::sendNodeDiscoverReq() {
-    uint8_t data[10];
-    data[0] = CTL_TYPE_NODE_DISCOVER_REQ;  // prefix_only=0
-    data[1] = (1 << ADV_TYPE_REPEATER);
-    getRNG()->random(&data[2], 4);  // tag
-    memcpy(&pending_discover_tag, &data[2], 4);
-    pending_discover_until = futureMillis(30000);
-    uint32_t since = 0;
-    memcpy(&data[6], &since, 4);
-
-    auto pkt = createControlData(data, sizeof(data));
-    if (pkt) {
-        sendZeroHop(pkt);
-    }
-}
-
 RoomServerMesh::RoomServerMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms,
                            mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables)
     : mesh::Mesh(radio, ms, rng, rtc, *new mesh::StaticPoolPacketManager(), tables),
       _board(board),
       _cli(board, rtc, acl, &_prefs, this),
       region_map(key_store), temp_map(key_store),
-      discover_limiter(4, 120),
       /* Failed-login rate limit: 4 wrong-password attempts per 180s.  Global
        * rate (not per-sender) — trade-off documented in CRYPTO_AUDIT_INDEX.md
        * Phase 4 (mitigation for upstream MeshCore#2556). */
@@ -993,21 +760,12 @@ RoomServerMesh::RoomServerMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh:
     region_load_active = false;
     recv_pkt_region = nullptr;
     memset(default_scope.key, 0, sizeof(default_scope.key));
-    pending_discover_tag = 0;
-    pending_discover_until = 0;
-
-#if MAX_NEIGHBOURS > 0
-    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
-        neighbours[i].clear();
-    }
-#endif
 
     initNodePrefs(&_prefs);
     strcpy(_prefs.node_name, "Room");
     _prefs.advert_loc_policy = ADVERT_LOC_PREFS;  // advertise prefs coordinates
-    _prefs.loop_detect = LOOP_DETECT_MODERATE;
     _prefs.path_hash_mode = 1;
-    _prefs.disable_fwd = 1;  // a room server does not repeat other traffic by default
+    _prefs.disable_fwd = 1;  // a room server is an endpoint, never repeats
 
     /* Room server: circular post buffer + round-robin push state */
     next_post_idx = 0;
@@ -1226,52 +984,9 @@ void RoomServerMesh::setTxPower(int8_t power_dbm) {
     radio_set_tx_power(power_dbm);
 }
 
+/* A room server keeps no neighbour table (it is not a repeater). */
 void RoomServerMesh::formatNeighborsReply(char* reply) {
-    char* dp = reply;
-
-#if MAX_NEIGHBOURS > 0
-    int16_t neighbours_count = 0;
-    NeighbourInfo* sorted_neighbours[MAX_NEIGHBOURS];
-    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
-        if (neighbours[i].heard_timestamp > 0) {
-            sorted_neighbours[neighbours_count++] = &neighbours[i];
-        }
-    }
-
-    simple_sort(sorted_neighbours, (int)neighbours_count,
-        [](const NeighbourInfo* a, const NeighbourInfo* b) {
-            return a->heard_timestamp > b->heard_timestamp;
-        });
-
-    for (int i = 0; i < neighbours_count && dp - reply < 134; i++) {
-        NeighbourInfo* neighbour = sorted_neighbours[i];
-
-        if (i > 0) *dp++ = '\n';
-
-        char hex[10];
-        mesh::Utils::toHex(hex, neighbour->id.pub_key, 4);
-
-        uint32_t secs_ago = getRTCClock()->getCurrentTime() - neighbour->heard_timestamp;
-        sprintf(dp, "%s:%u:%d", hex, secs_ago, neighbour->snr);
-        while (*dp) dp++;
-    }
-#endif
-
-    if (dp == reply) {
-        strcpy(dp, "-none-");
-        dp += 6;
-    }
-    *dp = 0;
-}
-
-void RoomServerMesh::removeNeighbor(const uint8_t* pubkey, int key_len) {
-#if MAX_NEIGHBOURS > 0
-    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
-        if (memcmp(neighbours[i].id.pub_key, pubkey, key_len) == 0) {
-            neighbours[i].clear();
-        }
-    }
-#endif
+    strcpy(reply, "not supported");
 }
 
 void RoomServerMesh::formatStatsReply(char* reply) {
@@ -1388,15 +1103,6 @@ void RoomServerMesh::handleCommand(uint32_t sender_timestamp, char* command, cha
         reply[0] = 0;
     } else if (memcmp(command, "region", 6) == 0) {
         handleRegionCommand(command, reply);
-    } else if (memcmp(command, "discover.neighbors", 18) == 0) {
-        const char* sub = command + 18;
-        while (*sub == ' ') sub++;
-        if (*sub != 0) {
-            strcpy(reply, "Err - discover.neighbors has no options");
-        } else {
-            sendNodeDiscoverReq();
-            strcpy(reply, "OK - Discover sent");
-        }
     } else {
         _cli.handleCommand(sender_timestamp, command, reply);
     }

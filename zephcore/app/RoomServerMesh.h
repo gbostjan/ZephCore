@@ -1,13 +1,15 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
- * RoomServerMesh - LoRa mesh repeater implementation
+ * RoomServerMesh - LoRa mesh shared-room (BBS) server
  *
  * Extends mesh::Mesh with:
- * - ACL-based client authentication
- * - Region-based flood filtering
- * - Neighbor tracking
+ * - ACL-based client authentication (admin / room / guest)
+ * - Region-based flood scoping
+ * - Shared-post buffer + round-robin push/sync to logged-in clients
  * - CLI commands (via USB serial)
- * - Protocol handlers (login, status, telemetry, etc.)
+ *
+ * A room server is an endpoint, not a repeater: it does not forward other
+ * nodes' traffic and keeps no neighbour / node-discovery state.
  */
 
 #pragma once
@@ -36,46 +38,6 @@
 #endif
 
 #define FIRMWARE_ROLE "room_server"
-
-#ifndef MAX_NEIGHBOURS
-  #ifdef CONFIG_ZEPHCORE_MAX_NEIGHBOURS
-    #define MAX_NEIGHBOURS  CONFIG_ZEPHCORE_MAX_NEIGHBOURS
-  #else
-    #define MAX_NEIGHBOURS  16
-  #endif
-#endif
-
-struct NeighbourInfo {
-    mesh::Identity id;
-    uint32_t advert_timestamp;
-    uint32_t heard_timestamp;
-    int8_t snr;  // multiplied by 4
-
-    void clear() {
-        id = mesh::Identity();
-        advert_timestamp = 0;
-        heard_timestamp = 0;
-        snr = 0;
-    }
-};
-
-struct RepeaterStats {
-    uint16_t batt_milli_volts;
-    uint16_t curr_tx_queue_len;
-    int16_t noise_floor;
-    int16_t last_rssi;
-    uint32_t n_packets_recv;
-    uint32_t n_packets_sent;
-    uint32_t total_air_time_secs;
-    uint32_t total_up_time_secs;
-    uint32_t n_sent_flood, n_sent_direct;
-    uint32_t n_recv_flood, n_recv_direct;
-    uint16_t err_events;
-    int16_t last_snr;  // x 4
-    uint16_t n_direct_dups, n_flood_dups;
-    uint32_t total_rx_air_time_secs;
-    uint32_t n_recv_errors;
-};
 
 #ifndef MAX_UNSYNCED_POSTS
   #ifdef CONFIG_ZEPHCORE_MAX_UNSYNCED_POSTS
@@ -120,9 +82,7 @@ class RoomServerMesh : public mesh::Mesh, public CommonCLICallbacks {
     RegionEntry* load_stack[8];
     RegionEntry* recv_pkt_region;
     TransportKey default_scope;
-    RateLimiter discover_limiter, login_fail_limiter;
-    uint32_t pending_discover_tag;
-    unsigned long pending_discover_until;
+    RateLimiter login_fail_limiter;
     bool region_load_active;
     unsigned long dirty_contacts_expiry;
     /* Room server: circular post buffer + round-robin push state */
@@ -131,9 +91,6 @@ class RoomServerMesh : public mesh::Mesh, public CommonCLICallbacks {
     int next_client_idx;
     int next_post_idx;
     PostInfo posts[MAX_UNSYNCED_POSTS];
-#if MAX_NEIGHBOURS > 0
-    NeighbourInfo neighbours[MAX_NEIGHBOURS];
-#endif
     unsigned long set_radio_at, revert_radio_at;
     float pending_freq;
     float pending_bw;
@@ -153,7 +110,6 @@ class RoomServerMesh : public mesh::Mesh, public CommonCLICallbacks {
     unsigned long _uplink_next_status_at;
 #endif
 
-    void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
     int handleRequest(ClientInfo* sender, uint32_t sender_timestamp, uint8_t* payload, size_t payload_len);
     mesh::Packet* createSelfAdvert();
 
@@ -180,7 +136,6 @@ protected:
     }
 
     bool allowPacketForward(const mesh::Packet* packet) override;
-    bool isLooped(const mesh::Packet* packet, const uint8_t max_counters[]);
     const char* getLogDateTime() override;
 
     void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
@@ -208,10 +163,8 @@ protected:
     void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
     int searchPeersByHash(const uint8_t* hash) override;
     void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
-    void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len);
     void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
     bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
-    void onControlDataRecv(mesh::Packet* packet) override;
     void onAckRecv(mesh::Packet* packet, uint32_t ack_crc) override;
 #if IS_ENABLED(CONFIG_ZEPHCORE_REPEATER_UPLINK)
     bool handleUplinkCommand(const char *command, char *reply);
@@ -234,8 +187,6 @@ public:
                  mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
     void begin(RepeaterDataStore* store);
-
-    void sendNodeDiscoverReq();
 
     /* CommonCLICallbacks */
     const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
@@ -261,7 +212,6 @@ public:
     void dumpLogFile() override;
     void setTxPower(int8_t power_dbm) override;
     void formatNeighborsReply(char* reply) override;
-    void removeNeighbor(const uint8_t* pubkey, int key_len) override;
     void formatStatsReply(char* reply) override;
     void formatRadioStatsReply(char* reply) override;
     void formatPacketStatsReply(char* reply) override;
