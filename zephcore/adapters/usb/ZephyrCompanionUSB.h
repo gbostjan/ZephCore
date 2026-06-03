@@ -31,15 +31,45 @@ void zephcore_usb_companion_init(struct k_event *mesh_events,
 				 void *board);
 
 /**
- * Send a frame over USB with V3 length prefix.
- * @return number of payload bytes sent, or 0 on failure
+ * Queue a frame for interrupt-driven USB TX (sync byte + LE length + payload).
+ * @return number of payload bytes queued, or 0 if the TX ring can't fit the
+ *         whole frame (caller should back off and retry on the drain callback)
  */
 size_t zephcore_usb_companion_write_frame(const uint8_t *src, size_t len);
+
+/**
+ * @return true if the TX ring can hold one more frame carrying `payload_len`
+ *         bytes (plus 3 bytes of framing). Used by the contact pump to pace
+ *         itself against real TX backpressure instead of a fixed delay.
+ */
+bool zephcore_usb_companion_tx_has_space(size_t payload_len);
+
+/**
+ * Register a callback fired when the TX ring fully drains (USB analogue of the
+ * BLE on_tx_idle notify-complete event). Used to resume the contact pump. May
+ * be NULL. Invoked from the CDC TX interrupt-callback context.
+ */
+void zephcore_usb_companion_set_tx_drain_cb(void (*cb)(void));
 
 /**
  * Reset USB RX state (e.g., on BLE disconnect).
  */
 void zephcore_usb_companion_reset_rx(void);
+
+/**
+ * Register a callback invoked when a USB companion session starts — i.e. the
+ * first inbound frame claims the interface for USB. Mirrors BLE on_connected
+ * (e.g. light the UI connection indicator). May be NULL.
+ */
+void zephcore_usb_companion_set_session_start_cb(void (*cb)(void));
+
+/**
+ * Register a callback invoked when a USB companion session ends — i.e. the
+ * host closed the port (DTR dropped) while USB owned the interface. Mirrors
+ * the BLE on_disconnected cleanup: cancel in-flight contact iteration and
+ * message sync, free the sign buffer. May be NULL.
+ */
+void zephcore_usb_companion_set_session_end_cb(void (*cb)(void));
 
 #ifdef __cplusplus
 }

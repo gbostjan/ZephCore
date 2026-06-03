@@ -128,6 +128,16 @@ static void joystick_signal_tx(void)
 K_WORK_DEFINE(rx_process_work, rx_process_work_fn);
 K_WORK_DEFINE(contact_iter_work, contact_iter_work_fn);
 
+#if ZEPHCORE_USB_STACK
+/* USB TX-drained callback (mirrors BLE on_tx_idle): the TX ring emptied, so
+ * resume the contact pump to queue the next batch. Runs in the CDC TX
+ * interrupt-callback context — k_work_submit is safe there. */
+static void usb_on_tx_drain(void)
+{
+	k_work_submit(&contact_iter_work);
+}
+#endif
+
 /* Housekeeping timer for periodic tasks (noise floor calibration, etc.)
  * Fires every 5 seconds to wake event loop for maintenance without
  * compromising event-driven power savings. */
@@ -184,24 +194,46 @@ static void ble_on_connected(void)
 	ui_notify(UI_EVENT_BLE_CONNECTED);
 }
 
+/* Per-session cleanup shared by BLE disconnect and USB session-end.
+ * Silently cancels in-progress contact iteration (a reconnect would otherwise
+ * send a stale PACKET_CONTACT_END to the new session and confuse the phone's
+ * sync state machine), resets message sync (un-ACKed peeked message stays in
+ * the queue and is re-sent on the next CMD_SYNC_NEXT_MESSAGE), and frees the
+ * Ed25519 sign buffer if a sign op was interrupted (else an 8KB leak). */
+static void companion_session_cleanup(void)
+{
+#ifdef ZEPHCORE_LORA
+	companion_mesh_ptr->cancelContactIterator();
+	companion_mesh_ptr->cancelSyncPending();
+	companion_mesh_ptr->cleanupSignState();
+#endif
+}
+
+#if ZEPHCORE_USB_STACK
+/* USB session start — mirror ble_on_connected's UI notification so the
+ * device shows "connected" during a USB session (matches Arduino, which
+ * lights the indicator for serial transports too). */
+static void usb_on_session_start(void)
+{
+	ui_notify(UI_EVENT_BLE_CONNECTED);
+}
+
+/* USB session end (host closed the port) — same cleanup + UI notification
+ * as ble_on_disconnected. */
+static void usb_on_session_end(void)
+{
+	companion_session_cleanup();
+	ui_notify(UI_EVENT_BLE_DISCONNECTED);
+}
+#endif
+
 /* BLE disconnected callback — clean up state and notify UI */
 static void ble_on_disconnected(void)
 {
 #if ZEPHCORE_USB_STACK
 	zephcore_usb_companion_reset_rx();
 #endif
-#ifdef ZEPHCORE_LORA
-	/* Silently cancel any in-progress contact iteration.
-	 * Without this, reconnect triggers resetContactIterator() which sends
-	 * a stale PACKET_CONTACT_END to the NEW connection, confusing the
-	 * phone's sync state machine. */
-	companion_mesh_ptr->cancelContactIterator();
-	/* Reset message sync — un-ACKed peeked message stays in queue
-	 * and will be re-sent on next CMD_SYNC_NEXT_MESSAGE. */
-	companion_mesh_ptr->cancelSyncPending();
-	/* Free Ed25519 sign buffer if allocated mid-operation */
-	companion_mesh_ptr->cleanupSignState();
-#endif
+	companion_session_cleanup();
 	ui_notify(UI_EVENT_BLE_DISCONNECTED);
 }
 
@@ -216,6 +248,14 @@ static const struct ble_callbacks ble_cbs = {
 
 static size_t write_frame(const uint8_t *src, size_t len)
 {
+#if ZEPHCORE_USB_STACK
+	/* When USB owns the interface, replies must go out the CDC port — the BLE
+	 * send queue is never drained while USB is active (tx_drain no-ops on
+	 * IFACE_USB), so routing through zephcore_ble_send would strand the frame. */
+	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
+		return zephcore_usb_companion_write_frame(src, len);
+	}
+#endif
 	return zephcore_ble_send(src, (uint16_t)len);
 }
 
@@ -225,8 +265,16 @@ static size_t write_frame(const uint8_t *src, size_t len)
  */
 static void push_callback(uint8_t code, const uint8_t *data, size_t len)
 {
-	/* No point serializing if nobody is listening */
-	if (!zephcore_ble_is_connected()) return;
+	/* No point serializing if nobody is listening. A USB companion session
+	 * is "connected" too, but zephcore_ble_is_connected() only reports the BLE
+	 * link — without the USB check, pushes (new messages, etc.) are silently
+	 * dropped on a USB-attached client. */
+	bool transport_up = zephcore_ble_is_connected();
+#if ZEPHCORE_USB_STACK
+	transport_up = transport_up ||
+		(zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB);
+#endif
+	if (!transport_up) return;
 
 	/* Push frame: code byte + optional data */
 	uint8_t push_buf[1 + MAX_FRAME_SIZE - 1];
@@ -271,6 +319,18 @@ static void rx_process_work_fn(struct k_work *work)
 		}
 #endif
 	}
+
+#if ZEPHCORE_USB_STACK
+	/* Over USB, write_frame is synchronous and never kicks the BLE
+	 * tx-drain/on_tx_idle pump that paces multi-frame responses (e.g. contact
+	 * sync, which only emits PACKET_CONTACT_START in the command handler and
+	 * relies on continueContactIteration() for the rest). Kick the pump here so
+	 * any iteration started by the command(s) just handled actually proceeds;
+	 * the USB branch of tx_drain fires on_tx_idle and the loop self-sustains. */
+	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
+		zephcore_ble_kick_tx();
+	}
+#endif
 }
 
 /* Contact iteration work - runs when TX queue has space */
@@ -278,6 +338,27 @@ static void contact_iter_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
 #ifdef ZEPHCORE_LORA
+	if (!companion_mesh_ptr) {
+		return;
+	}
+
+#if ZEPHCORE_USB_STACK
+	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
+		/* Event-driven pacing (no fixed delay): fill the USB TX ring as far
+		 * as it'll hold, then stop. The CDC TX ISR drains it to the wire at
+		 * full speed and calls usb_on_tx_drain() when empty, which re-kicks
+		 * this work to queue the next batch — real backpressure, like BLE's
+		 * on_tx_idle. tx_has_space() guarantees each continueContactIteration
+		 * frame fits, so writeFrame never fails mid-dump. */
+		while (zephcore_usb_companion_tx_has_space(CONTACT_FRAME_SIZE)) {
+			if (!companion_mesh_ptr->continueContactIteration()) {
+				break;  /* iteration complete */
+			}
+		}
+		return;
+	}
+#endif
+
 	/* Don't iterate while BLE TX is congested — wait for drain to clear.
 	 * Also check 2/3 high-water mark (catches stray frames before full). */
 	if (zephcore_ble_is_congested()) {
@@ -793,6 +874,11 @@ int main(void)
 #if ZEPHCORE_USB_STACK
 	zephcore_usb_companion_init(&mesh_events, &rx_process_work, MESH_EVENT_BLE_RX,
 				   &zephyr_board);
+	/* Mirror BLE connect/disconnect UI + cleanup for USB sessions. */
+	zephcore_usb_companion_set_session_start_cb(usb_on_session_start);
+	zephcore_usb_companion_set_session_end_cb(usb_on_session_end);
+	/* Resume the contact pump when the USB TX ring drains (≈ BLE on_tx_idle). */
+	zephcore_usb_companion_set_tx_drain_cb(usb_on_tx_drain);
 #endif
 
 #if IS_ENABLED(CONFIG_BT)

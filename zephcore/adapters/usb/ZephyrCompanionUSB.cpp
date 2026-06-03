@@ -28,19 +28,52 @@ LOG_MODULE_REGISTER(zephcore_usb, CONFIG_ZEPHCORE_USB_LOG_LEVEL);
 /* MAX_FRAME_SIZE defined in CompanionMesh.h */
 
 #define USB_RING_BUF_SIZE     512     /* USB RX ring buffer size */
+#define USB_TX_RING_BUF_SIZE  2048    /* USB TX ring buffer (~13 contact frames of headroom) */
 #define USB_FRAME_TIMEOUT_MS  2000    /* Partial frame timeout - reset parser after 2s of no completion */
+
+/* Companion serial framing (MeshCore ArduinoSerialInterface):
+ *   app  → device:  '<' len_lo len_hi <payload...>
+ *   device → app:   '>' len_lo len_hi <payload...>
+ * The leading sync byte is mandatory — the official app keys off it, and we
+ * must ignore any noise/banner bytes until it arrives. */
+#define USB_FRAME_RX_SYNC     '<'
+#define USB_FRAME_TX_SYNC     '>'
+
+enum usb_rx_state {
+	USB_RX_IDLE = 0,  /* waiting for '<' sync byte */
+	USB_RX_LEN_LO,    /* got sync, waiting len LSB */
+	USB_RX_LEN_HI,    /* got len LSB, waiting len MSB */
+	USB_RX_PAYLOAD,   /* accumulating payload */
+};
 
 /* USB CDC state */
 static const struct device *usb_dev;
 static uint8_t usb_ring_buf_data[USB_RING_BUF_SIZE];
 static struct ring_buf usb_ring_buf;
-static uint8_t usb_rx_buf[MAX_FRAME_SIZE + 2];  /* +2 for length prefix */
-static uint16_t usb_rx_idx;
-static uint16_t usb_frame_len;  /* Expected frame length (0 = waiting for header) */
-static uint32_t usb_frame_start_time;  /* Timestamp of first byte in current frame */
+static uint8_t usb_rx_buf[MAX_FRAME_SIZE];
+static enum usb_rx_state usb_rx_st;
+static uint16_t usb_rx_idx;     /* payload bytes received so far */
+static uint16_t usb_frame_len;  /* Expected payload length (0 = none in progress) */
+static uint32_t usb_frame_start_time;  /* Timestamp of sync byte for current frame */
+
+/* TX side: interrupt-driven so the contact pump gets real backpressure +
+ * a "drained" event (the USB analogue of BLE's notify-complete) instead of a
+ * fixed delay. write_frame queues whole frames here under usb_tx_lock; the TX
+ * ISR drains into the CDC FIFO and fires s_tx_drain_cb when the ring empties. */
+static uint8_t usb_tx_ring_buf_data[USB_TX_RING_BUF_SIZE];
+static struct ring_buf usb_tx_ring_buf;
+static struct k_spinlock usb_tx_lock;
 
 /* Work item for deferred V3 frame processing (set by init) */
 static struct k_work *s_rx_work;
+
+/* Session start/end callbacks (mirror BLE on_connected / on_disconnected),
+ * set by main. start fires on first-frame claim, end on DTR drop. */
+static void (*s_session_start_cb)(void);
+static void (*s_session_end_cb)(void);
+
+/* TX-drained callback (mirrors BLE on_tx_idle) — re-kicks the contact pump. */
+static void (*s_tx_drain_cb)(void);
 
 /* Work items */
 static void usb_rx_work_fn(struct k_work *work);
@@ -61,6 +94,35 @@ static void usb_uart_isr(const struct device *dev, void *user_data)
 				k_work_submit(&usb_rx_work);
 			}
 		}
+
+		if (uart_irq_tx_ready(dev)) {
+			/* Push as much of our TX ring as the CDC FIFO will take.
+			 * uart_fifo_fill returns the count actually accepted, so the
+			 * remainder stays queued and the callback fires again when the
+			 * FIFO drains — backpressure all the way to the wire. */
+			uint8_t *out;
+			bool empty;
+			k_spinlock_key_t key = k_spin_lock(&usb_tx_lock);
+			uint32_t claimed = ring_buf_get_claim(&usb_tx_ring_buf, &out, 64);
+			if (claimed > 0) {
+				int sent = uart_fifo_fill(dev, out, claimed);
+				ring_buf_get_finish(&usb_tx_ring_buf, sent > 0 ? sent : 0);
+			}
+			empty = ring_buf_is_empty(&usb_tx_ring_buf);
+			if (empty) {
+				/* Disable inside the lock so a concurrent write_frame can't
+				 * enqueue+enable in the gap and then have us disable it,
+				 * stranding the frame. write_frame's enable always runs
+				 * after its put, so it re-arms us correctly. */
+				uart_irq_tx_disable(dev);
+			}
+			k_spin_unlock(&usb_tx_lock, key);
+
+			if (empty && s_tx_drain_cb) {
+				/* Channel idle — let the pump queue the next batch. */
+				s_tx_drain_cb();
+			}
+		}
 	}
 }
 
@@ -71,50 +133,57 @@ static void usb_rx_work_fn(struct k_work *work)
 
 	uint8_t byte;
 
-	/* Timeout partial frames — if we've been accumulating bytes for too long
-	 * without completing a frame, reset the parser state */
-	if (usb_rx_idx > 0 && (k_uptime_get_32() - usb_frame_start_time) > USB_FRAME_TIMEOUT_MS) {
-		LOG_WRN("usb_rx: partial frame timeout (idx=%u, expected=%u), resync",
-			usb_rx_idx, usb_frame_len);
+	/* Timeout partial frames — if we've been mid-frame too long without
+	 * completing, reset the parser state and resync on the next sync byte. */
+	if (usb_rx_st != USB_RX_IDLE &&
+	    (k_uptime_get_32() - usb_frame_start_time) > USB_FRAME_TIMEOUT_MS) {
+		LOG_WRN("usb_rx: partial frame timeout (state=%d, expected=%u), resync",
+			usb_rx_st, usb_frame_len);
+		usb_rx_st = USB_RX_IDLE;
 		usb_frame_len = 0;
 		usb_rx_idx = 0;
 	}
 
 	while (ring_buf_get(&usb_ring_buf, &byte, 1) == 1) {
-		/* V3 framing: [len_lo][len_hi][payload...] */
-		if (usb_rx_idx == 0) {
-			/* First byte of length */
-			usb_rx_buf[0] = byte;
-			usb_rx_idx = 1;
-			usb_frame_start_time = k_uptime_get_32();
-		} else if (usb_rx_idx == 1) {
-			/* Second byte of length */
-			usb_rx_buf[1] = byte;
-			usb_frame_len = usb_rx_buf[0] | (usb_rx_buf[1] << 8);
-			usb_rx_idx = 2;
-
+		switch (usb_rx_st) {
+		case USB_RX_IDLE:
+			/* Ignore stray bytes until the '<' sync byte arrives. */
+			if (byte == USB_FRAME_RX_SYNC) {
+				usb_rx_st = USB_RX_LEN_LO;
+				usb_frame_start_time = k_uptime_get_32();
+			}
+			break;
+		case USB_RX_LEN_LO:
+			usb_frame_len = byte;  /* LSB */
+			usb_rx_st = USB_RX_LEN_HI;
+			break;
+		case USB_RX_LEN_HI:
+			usb_frame_len |= ((uint16_t)byte) << 8;  /* MSB */
+			usb_rx_idx = 0;
 			if (usb_frame_len == 0 || usb_frame_len > MAX_FRAME_SIZE) {
 				LOG_WRN("usb_rx: invalid frame len %u, resync", usb_frame_len);
+				usb_rx_st = USB_RX_IDLE;
 				usb_frame_len = 0;
-				usb_rx_idx = 0;
+			} else {
+				usb_rx_st = USB_RX_PAYLOAD;
 			}
-		} else {
-			/* Payload bytes */
+			break;
+		default: /* USB_RX_PAYLOAD */
 			usb_rx_buf[usb_rx_idx++] = byte;
 
-			if (usb_rx_idx >= usb_frame_len + 2) {
+			if (usb_rx_idx >= usb_frame_len) {
 				/* Frame complete - queue it */
-				uint8_t *payload = &usb_rx_buf[2];
+				uint8_t *payload = usb_rx_buf;
 				uint16_t payload_len = usb_frame_len;
 
 				LOG_DBG("usb_rx: frame complete len=%u hdr=0x%02x", payload_len, payload[0]);
 
-				/* Check for CMD_APP_START to switch interface.
-				 * CMD_APP_START is 0x01 — see CompanionMesh.cpp:26.
-				 * (Previously hardcoded 0x03 with the same comment, which
-				 * is actually CMD_SEND_CHANNEL_TXT_MSG and meant the USB
-				 * handshake silently dropped the app's first frame.) */
-				if (payload_len >= 1 && payload[0] == 0x01 /* CMD_APP_START */) {
+				/* Claim the interface for USB on the FIRST inbound frame of
+				 * any opcode — mirroring BLE, which claims on connect. The
+				 * official client opens with CMD_DEVICE_QUERY (0x16), not
+				 * CMD_APP_START (0x01); gating the claim on 0x01 dropped that
+				 * first query and the client timed out waiting for a reply. */
+				if (zephcore_ble_get_active_iface() != ZEPHCORE_IFACE_USB) {
 					/* Atomically claim the interface for USB unless BLE
 					 * already owns it.  try_claim succeeds when idle or
 					 * already USB (reconnect) and fails only while a BLE
@@ -122,9 +191,16 @@ static void usb_rx_work_fn(struct k_work *work)
 					 * compare-and-set can't race a concurrent BLE claim. */
 					if (zephcore_ble_iface_try_claim(ZEPHCORE_IFACE_USB)) {
 						zephcore_ble_set_enabled(false);
-						LOG_INF("usb_rx: CMD_APP_START → IFACE_USB");
+						LOG_INF("usb_rx: first frame 0x%02x → IFACE_USB", payload[0]);
+						/* New USB session — mirror BLE's on-connect UI
+						 * notification (Arduino shows "connected" for serial
+						 * transports too). Fires once per session: try_claim
+						 * only returns true on the NONE→USB transition. */
+						if (s_session_start_cb) {
+							s_session_start_cb();
+						}
 					} else {
-						LOG_INF("usb_rx: CMD_APP_START ignored, BLE is active");
+						LOG_INF("usb_rx: frame 0x%02x ignored, BLE is active", payload[0]);
 					}
 				}
 
@@ -144,9 +220,11 @@ static void usb_rx_work_fn(struct k_work *work)
 				}
 
 				/* Reset for next frame */
+				usb_rx_st = USB_RX_IDLE;
 				usb_frame_len = 0;
 				usb_rx_idx = 0;
 			}
+			break;
 		}
 	}
 }
@@ -163,6 +241,14 @@ static void on_dtr_change(bool dtr_active)
 	 * so this thread is the only writer of active_iface here — the get/set
 	 * pair below needs no extra locking beyond the thread-safe accessors. */
 	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
+		/* A USB companion session is ending — run the same per-session
+		 * cleanup BLE does on disconnect (cancel contact iteration and
+		 * message sync, free the sign buffer). Without this, stale sync
+		 * state carries into the next session and an in-flight sign op
+		 * leaks its 8KB buffer. */
+		if (s_session_end_cb) {
+			s_session_end_cb();
+		}
 		if (zephcore_ble_is_connected()) {
 			/* BLE client is physically connected — hand off to it. */
 			zephcore_ble_set_active_iface(ZEPHCORE_IFACE_BLE);
@@ -176,38 +262,94 @@ static void on_dtr_change(bool dtr_active)
 		}
 	}
 	ring_buf_reset(&usb_ring_buf);
+	usb_rx_st = USB_RX_IDLE;
 	usb_frame_len = 0;
 	usb_rx_idx = 0;
+
+	/* Discard any pending TX from the closed session. */
+	uart_irq_tx_disable(usb_dev);
+	k_spinlock_key_t key = k_spin_lock(&usb_tx_lock);
+	ring_buf_reset(&usb_tx_ring_buf);
+	k_spin_unlock(&usb_tx_lock, key);
 }
 
-/* Send frame over USB with V3 length prefix */
+/* Queue a frame for interrupt-driven TX (sync byte + LE length + payload,
+ * matching the MeshCore ArduinoSerialInterface framing). The whole frame is
+ * committed atomically under usb_tx_lock — either it all fits or none of it
+ * does (returns 0), so frames never tear and tx_has_space() stays truthful.
+ * 0 means "ring full, retry when drained"; the caller (contact pump) backs off
+ * and the TX-drain callback re-kicks it. */
 size_t zephcore_usb_companion_write_frame(const uint8_t *src, size_t len)
 {
 	if (!usb_dev || len == 0 || len > MAX_FRAME_SIZE) {
 		return 0;
 	}
 
-	/* Send length prefix (little-endian) */
-	uint8_t len_lo = (uint8_t)(len & 0xFF);
-	uint8_t len_hi = (uint8_t)((len >> 8) & 0xFF);
+	uint8_t hdr[3] = {
+		USB_FRAME_TX_SYNC,
+		(uint8_t)(len & 0xFF),
+		(uint8_t)((len >> 8) & 0xFF),
+	};
+	size_t total = sizeof(hdr) + len;
 
-	uart_poll_out(usb_dev, len_lo);
-	uart_poll_out(usb_dev, len_hi);
-
-	/* Send payload */
-	for (size_t i = 0; i < len; i++) {
-		uart_poll_out(usb_dev, src[i]);
+	k_spinlock_key_t key = k_spin_lock(&usb_tx_lock);
+	if (ring_buf_space_get(&usb_tx_ring_buf) < total) {
+		k_spin_unlock(&usb_tx_lock, key);
+		return 0;
 	}
+	ring_buf_put(&usb_tx_ring_buf, hdr, sizeof(hdr));
+	ring_buf_put(&usb_tx_ring_buf, src, len);
+	k_spin_unlock(&usb_tx_lock, key);
 
-	LOG_DBG("usb_write_frame: sent len=%u hdr=0x%02x", (unsigned)len, src[0]);
+	/* Kick the TX ISR; harmless if already enabled. */
+	uart_irq_tx_enable(usb_dev);
+
+	LOG_DBG("usb_write_frame: queued len=%u hdr=0x%02x", (unsigned)len, src[0]);
 	return len;
+}
+
+/* True if the TX ring can hold one more frame of `payload_len` (+3 framing).
+ * The pump checks this before each contact so write_frame can't fail mid-dump. */
+bool zephcore_usb_companion_tx_has_space(size_t payload_len)
+{
+	if (!usb_dev) {
+		return false;
+	}
+	k_spinlock_key_t key = k_spin_lock(&usb_tx_lock);
+	bool ok = ring_buf_space_get(&usb_tx_ring_buf) >= payload_len + 3;
+	k_spin_unlock(&usb_tx_lock, key);
+	return ok;
 }
 
 void zephcore_usb_companion_reset_rx(void)
 {
 	ring_buf_reset(&usb_ring_buf);
+	usb_rx_st = USB_RX_IDLE;
 	usb_frame_len = 0;
 	usb_rx_idx = 0;
+
+	/* Drop any half-sent TX too — the session it belonged to is gone. */
+	if (usb_dev) {
+		uart_irq_tx_disable(usb_dev);
+	}
+	k_spinlock_key_t key = k_spin_lock(&usb_tx_lock);
+	ring_buf_reset(&usb_tx_ring_buf);
+	k_spin_unlock(&usb_tx_lock, key);
+}
+
+void zephcore_usb_companion_set_session_start_cb(void (*cb)(void))
+{
+	s_session_start_cb = cb;
+}
+
+void zephcore_usb_companion_set_session_end_cb(void (*cb)(void))
+{
+	s_session_end_cb = cb;
+}
+
+void zephcore_usb_companion_set_tx_drain_cb(void (*cb)(void))
+{
+	s_tx_drain_cb = cb;
 }
 
 void zephcore_usb_companion_init(struct k_event *mesh_events,
@@ -232,8 +374,10 @@ void zephcore_usb_companion_init(struct k_event *mesh_events,
 	if (device_is_ready(usb_dev)) {
 		LOG_INF("USB CDC device ready: %s", usb_dev->name);
 		ring_buf_init(&usb_ring_buf, sizeof(usb_ring_buf_data), usb_ring_buf_data);
+		ring_buf_init(&usb_tx_ring_buf, sizeof(usb_tx_ring_buf_data), usb_tx_ring_buf_data);
 
-		/* Set up UART interrupt callback */
+		/* Set up UART interrupt callback (RX enabled now, TX enabled on demand
+		 * by write_frame and disabled by the ISR when the TX ring drains). */
 		uart_irq_callback_set(usb_dev, usb_uart_isr);
 		uart_irq_rx_enable(usb_dev);
 
