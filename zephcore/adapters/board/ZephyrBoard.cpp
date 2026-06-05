@@ -289,4 +289,18 @@ uint8_t ZephyrBoard::getStartupReason() const
 	return BD_STARTUP_NORMAL;
 }
 
+bool ZephyrBoard::isExternalPowered()
+{
+#if defined(CONFIG_SOC_SERIES_NRF52X) || defined(CONFIG_SOC_SERIES_NRF52)
+	/* VBUS detect from the POWER peripheral — true when USB/charger is
+	 * attached. Read-only status register; safe alongside the BLE controller
+	 * (we already poke NRF_POWER->GPREGRET directly elsewhere). */
+	return nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
+#else
+	/* Other platforms have no portable VBUS query — report battery (false)
+	 * so low-battery auto-shutdown is never inhibited. */
+	return false;
+#endif
+}
+
 } /* namespace mesh */

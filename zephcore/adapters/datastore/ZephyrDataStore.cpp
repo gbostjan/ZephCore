@@ -522,6 +522,16 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 	} else {
 		prefs.screen_off_secs = 0;
 	}
+
+	/* Offset 148: auto_shutdown_mv (ZephCore extension, 2 bytes LE).
+	 * Absent in pre-existing files → fall back to the Kconfig default so
+	 * upgrades inherit the board's built-in threshold. */
+	if (off + 2 <= len) {
+		prefs.auto_shutdown_mv = (uint16_t)buf[off] | ((uint16_t)buf[off + 1] << 8);
+		off += 2;
+	} else {
+		prefs.auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS;
+	}
 }
 
 void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
@@ -591,7 +601,10 @@ void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
 	/* Offset 146: screen_off_secs (ZephCore extension, 2 bytes LE) */
 	buf[off++] = prefs.screen_off_secs & 0xFF;
 	buf[off++] = (prefs.screen_off_secs >> 8) & 0xFF;
-	/* Total: 148 bytes */
+	/* Offset 148: auto_shutdown_mv (ZephCore extension, 2 bytes LE) */
+	buf[off++] = prefs.auto_shutdown_mv & 0xFF;
+	buf[off++] = (prefs.auto_shutdown_mv >> 8) & 0xFF;
+	/* Total: 150 bytes */
 
 	bool ok = atomicReplaceFile(PREFS_FILE, buf, off);
 	LOG_DBG("savePrefs: wrote %s, ok=%d (%d bytes), name='%.16s'",

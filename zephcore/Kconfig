@@ -620,6 +620,32 @@ config ZEPHCORE_UI_DISPLAY_AUTO_OFF_MS
 	  Time in milliseconds before the display turns off
 	  after the last user interaction. Set to 0 to disable.
 
+config ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS
+	int "Low-battery auto-shutdown threshold (mV, 0 = disabled)"
+	default 3300 if SOC_SERIES_NRF52
+	default 0
+	help
+	  Companion only. When the battery falls below this voltage the device
+	  shows a brief "Low Battery / Shutting Down" notice (3 s on OLED;
+	  e-paper persists without delay) and enters System OFF to protect the
+	  cell from over-discharge. The check piggybacks the existing periodic
+	  housekeeping tick (no extra polling) and is skipped while externally
+	  powered (USB/charger) via MainBoard::isExternalPowered().
+
+	  3300 mV is ~10% SoC on the default LiPo curve (battery_curve.c) — a
+	  protective floor that still leaves headroom for the under-load voltage
+	  sag during a TX burst. Requires CONFIG_POWEROFF to actually power down.
+
+	  This is only the boot DEFAULT: the value is copied into prefs and is
+	  tunable at runtime over the USB CLI ("set autoshutdown <mv>" /
+	  "get autoshutdown", 0 = off or 1-5000 mV), persisted to flash.
+
+	  Defaults ON (3300) for nRF52 only: that is where isExternalPowered()
+	  reads VBUS, so the "plugged in" gate actually works. ESP32 / MG24 /
+	  nRF54L stay at 0 (off) — isExternalPowered() is a stub there, so a
+	  USB/mains-powered node could otherwise self-shutdown on a low ADC
+	  reading. Set explicitly per board to enable once VBUS detect exists.
+
 config ZEPHCORE_UI_CONFIRM_WINDOW_MS
 	int "Double-press confirmation window (ms)"
 	default 500

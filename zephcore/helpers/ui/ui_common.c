@@ -22,6 +22,11 @@
 
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
+#include <string.h>
+
+#ifdef CONFIG_POWEROFF
+#include <zephyr/sys/poweroff.h>
+#endif
 
 #if defined(CONFIG_SOC_FAMILY_NORDIC_NRF)
 #include <hal/nrf_gpio.h>
@@ -217,10 +222,16 @@ void ui_led_flash_msg(void)
 static uint16_t (*s_batt_provider)(void);
 static uint32_t s_batt_last_read_ms;
 static bool s_batt_ever_read;
+static bool (*s_power_source_provider)(void);
 
 void ui_set_battery_provider(uint16_t (*provider)(void))
 {
 	s_batt_provider = provider;
+}
+
+void ui_set_power_source_provider(bool (*provider)(void))
+{
+	s_power_source_provider = provider;
 }
 
 void ui_refresh_battery(void)
@@ -325,6 +336,109 @@ void ui_prepare_for_system_off(void)
 	}
 #endif /* CONFIG_SOC_FAMILY_NORDIC_NRF && sw0 */
 }
+
+/* ========== Low-battery auto-shutdown ==========
+ * Companion only. Driven off the existing housekeeping tick — self-throttled,
+ * so there is no dedicated poll. Disabled entirely (compiled out) unless a
+ * board sets CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0. */
+#if defined(CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) && \
+	CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0
+
+/* How often we actually sample the ADC for the shutdown check. The caller
+ * fires every housekeeping tick (~5 s); this gate keeps the divider from
+ * being energised more than necessary while still catching a sagging cell
+ * well before it collapses. */
+#define UI_AUTO_SHUTDOWN_CHECK_MS  30000
+
+/* Runtime threshold (mV); 0 disables. Seeded from the Kconfig default, then
+ * overridden at boot from prefs and live via the CLI (ui_set_auto_shutdown_mv). */
+static uint16_t s_auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS;
+
+void ui_set_auto_shutdown_mv(uint16_t mv)
+{
+	s_auto_shutdown_mv = mv;
+}
+
+#ifdef CONFIG_ZEPHCORE_UI_DISPLAY
+static void auto_shutdown_warn_screen(void)
+{
+	/* Wake the panel (OLED may be blanked by auto-off; EPD is always
+	 * visible). Centre two lines; the message persists on e-paper after
+	 * power is cut, so e-paper needs no hold delay. */
+	mc_display_on();
+	mc_display_clear();
+
+	const char *l1 = "Low Battery";
+	const char *l2 = "Shutting Down";
+	uint16_t w  = mc_display_width();
+	uint8_t  fw = mc_display_font_width();
+	uint8_t  fh = mc_display_font_height();
+	int x1 = (fw && w) ? ((int)w - (int)strlen(l1) * fw) / 2 : 0;
+	int x2 = (fw && w) ? ((int)w - (int)strlen(l2) * fw) / 2 : 0;
+	if (x1 < 0) x1 = 0;
+	if (x2 < 0) x2 = 0;
+	int y1 = (int)mc_display_height() / 2 - (int)fh;
+	if (y1 < 0) y1 = 0;
+
+	mc_display_text(x1, y1, l1, false);
+	mc_display_text(x2, y1 + fh + 2, l2, false);
+	mc_display_finalize();
+
+	/* OLED blanks the instant power drops, so hold long enough to read it.
+	 * EPD keeps the image with no power, so skip the delay. */
+	if (!mc_display_is_epd()) {
+		k_sleep(K_MSEC(3000));
+	}
+}
+#endif /* CONFIG_ZEPHCORE_UI_DISPLAY */
+
+void ui_auto_shutdown_check(void)
+{
+	if (!s_batt_provider || s_auto_shutdown_mv == 0) {
+		return;  /* no battery provider, or runtime-disabled */
+	}
+
+	uint32_t now = k_uptime_get_32();
+	static uint32_t next_check_ms;   /* 0 at boot → first tick samples */
+	if (next_check_ms != 0 && (now - next_check_ms) < UI_AUTO_SHUTDOWN_CHECK_MS) {
+		return;
+	}
+	next_check_ms = now;
+
+	uint16_t mv = s_batt_provider();
+	if (mv == 0 || mv >= s_auto_shutdown_mv) {
+		return;  /* no battery hardware / reading, or healthy */
+	}
+
+	/* Don't power off while charging or USB-powered — the reading is the
+	 * cell, not the supply, and yanking power on a bench cable is annoying. */
+	if (s_power_source_provider && s_power_source_provider()) {
+		LOG_INF("auto-shutdown: %u mV below threshold but externally powered", mv);
+		return;
+	}
+
+	LOG_WRN("auto-shutdown: battery %u mV < %u mV — powering off",
+		mv, s_auto_shutdown_mv);
+
+#ifdef CONFIG_ZEPHCORE_UI_DISPLAY
+	auto_shutdown_warn_screen();
+#endif
+
+#ifdef CONFIG_POWEROFF
+	ui_prepare_for_system_off();
+	sys_poweroff();
+	CODE_UNREACHABLE;
+#else
+	LOG_WRN("auto-shutdown: CONFIG_POWEROFF not enabled — cannot power off");
+#endif
+}
+
+#else  /* feature disabled (non-nRF52 / threshold default 0) */
+
+void ui_set_auto_shutdown_mv(uint16_t mv) { (void)mv; }
+void ui_auto_shutdown_check(void) { }
+
+#endif /* CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0 */
 
 /* ========== Shared splash logo ==========
  * 128×13 ZephCore wordmark, MSB-first row-major (Adafruit XBM/drawBitmap

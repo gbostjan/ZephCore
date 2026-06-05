@@ -124,6 +124,18 @@ WEAK void ui_set_battery_provider(uint16_t (*provider)(void))
 	ARG_UNUSED(provider);
 }
 
+WEAK void ui_set_power_source_provider(bool (*provider)(void))
+{
+	ARG_UNUSED(provider);
+}
+
+WEAK void ui_set_auto_shutdown_mv(uint16_t mv)
+{
+	ARG_UNUSED(mv);
+}
+
+WEAK void ui_auto_shutdown_check(void) { }
+
 WEAK void ui_refresh_battery(void) { }
 WEAK void ui_invalidate_battery_cache(void) { }
 

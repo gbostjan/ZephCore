@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
@@ -451,6 +452,11 @@ static void mesh_event_loop(void)
 			}
 
 			mesh_housekeeping_ui_refresh();
+
+			/* Low-battery auto-shutdown (companion only). Self-throttled
+			 * and compiled out unless the board sets a threshold — no
+			 * extra poll, just a cheap call on the existing tick. */
+			ui_auto_shutdown_check();
 		}
 
 		/* Off-main pref mutators (e.g. gps_fix_callback in modem_chat
@@ -624,10 +630,83 @@ static CommonCLI companion_cli(zephyr_board, rtc_clock, companion_acl,
 /* Dispatch a CLI text line from USB, reply back over USB CDC. Output mirrors
  * the repeater's serial CLI ("\r\n  -> <reply>\r\n", CRLF) so the
  * flasher.meshcore.io serial console renders companion replies identically. */
+#if defined(CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) && \
+	CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0
+/* Companion-only CLI sideband for the low-battery auto-shutdown threshold.
+ * Handled here (not in shared CommonCLI) so the pref persists via the
+ * companion datastore and the command never appears on repeater builds.
+ * Returns true if the line was a recognised autoshutdown command. */
+static bool handle_autoshutdown_cli(const char *line, char *reply)
+{
+	if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
+		/* No global CLI help exists; list only the companion-specific extras
+		 * and make clear the standard set/get radio+mesh commands also work. */
+		strcpy(reply,
+		       "Auto-shutdown (plus the standard set/get commands):\r\n"
+		       "  get autoshutdown      - show low-battery cutoff\r\n"
+		       "  set autoshutdown <mV> - 0 = off, or 1-5000 mV");
+		return true;
+	}
+	if (strcmp(line, "get autoshutdown") == 0) {
+		uint16_t mv = companion_mesh.prefs.auto_shutdown_mv;
+		if (mv == 0) {
+			strcpy(reply, "autoshutdown: off");
+		} else {
+			snprintf(reply, CLI_REPLY_SIZE, "autoshutdown: %u mV", mv);
+		}
+		return true;
+	}
+	if (strncmp(line, "set autoshutdown ", 17) == 0) {
+		const char *arg = line + 17;
+		while (*arg == ' ') {
+			arg++;
+		}
+		/* Numbers only: first char must be a digit (rejects sign, letters,
+		 * empty), and nothing but trailing whitespace may follow. */
+		char *end = NULL;
+		long v = strtol(arg, &end, 10);
+		while (*end == ' ' || *end == '\r' || *end == '\n' || *end == '\t') {
+			end++;
+		}
+		if (arg[0] < '0' || arg[0] > '9' || *end != '\0') {
+			strcpy(reply, "ERROR: numbers only (0 = off, 1-5000 mV)");
+			return true;
+		}
+		if (v > 5000) {
+			strcpy(reply, "ERROR: must be 0 (off) or 1-5000 mV");
+			return true;
+		}
+		companion_mesh.prefs.auto_shutdown_mv = (uint16_t)v;
+		/* Defer the flash write to the main thread (this runs on sysworkq via
+		 * the USB RX work handler). A synchronous savePrefs here could race a
+		 * concurrent main-thread save (e.g. GPS-fix MESH_EVENT_PREFS_DIRTY) on
+		 * the same prefs .tmp file. Posting the event coalesces both onto main. */
+		k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
+		ui_set_auto_shutdown_mv((uint16_t)v);
+		if (v == 0) {
+			strcpy(reply, "OK - autoshutdown off");
+		} else {
+			snprintf(reply, CLI_REPLY_SIZE, "OK - autoshutdown %ld mV", v);
+		}
+		return true;
+	}
+	return false;
+}
+#endif
+
 static void companion_cli_dispatch(const char *line)
 {
 	char reply[CLI_REPLY_SIZE];
 	reply[0] = '\0';
+#if defined(CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) && \
+	CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0
+	if (handle_autoshutdown_cli(line, reply)) {
+		zephcore_usb_companion_write_text("\r\n  -> ", 7);
+		zephcore_usb_companion_write_text(reply, strlen(reply));
+		zephcore_usb_companion_write_text("\r\n", 2);
+		return;
+	}
+#endif
 	companion_cli.handleCommand(0, line, reply);
 	if (reply[0] != '\0') {
 		zephcore_usb_companion_write_text("\r\n  -> ", 7);
@@ -804,6 +883,7 @@ int main(void)
 	companion_mesh.prefs.rx_boost = 1;          /* Default: boosted RX (+3dB sensitivity, +2mA) */
 	companion_mesh.prefs.apc_enabled = 0;       /* Default: APC off */
 	companion_mesh.prefs.apc_margin = 20;       /* Companions: more conservative margin (mobile) */
+	companion_mesh.prefs.auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS; /* low-batt cutoff (0=off) */
 
 	/* Load prefs from storage */
 	data_store.loadPrefs(companion_mesh.prefs);
@@ -857,6 +937,8 @@ int main(void)
 	companion_mesh.setPushCallback(push_callback);
 	companion_mesh.setBatteryCallback(get_battery_mv);
 	ui_set_battery_provider(get_battery_mv);
+	ui_set_power_source_provider([]() { return zephyr_board.isExternalPowered(); });
+	ui_set_auto_shutdown_mv(companion_mesh.prefs.auto_shutdown_mv);
 	companion_mesh.setRadioReconfigureCallback(radio_reconfigure);
 	companion_mesh.setPinChangeCallback([](uint32_t new_pin) {
 		zephcore_ble_set_passkey(new_pin);

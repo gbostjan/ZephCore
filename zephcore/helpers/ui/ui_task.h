@@ -194,6 +194,33 @@ void ui_refresh_battery(void);
 void ui_prepare_for_system_off(void);
 
 /**
+ * Register a power-source provider used by ui_auto_shutdown_check().
+ * provider() must return true when the device is externally powered
+ * (USB/charger present), false on battery. NULL = always treat as battery.
+ */
+void ui_set_power_source_provider(bool (*provider)(void));
+
+/**
+ * Set the runtime low-battery auto-shutdown threshold in millivolts.
+ * 0 disables the check. Seeded at boot from prefs (which default to
+ * CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) and updated live by the CLI.
+ * No-op on builds where the feature is compiled out (non-nRF52).
+ */
+void ui_set_auto_shutdown_mv(uint16_t mv);
+
+/**
+ * Low-battery auto-shutdown check (companion only).
+ *
+ * Call from the periodic housekeeping tick — it self-throttles its own ADC
+ * sampling, so calling it every tick is cheap (no extra polling). When
+ * CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS is 0 this is a no-op. Otherwise,
+ * if the battery is below the threshold AND not externally powered, it shows
+ * a brief warning (3 s on OLED, instant-persist on e-paper) and powers off
+ * via ui_prepare_for_system_off() + sys_poweroff().
+ */
+void ui_auto_shutdown_check(void);
+
+/**
  * Drop the battery-refresh freshness timestamp. The next
  * ui_refresh_battery() call is guaranteed to sample the ADC.
  * Use when waking the display from sleep so the user sees a current

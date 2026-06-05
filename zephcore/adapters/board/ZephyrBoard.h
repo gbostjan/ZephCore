@@ -25,6 +25,7 @@ public:
 	bool startOTAUpdate(const char *id, char reply[]) override;  /* Reboot into BLE OTA DFU */
 	void clearBootloaderMagic();      /* Clear stale GPREGRET values at startup */
 	uint8_t getStartupReason() const override;
+	bool isExternalPowered() override;  /* nRF52: VBUS present (USB/charger); else false */
 
 private:
 	/* Runtime override for vbat-mv-multiplier. Units match DT `vbat-mv-multiplier`
