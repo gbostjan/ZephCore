@@ -225,65 +225,67 @@ static void lr20xx_configure_rfswitch(void *ctx, const struct lr20xx_config *cfg
 	}
 }
 
-/* ── PA power lookup table (from Semtech lr20xx_pa_pwr_cfg.h) ──────── */
-
+/* ── PA power lookup table (LF / sub-GHz) ─────────────────────────────
+ *
+ * Mirrors RadioLib's paOptTableLf (known-good on real LR2021 silicon).
+ * Each row is { pa_lf_duty_cycle, pa_lf_slices, pa_val } where pa_val is the
+ * value passed to SetTxParams.
+ *
+ * IMPORTANT: pa_val is a PA *calibration* value, NOT power in dBm or half-dBm.
+ * Our previous table mis-modeled it as 0.5dB steps (e.g. 44 for +22dBm); the
+ * chip rejected those out-of-range values (PERR / CMD_ERROR) and refused TX.
+ * RadioLib's LF range is -9..+22 dBm, indexed as (power_dbm + 9).
+ */
 struct lr20xx_pa_pwr_entry {
-	int8_t  half_power;
 	uint8_t pa_duty_cycle;
 	uint8_t pa_lf_slices;
+	int8_t  pa_val;
 };
 
-#define LR20XX_LF_MIN_PWR (-10)
+#define LR20XX_LF_MIN_PWR (-9)
 #define LR20XX_LF_MAX_PWR 22
 
-/* Calibrated per-dBm PA config — each row is [half_power, duty_cycle, slices]
- * for the corresponding output power from -10 to +22 dBm inclusive.
- *
- * 10–22 dBm: from LR2021 datasheet Rev 1.1, Table 7-16 (915MHz ref design).
- *   TX_PARAM is in 0.5dB steps; half_power = TX_PARAM * 2.
- *   For integer dBm targets, we take the exact row from the table.
- *
- * -10 to +9 dBm: from Semtech SDK lr20xx_pa_pwr_cfg.h (not in datasheet).
- */
 static const struct lr20xx_pa_pwr_entry pa_lf_table[] = {
-	{ -18, 3, 6 }, /* -10 dBm  (SDK) */
-	{ -13, 2, 5 }, /*  -9 dBm  (SDK) */
-	{ -13, 6, 1 }, /*  -8 dBm  (SDK) */
-	{  -6, 6, 0 }, /*  -7 dBm  (SDK) */
-	{   4, 1, 0 }, /*  -6 dBm  (SDK) */
-	{   4, 2, 0 }, /*  -5 dBm  (SDK) */
-	{   2, 1, 3 }, /*  -4 dBm  (SDK) */
-	{  14, 0, 0 }, /*  -3 dBm  (SDK) */
-	{   9, 0, 3 }, /*  -2 dBm  (SDK) */
-	{  11, 3, 0 }, /*  -1 dBm  (SDK) */
-	{  16, 1, 0 }, /*   0 dBm  (SDK) */
-	{  11, 7, 0 }, /*   1 dBm  (SDK) */
-	{  18, 2, 0 }, /*   2 dBm  (SDK) */
-	{  16, 5, 0 }, /*   3 dBm  (SDK) */
-	{  17, 7, 0 }, /*   4 dBm  (SDK) */
-	{  21, 1, 2 }, /*   5 dBm  (SDK) */
-	{  25, 3, 0 }, /*   6 dBm  (SDK) */
-	{  32, 0, 1 }, /*   7 dBm  (SDK) */
-	{  32, 2, 0 }, /*   8 dBm  (SDK) */
-	{  27, 3, 1 }, /*   9 dBm  (SDK) */
-	{  32, 2, 1 }, /*  10 dBm  (DS Table 7-16: TX_PARAM=16) */
-	{  32, 2, 2 }, /*  11 dBm  (DS Table 7-16: TX_PARAM=16) */
-	{  30, 5, 1 }, /*  12 dBm  (DS Table 7-16: TX_PARAM=15) */
-	{  31, 4, 3 }, /*  13 dBm  (DS Table 7-16: TX_PARAM=15.5) */
-	{  34, 4, 2 }, /*  14 dBm  (DS Table 7-16: TX_PARAM=17) */
-	{  33, 5, 4 }, /*  15 dBm  (DS Table 7-16: TX_PARAM=16.5) */
-	{  36, 4, 4 }, /*  16 dBm  (DS Table 7-16: TX_PARAM=18) */
-	{  36, 5, 6 }, /*  17 dBm  (DS Table 7-16: TX_PARAM=18) */
-	{  38, 5, 6 }, /*  18 dBm  (DS Table 7-16: TX_PARAM=19) */
-	{  39, 6, 6 }, /*  19 dBm  (DS Table 7-16: TX_PARAM=19.5) */
-	{  41, 6, 6 }, /*  20 dBm  (DS Table 7-16: TX_PARAM=20.5) */
-	{  42, 7, 7 }, /*  21 dBm  (DS Table 7-16: TX_PARAM=21) */
-	{  44, 7, 6 }, /*  22 dBm  (DS Table 7-16: TX_PARAM=22) */
+	{ 1, 1,  8 }, /*  -9 dBm */
+	{ 2, 2,  1 }, /*  -8 dBm */
+	{ 2, 2,  3 }, /*  -7 dBm */
+	{ 2, 2,  5 }, /*  -6 dBm */
+	{ 1, 2, 13 }, /*  -5 dBm */
+	{ 2, 1, 13 }, /*  -4 dBm */
+	{ 2, 2, 11 }, /*  -3 dBm */
+	{ 2, 2, 13 }, /*  -2 dBm */
+	{ 3, 1, 12 }, /*  -1 dBm */
+	{ 1, 1, 18 }, /*   0 dBm */
+	{ 1, 1, 20 }, /*   1 dBm */
+	{ 1, 1, 23 }, /*   2 dBm */
+	{ 1, 1, 27 }, /*   3 dBm */
+	{ 1, 1, 33 }, /*   4 dBm */
+	{ 1, 2, 26 }, /*   5 dBm */
+	{ 1, 2, 31 }, /*   6 dBm */
+	{ 1, 3, 27 }, /*   7 dBm */
+	{ 1, 1, 37 }, /*   8 dBm */
+	{ 1, 2, 40 }, /*   9 dBm */
+	{ 2, 1, 38 }, /*  10 dBm */
+	{ 2, 2, 39 }, /*  11 dBm */
+	{ 2, 4, 40 }, /*  12 dBm */
+	{ 2, 7, 41 }, /*  13 dBm */
+	{ 3, 2, 39 }, /*  14 dBm */
+	{ 3, 3, 39 }, /*  15 dBm */
+	{ 3, 6, 38 }, /*  16 dBm */
+	{ 4, 3, 37 }, /*  17 dBm */
+	{ 4, 5, 37 }, /*  18 dBm */
+	{ 4, 7, 38 }, /*  19 dBm */
+	{ 5, 3, 37 }, /*  20 dBm */
+	{ 5, 6, 37 }, /*  21 dBm */
+	{ 6, 7, 35 }, /*  22 dBm */
 };
+
+/* PA_HF_DUTY_CYCLE "unused" marker (RADIOLIB_LR2021_PA_HF_DUTY_CYCLE_UNUSED) */
+#define LR20XX_PA_HF_DUTY_CYCLE_UNUSED 16
 
 static void lr20xx_get_pa_cfg_for_power(int8_t power_dbm,
 					lr20xx_radio_common_pa_cfg_t *pa,
-					int8_t *half_power_out)
+					int8_t *pa_val_out)
 {
 	if (power_dbm < LR20XX_LF_MIN_PWR) {
 		power_dbm = LR20XX_LF_MIN_PWR;
@@ -299,9 +301,9 @@ static void lr20xx_get_pa_cfg_for_power(int8_t power_dbm,
 	pa->pa_lf_mode       = LR20XX_RADIO_COMMON_PA_LF_MODE_FSM;
 	pa->pa_lf_duty_cycle = e->pa_duty_cycle;
 	pa->pa_lf_slices     = e->pa_lf_slices;
-	pa->pa_hf_duty_cycle = 16;
+	pa->pa_hf_duty_cycle = LR20XX_PA_HF_DUTY_CYCLE_UNUSED;
 
-	*half_power_out = e->half_power;
+	*pa_val_out = e->pa_val;
 }
 
 /* ── Hardware reset (BUSY stuck recovery) ───────────────────────────── */
@@ -373,6 +375,25 @@ static void lr20xx_apply_modem_config(struct lr20xx_data *data,
 	rc = lr20xx_radio_common_set_pkt_type(ctx, LR20XX_RADIO_COMMON_PKT_TYPE_LORA);
 	LOG_DBG("modem_cfg: set_pkt_type=%d", rc);
 
+	/* Front-end calibration paired with set_rf_freq, exactly like RadioLib's
+	 * setFrequency() (cal THEN set, together).  One cal covers ±50MHz so the
+	 * bin is not the issue — the cal just has to be (re)applied here, right
+	 * before the frequency is set and RX/TX starts.  Doing it only once at
+	 * config time left the chip reporting RXFREQ_NO_FE_CAL (0x0200) at RX and
+	 * refusing TX (PERR). */
+	{
+		lr20xx_radio_common_front_end_calibration_value_t fe_cal = {
+			.rx_path = LR20XX_RADIO_COMMON_RX_PATH_LF,
+			.frequency_in_hertz = mc->frequency,
+		};
+		rc = lr20xx_radio_common_calibrate_front_end_helper(ctx, &fe_cal, 1);
+		lr20xx_system_errors_t fe_err = 0;
+		lr20xx_system_get_errors(ctx, &fe_err);
+		LOG_DBG("modem_cfg: FE cal(%uHz) rc=%d post-cal-err=0x%04x",
+			mc->frequency, rc, fe_err);
+		lr20xx_system_clear_errors(ctx);
+	}
+
 	rc = lr20xx_radio_common_set_rf_freq(ctx, mc->frequency);
 	LOG_DBG("modem_cfg: set_rf_freq(%u)=%d", mc->frequency, rc);
 
@@ -422,30 +443,25 @@ static void lr20xx_apply_modem_config(struct lr20xx_data *data,
 		mc->public_network ? 0x34 : 0x12, rc);
 
 	if (tx_mode) {
-		/* PA config: Semtech SDK 3-byte packed format is CORRECT per
-		 * datasheet Table 7-15 (p132):
-		 *   Byte 2: (pa_sel<<7) | rfu(4:0) | pa_lf_mode(1:0)
-		 *   Byte 3: pa_lf_duty_cycle(3:0) | pa_lf_slices(3:0)
-		 *   Byte 4: rfu(2:0) | pa_hf_duty_cycle(4:0)
-		 *
-		 * RadioLib's 5-byte format was WRONG (misread the datasheet).
-		 * The SDK's lr20xx_radio_common_set_pa_cfg() packs correctly.
-		 *
-		 * PA values from datasheet Table 7-16 (915MHz ref design).
-		 */
+		/* PA config + TX params from RadioLib's known-good LF table.
+		 * pa_val is a PA calibration value (NOT dBm/half-dBm). */
 		lr20xx_radio_common_pa_cfg_t pa;
-		int8_t half_power;
+		int8_t pa_val;
 
-		lr20xx_get_pa_cfg_for_power(mc->tx_power, &pa, &half_power);
+		/* DEBUG/TEST: force MINIMUM power (-9dBm, 1 PA slice) to probe the
+		 * supply-sag hypothesis.  If TX keys here (mode=5 + carrier) but
+		 * not at +22dBm (7 slices), the rail can't source PA current →
+		 * hardware power limit.  REVERT to mc->tx_power after testing. */
+		lr20xx_get_pa_cfg_for_power(-9, &pa, &pa_val);
 		rc = lr20xx_radio_common_set_pa_cfg(ctx, &pa);
 		LOG_DBG("modem_cfg: set_pa_cfg(sel=%d mode=%d duty=%d slices=%d hf_duty=%d)=%d",
 			pa.pa_sel, pa.pa_lf_mode, pa.pa_lf_duty_cycle,
 			pa.pa_lf_slices, pa.pa_hf_duty_cycle, rc);
 
-		rc = lr20xx_radio_common_set_tx_params(ctx, half_power,
+		rc = lr20xx_radio_common_set_tx_params(ctx, pa_val,
 						  LR20XX_RADIO_COMMON_RAMP_48_US);
-		LOG_DBG("modem_cfg: set_tx_params(half_pwr=%d ramp=0x05)=%d",
-			half_power, rc);
+		LOG_DBG("modem_cfg: set_tx_params(pa_val=%d ramp=0x05)=%d",
+			pa_val, rc);
 	}
 
 	rc = lr20xx_system_set_dio_irq_cfg(ctx, LR20XX_SYSTEM_DIO_9,
@@ -572,6 +588,10 @@ static void lr20xx_start_rx(struct lr20xx_data *data,
 
 	data->in_rx_mode = true;
 	data->tx_active = false;
+
+	/* DEBUG: dump state AFTER SET_RX — should show mode=4 (RX). The
+	 * "modem-RX" dump inside apply_modem_config is taken before SET_RX. */
+	DUMP_CHIP_STATE(ctx, &data->hal_ctx, "post-SET_RX");
 }
 
 /* ── Lightweight RX restart (no modem reconfig) ─────────────────────── */
@@ -926,6 +946,29 @@ static int lr20xx_lora_send_async(const struct device *dev,
 	data->tx_active = true;
 
 	lr20xx_radio_common_set_tx(ctx, 5000);
+
+#if IS_ENABLED(CONFIG_LOG)
+	/* DEBUG: poll chip state right after SET_TX.  Non-destructive
+	 * (get_status does NOT clear IRQs).  We want to see:
+	 *   - cmd= on the FIRST poll == SET_TX's own command status
+	 *     (2=OK accepted, 1=PERR rejected, 0=FAIL not executed)
+	 *   - mode transitions 1(STBY)->5(TX)->1(fallback) if it really TXes
+	 *   - irq gaining TX_DONE (bit19, 0x00080000) at the chip level
+	 *   - whether DIO9 physically asserts (the MCU IRQ line)
+	 * Diagnostic only — the spi_mutex is held, so the DIO9 work handler
+	 * blocks until we unlock, then processes TX_DONE normally. */
+	for (int i = 0; i < 20; i++) {
+		lr20xx_system_stat1_t s1 = {0};
+		lr20xx_system_stat2_t s2 = {0};
+		lr20xx_system_irq_mask_t dbgirq = 0;
+		lr20xx_system_get_status(ctx, &s1, &s2, &dbgirq);
+		LOG_INF("TXpoll[%2d] cmd=%d mode=%d irq=0x%08x BUSY=%d DIO9=%d",
+			i, s1.command_status, s2.chip_mode, dbgirq,
+			gpio_pin_get_dt(&data->hal_ctx.busy),
+			gpio_pin_get_dt(&data->hal_ctx.dio1));
+		k_msleep(20);
+	}
+#endif
 
 	k_mutex_unlock(&data->spi_mutex);
 
@@ -1392,6 +1435,15 @@ static int lr20xx_hw_init(struct lr20xx_data *data,
 	st = lr20xx_radio_common_set_rx_tx_fallback_mode(ctx,
 						    LR20XX_RADIO_FALLBACK_STDBY_RC);
 
+	/* DEBUG/TEST: disable the low-battery / EoL detector.  The chip was
+	 * raising LOW_BATTERY (IRQ bit10, 0x400) during FE cal and TX and
+	 * refusing to enter TX.  Disabling it disambiguates:
+	 *   - TX now keys  → it was a FALSE VBAT reading (sense pin), done.
+	 *   - TX still dead → genuine supply brownout under RF (hardware).
+	 * Default trim is 1.88V; we both disable AND set the lowest (1.60V). */
+	st = lr20xx_system_set_lbd_cfg(ctx, false, LR20XX_SYSTEM_LBD_TRIM_1_60_V);
+	LOG_DBG("init: disable LBD (low-battery detect)=%d", st);
+
 	DUMP_CHIP_STATE(ctx, &data->hal_ctx, "pre-cal");
 
 	lr20xx_system_clear_errors(ctx);
@@ -1436,6 +1488,19 @@ static int lr20xx_hw_init(struct lr20xx_data *data,
 	lr20xx_radio_common_get_pkt_type(ctx, &pkt_readback);
 
 	DUMP_CHIP_STATE(ctx, &data->hal_ctx, "init-done");
+
+	/* DEBUG: what voltage does the chip see on its OWN supply pin? (mV,
+	 * after MU calibration).  If this reads low (≪3000mV) while the board
+	 * is powered, the LR2021 VBAT/supply pin is floating or miswired — that
+	 * is why it flags LOW_BATTERY and aborts TX no matter the system rail
+	 * or external battery. ~3000-3300mV ⇒ supply is fine, sag is transient. */
+	{
+		uint16_t vbat_mv = 0;
+		lr20xx_status_t vrc = lr20xx_system_get_vbat(ctx,
+			LR20XX_SYSTEM_VALUE_FORMAT_UNIT,
+			LR20XX_SYSTEM_MEAS_RES_12_BITS, &vbat_mv);
+		LOG_INF("init: chip VBAT reads %u mV (rc=%d)", vbat_mv, vrc);
+	}
 
 	lr20xx_system_clear_errors(ctx);
 	lr20xx_hal_enable_dio1_irq(&data->hal_ctx);
