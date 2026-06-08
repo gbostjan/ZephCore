@@ -20,9 +20,12 @@ LOG_MODULE_REGISTER(zephcore_ble, CONFIG_ZEPHCORE_BLE_LOG_LEVEL);
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
+#include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/services/nus.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/sys/byteorder.h>
 
 #include "ZephyrBLE.h"
 
@@ -113,6 +116,239 @@ static bool nus_notif_enabled;
 static bool ble_tx_ready = false;
 static bool ble_tx_in_progress = false;
 static int64_t ble_tx_start_time = 0;
+
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+/* Bump when static BT_GATT_SERVICE_DEFINE layout or registration order changes.
+ * 1 = pre-2cf4b97 (dfu_svc before secure_nus_svc)
+ * 2 = secure_nus_svc_dfu after secure_nus_svc (+ packet/revision chars) */
+#define ZEPHCORE_GATT_LAYOUT_VERSION 2
+
+/* Delay before sending Service Changed after L2 security is established.
+ * On a fresh pairing, pairing_complete() fires within this window and marks the
+ * peer current, so only genuine bonded reconnects with a stale layout get an SC.
+ * The delay also gives the peer time to subscribe to the Service Changed CCC. */
+#define GATT_SC_INDICATE_DELAY_MS 1000
+
+static bool gatt_sc_ind_in_flight;
+static const struct bt_gatt_attr *gatt_sc_value_attr;
+static struct bt_gatt_indicate_params gatt_sc_ind_params;
+static uint16_t gatt_sc_ind_range[2];
+
+static void gatt_peer_settings_key(char *key, size_t key_len, const bt_addr_le_t *addr)
+{
+	char addr_str[BT_ADDR_LE_STR_LEN];
+
+	bt_addr_le_to_str(addr, addr_str, sizeof(addr_str));
+	snprintk(key, key_len, "ble/gatt_peer/%s", addr_str);
+}
+
+static int gatt_peer_layout_load(const bt_addr_le_t *addr, uint8_t *ver_out)
+{
+#if IS_ENABLED(CONFIG_SETTINGS)
+	char key[64];
+	ssize_t len;
+
+	gatt_peer_settings_key(key, sizeof(key), addr);
+	len = settings_load_one(key, ver_out, sizeof(*ver_out));
+	if (len == (ssize_t)sizeof(*ver_out)) {
+		return 0;
+	}
+#endif
+	return -ENOENT;
+}
+
+static int gatt_peer_layout_save(const bt_addr_le_t *addr, uint8_t ver)
+{
+#if IS_ENABLED(CONFIG_SETTINGS)
+	char key[64];
+	int err;
+
+	gatt_peer_settings_key(key, sizeof(key), addr);
+	err = settings_save_one(key, &ver, sizeof(ver));
+	return err;
+#else
+	ARG_UNUSED(addr);
+	ARG_UNUSED(ver);
+	return -ENOTSUP;
+#endif
+}
+
+static void gatt_peer_layout_delete(const bt_addr_le_t *addr)
+{
+#if IS_ENABLED(CONFIG_SETTINGS)
+	char key[64];
+
+	gatt_peer_settings_key(key, sizeof(key), addr);
+	settings_delete(key);
+#else
+	ARG_UNUSED(addr);
+#endif
+}
+
+static int gatt_global_layout_save(uint8_t ver)
+{
+#if IS_ENABLED(CONFIG_SETTINGS)
+	return settings_save_one("ble/gatt_layout", &ver, sizeof(ver));
+#else
+	ARG_UNUSED(ver);
+	return -ENOTSUP;
+#endif
+}
+
+struct gatt_layout_bond_ctx {
+	int count;
+};
+
+static void gatt_layout_count_bonds(const struct bt_bond_info *info, void *user_data)
+{
+	struct gatt_layout_bond_ctx *ctx =
+		static_cast<struct gatt_layout_bond_ctx *>(user_data);
+
+	ARG_UNUSED(info);
+	ctx->count++;
+}
+
+static void gatt_layout_check_after_settings_load(void)
+{
+#if IS_ENABLED(CONFIG_SETTINGS)
+	struct gatt_layout_bond_ctx bond_ctx = { 0 };
+	uint8_t global;
+	uint8_t prev;
+	ssize_t len;
+
+	bt_foreach_bond(BT_ID_DEFAULT, gatt_layout_count_bonds, &bond_ctx);
+
+	len = settings_load_one("ble/gatt_layout", &global, sizeof(global));
+	if (len != (ssize_t)sizeof(global)) {
+		if (bond_ctx.count == 0) {
+			/* Fresh device — no stale phone caches to fix. */
+			if (gatt_global_layout_save(ZEPHCORE_GATT_LAYOUT_VERSION) == 0) {
+				LOG_DBG("GATT layout v%u seeded (no bonds)",
+					ZEPHCORE_GATT_LAYOUT_VERSION);
+			}
+			return;
+		}
+
+		prev = 1; /* bonded before layout tracking existed */
+	} else {
+		prev = global;
+	}
+
+	if (prev != ZEPHCORE_GATT_LAYOUT_VERSION) {
+		LOG_INF("GATT layout v%u -> v%u (per-peer SC on connect)",
+			prev, ZEPHCORE_GATT_LAYOUT_VERSION);
+		if (gatt_global_layout_save(ZEPHCORE_GATT_LAYOUT_VERSION) != 0) {
+			LOG_WRN("GATT layout global version save failed");
+		}
+	}
+#endif
+}
+
+static uint8_t gatt_sc_find_value_attr(const struct bt_gatt_attr *attr, uint16_t handle,
+				       void *user_data)
+{
+	ARG_UNUSED(handle);
+	ARG_UNUSED(user_data);
+
+	if (!bt_uuid_cmp(attr->uuid, BT_UUID_GATT_CHRC)) {
+		const struct bt_gatt_chrc *chrc =
+			static_cast<const struct bt_gatt_chrc *>(attr->user_data);
+
+		if (!bt_uuid_cmp(chrc->uuid, BT_UUID_GATT_SC)) {
+			gatt_sc_value_attr = bt_gatt_attr_next(attr);
+			return BT_GATT_ITER_STOP;
+		}
+	}
+
+	return BT_GATT_ITER_CONTINUE;
+}
+
+static void gatt_sc_indicate_cb(struct bt_conn *conn, struct bt_gatt_indicate_params *params,
+				uint8_t err)
+{
+	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+
+	ARG_UNUSED(params);
+
+	gatt_sc_ind_in_flight = false;
+
+	if (err) {
+		LOG_WRN("Service Changed indicate failed: 0x%02x (will retry)", err);
+		return;
+	}
+
+	if (gatt_peer_layout_save(addr, ZEPHCORE_GATT_LAYOUT_VERSION) != 0) {
+		LOG_WRN("GATT peer layout save failed (will retry on reconnect)");
+		return;
+	}
+
+	LOG_INF("GATT layout v%u: Service Changed confirmed", ZEPHCORE_GATT_LAYOUT_VERSION);
+}
+
+static void gatt_peer_mark_current_no_sc(const bt_addr_le_t *addr)
+{
+	if (gatt_peer_layout_save(addr, ZEPHCORE_GATT_LAYOUT_VERSION) != 0) {
+		LOG_WRN("GATT peer layout save failed");
+		return;
+	}
+
+	LOG_DBG("GATT layout v%u: peer marked current (no SC needed)", ZEPHCORE_GATT_LAYOUT_VERSION);
+}
+
+static void maybe_indicate_service_changed(struct bt_conn *conn)
+{
+	const bt_addr_le_t *addr = bt_conn_get_dst(conn);
+	uint8_t peer_ver;
+	int err;
+
+	if (gatt_sc_ind_in_flight) {
+		return;
+	}
+
+	if (gatt_peer_layout_load(addr, &peer_ver) == 0 &&
+	    peer_ver == ZEPHCORE_GATT_LAYOUT_VERSION) {
+		return;
+	}
+
+	if (!gatt_sc_value_attr) {
+		bt_gatt_foreach_attr(0x0001, 0xffff, gatt_sc_find_value_attr, NULL);
+		if (!gatt_sc_value_attr) {
+			LOG_ERR("Service Changed characteristic not found");
+			return;
+		}
+	}
+
+	gatt_sc_ind_range[0] = sys_cpu_to_le16(0x0001);
+	gatt_sc_ind_range[1] = sys_cpu_to_le16(0xffff);
+
+	memset(&gatt_sc_ind_params, 0, sizeof(gatt_sc_ind_params));
+	gatt_sc_ind_params.attr = gatt_sc_value_attr;
+	gatt_sc_ind_params.func = gatt_sc_indicate_cb;
+	gatt_sc_ind_params.data = gatt_sc_ind_range;
+	gatt_sc_ind_params.len = sizeof(gatt_sc_ind_range);
+
+	err = bt_gatt_indicate(conn, &gatt_sc_ind_params);
+	if (err) {
+		LOG_WRN("Service Changed indicate err %d (will retry)", err);
+		return;
+	}
+
+	gatt_sc_ind_in_flight = true;
+	LOG_INF("GATT layout migration: Service Changed indicated");
+}
+
+/* Deferred from security_changed() — see GATT_SC_INDICATE_DELAY_MS. Runs on the
+ * single active connection (BT_MAX_CONN=1); cancelled on disconnect. */
+static void gatt_sc_work_fn(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (current_conn) {
+		maybe_indicate_service_changed(current_conn);
+	}
+}
+static K_WORK_DELAYABLE_DEFINE(gatt_sc_work, gatt_sc_work_fn);
+#endif /* CONFIG_BT_GATT_SERVICE_CHANGED */
 
 /* Active interface tracking */
 static enum zephcore_iface active_iface = ZEPHCORE_IFACE_NONE;
@@ -532,6 +768,11 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	k_work_cancel_delayable(&tx_drain_work);
 	k_work_cancel_delayable(&overflow_retry_work);
 
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+	k_work_cancel_delayable(&gatt_sc_work);
+	gatt_sc_ind_in_flight = false;
+#endif
+
 	/* Notify main of BLE disconnection */
 	if (ble_cbs && ble_cbs->on_disconnected) {
 		ble_cbs->on_disconnected();
@@ -578,6 +819,13 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 	}
 
 	if (level >= BT_SECURITY_L2) {
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+		/* After a GATT layout change, bonded phones may hold stale handles.
+		 * Service Changed forces rediscovery without breaking the bond.
+		 * Deferred so a fresh pairing (pairing_complete marks the peer
+		 * current) doesn't trigger a needless SC. */
+		k_work_reschedule(&gatt_sc_work, K_MSEC(GATT_SC_INDICATE_DELAY_MS));
+#endif
 #if defined(CONFIG_BT_USER_DATA_LEN_UPDATE)
 		/* Fallback DLE request — if le_phy_updated() already sent it,
 		 * request_dle() returns immediately (dle_requested flag). */
@@ -698,8 +946,14 @@ static struct bt_conn_auth_cb auth_cb = {
 
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
-	ARG_UNUSED(conn);
 	LOG_INF("pairing complete: bonded=%d", bonded);
+
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+	/* Fresh pairing always does full GATT discovery — no Service Changed needed. */
+	if (bonded) {
+		gatt_peer_mark_current_no_sc(bt_conn_get_dst(conn));
+	}
+#endif
 
 	if (ble_claim_iface_if_idle()) {
 		LOG_INF("pairing complete, activating BLE interface");
@@ -715,9 +969,23 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 	bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
 }
 
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+/* Fires on explicit unpair and on BT_MAX_PAIRED overwrite-oldest eviction (both
+ * route through bt_unpair). Drop the per-peer layout key so /lfs/settings does
+ * not accumulate orphaned ble/gatt_peer entries over the device lifetime. */
+static void bond_deleted(uint8_t id, const bt_addr_le_t *peer)
+{
+	ARG_UNUSED(id);
+	gatt_peer_layout_delete(peer);
+}
+#endif
+
 static struct bt_conn_auth_info_cb auth_info_cb = {
 	.pairing_complete = pairing_complete,
 	.pairing_failed = pairing_failed,
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+	.bond_deleted = bond_deleted,
+#endif
 };
 
 /* ========== TX congestion overflow retry ========== */
@@ -1004,6 +1272,9 @@ void zephcore_ble_start(const char *name)
 {
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_load();
+#if IS_ENABLED(CONFIG_BT_GATT_SERVICE_CHANGED)
+		gatt_layout_check_after_settings_load();
+#endif
 	}
 
 	build_device_name_and_adv(name);
