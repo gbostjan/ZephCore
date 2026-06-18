@@ -529,6 +529,15 @@ void mc_display_finalize(void)
 		display_blanking_on(disp_dev);
 		cfb_framebuffer_finalize(disp_dev);
 		display_blanking_off(disp_dev);
+
+		/* Prime the partial-refresh reference frame.  After a full
+		 * refresh the SSD1681's "old frame" RAM is stale, so the first
+		 * partial diff produces a wrong delta and the partial waveform
+		 * smears static regions (e.g. the top bar).  One extra partial
+		 * finalize with the same content lets the controller record the
+		 * post-full-refresh state as its reference; it's a visual no-op
+		 * (zero-diff → no pixel transitions) but fixes subsequent diffs. */
+		cfb_framebuffer_finalize(disp_dev);
 		epd_partial_count = 0;
 	} else {
 		cfb_framebuffer_finalize(disp_dev);
