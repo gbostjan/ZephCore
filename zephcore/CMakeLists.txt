@@ -685,16 +685,18 @@ else()
   target_include_directories(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/adapters/transport
   )
-  # USB CDC companion transport.  Compiled whenever logging is on (USB can
-  # double as the log backend) OR the standalone companion-over-USB feature is
-  # enabled — this MUST match the ZEPHCORE_USB_STACK guard in main_companion.cpp
-  # (CONFIG_LOG || CONFIG_ZEPHCORE_COMPANION_USB), otherwise the call sites
-  # compile but the implementation is never linked (undefined references).
-  # Pulls in the shared ZephyrUSBCDC module too (USBD lifecycle + DTR callback).
-  if(CONFIG_LOG OR CONFIG_ZEPHCORE_COMPANION_USB)
+  # Wired-companion transport.  Compiled whenever logging is on (USB can
+  # double as the log backend), the native-USB companion is enabled, OR the
+  # plain-UART companion is enabled — this MUST match the ZEPHCORE_USB_STACK
+  # guard in main_companion.cpp (CONFIG_LOG || CONFIG_ZEPHCORE_COMPANION_USB ||
+  # CONFIG_ZEPHCORE_COMPANION_SERIAL), otherwise the call sites compile but the
+  # implementation is never linked (undefined references).  The shared
+  # ZephyrUSBCDC module (USBD lifecycle + DTR) is pulled in only for the native
+  # USB CDC backend — the plain-UART backend has no USBD stack.
+  if(CONFIG_LOG OR CONFIG_ZEPHCORE_COMPANION_USB OR CONFIG_ZEPHCORE_COMPANION_SERIAL)
     target_sources(app PRIVATE
       adapters/usb/ZephyrCompanionUSB.cpp
-      helpers/CommonCLI.cpp  # backs the USB-only text CLI dispatch
+      helpers/CommonCLI.cpp  # backs the wired text CLI dispatch
     )
     if(NOT CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT AND (CONFIG_USB_CDC_ACM OR CONFIG_USBD_CDC_ACM_CLASS))
       target_sources(app PRIVATE

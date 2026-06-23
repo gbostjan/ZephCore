@@ -126,6 +126,25 @@ config ZEPHCORE_COMPANION_USB
 	  For ESP32-S3 boards, USB_DEVICE_STACK_NEXT must be enabled first via
 	  boards/common/esp32s3_usb.conf before this becomes active.
 
+config ZEPHCORE_COMPANION_SERIAL
+	bool "Enable plain-UART companion transport"
+	depends on ZEPHCORE_ROLE_COMPANION && !ZEPHCORE_COMPANION_USB
+	help
+	  Run the same wired-companion stack (ZephyrCompanionUSB: frame parser,
+	  TX ring, text CLI, BLE-arbitrated interface) over a plain UART instead
+	  of a native-USB CDC-ACM endpoint.  For boards whose USB-C is wired to a
+	  USB-UART bridge rather than the SoC's native USB (e.g. Heltec V3 /
+	  CP2102), or that have no USB device controller at all.
+
+	  The board points the transport at its UART with the
+	  `zephcore,companion-uart` chosen node (e.g. = &uart0); that UART must be
+	  dedicated to the companion (console/shell moved off or disabled), since
+	  the protocol stream and a text console cannot share one line.  Coexists
+	  with BLE exactly like the USB backend — same first-come arbitration.
+
+	  Distinct from the legacy SerialCompanionTransport (no-BLE STM32WL path):
+	  this one keeps BLE and adds the text CLI.
+
 if ZEPHCORE_ROLE_REPEATER || ZEPHCORE_ROLE_ROOM_SERVER
 
 config ZEPHCORE_REPEATER_UPLINK

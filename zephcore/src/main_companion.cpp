@@ -36,11 +36,15 @@ LOG_MODULE_REGISTER(zephcore_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #include <ZephyrBLE.h>
 
-/* The USB CDC companion stack is compiled when either logging needs the CDC
- * console (debug builds) or the binary companion transport is explicitly
- * enabled (CONFIG_ZEPHCORE_COMPANION_USB, default-y on USB-capable boards). */
+/* The wired-companion stack (ZephyrCompanionUSB) is compiled when either
+ * logging needs the CDC console (debug builds), the native-USB companion is
+ * enabled (CONFIG_ZEPHCORE_COMPANION_USB, default-y on USB-capable boards), or
+ * the plain-UART companion is enabled (CONFIG_ZEPHCORE_COMPANION_SERIAL, for
+ * USB-UART-bridge / no-USB boards).  All three share the same frame parser,
+ * TX ring, CLI, and BLE arbitration — only the byte backend differs. */
 #define ZEPHCORE_USB_STACK \
-	(IS_ENABLED(CONFIG_LOG) || IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_USB))
+	(IS_ENABLED(CONFIG_LOG) || IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_USB) || \
+	 IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_SERIAL))
 
 #if ZEPHCORE_USB_STACK
 #include <ZephyrCompanionUSB.h>
