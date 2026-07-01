@@ -504,11 +504,9 @@ static void action_deep_sleep(void)
 	}
 	buzzer_stop();
 
-#ifdef CONFIG_BOARD_T1000_E
 	if (buzzer_is_quiet()) {
 		ui_led_flash_shutdown();
 	}
-#endif
 #endif
 
 	/* Shared peripheral teardown + SENSE config for sw0 wake.
