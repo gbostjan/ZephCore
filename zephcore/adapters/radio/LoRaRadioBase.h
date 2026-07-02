@@ -78,7 +78,8 @@ public:
 	/* Power saving */
 	void enableRxDutyCycle(bool enable);
 	bool isRxDutyCycleEnabled() const { return _rx_duty_cycle_enabled; }
-	void setRxBoost(bool enable);
+	/* Returns false when the chip has no RX boost feature (SX127x). */
+	virtual bool setRxBoost(bool enable);
 	bool isRxBoostEnabled() const { return _rx_boost_enabled; }
 
 	/* Duty-cycle preamble false-positive counter.

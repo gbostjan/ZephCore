@@ -682,6 +682,10 @@ public:
 		LOG_INF("TX power %d dBm requested (reboot to apply)", power_dbm);
 	}
 
+	bool setRxBoostedGain(bool enable) override {
+		return lora_radio.setRxBoost(enable);
+	}
+
 	mesh::LocalIdentity& getSelfId() override { return companion_mesh.self_id; }
 
 	void saveIdentity(const mesh::LocalIdentity& new_id) override {

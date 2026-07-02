@@ -918,6 +918,10 @@ void RoomServerMesh::setTxPower(int8_t power_dbm) {
     radio_set_tx_power(power_dbm);
 }
 
+bool RoomServerMesh::setRxBoostedGain(bool enable) {
+    return getRadioDriver(_radio).setRxBoost(enable);
+}
+
 /* A room server keeps no neighbour table (it is not a repeater). */
 void RoomServerMesh::formatNeighborsReply(char* reply) {
     strcpy(reply, "not supported");

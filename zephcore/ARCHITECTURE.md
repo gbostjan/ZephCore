@@ -203,7 +203,7 @@ Path_len byte:
 
 **Direct routing**: Packet carries a source-routed `path[]`. Each relay node checks if the first path hash matches its own identity, removes itself, and forwards. Path is built from previous flood packets' accumulated hashes.
 
-**Deduplication**: `SimpleMeshTables` maintains a circular buffer of 128 packet hashes (8 bytes each, SHA-256 truncated) and 64 ACK CRCs. `hasSeen()` prevents duplicate processing and retransmission.
+**Deduplication**: `SimpleMeshTables` maintains a circular buffer of 160 packet hashes (8 bytes each, SHA-256 truncated); ACKs are deduped through the same packet-hash path. `wasSeen()` is a pure query; call sites insert explicitly via `markSeen()` to prevent duplicate processing and retransmission.
 
 ### 4.5 Dispatcher Scheduling
 

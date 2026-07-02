@@ -895,9 +895,15 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             else if (memcmp(arg, "off", 3) == 0) val = 0;
             else if (arg[0] == '0' || arg[0] == '1') val = atoi(arg);
             if (val == 0 || val == 1) {
+                /* Always save (upstream f3d4d8cd), then apply live and
+                 * report when the radio has no RX boost feature. */
                 _prefs->rx_boost = (uint8_t)val;
                 savePrefs();
-                snprintf(reply, CLI_REPLY_SIZE, "OK - radio.rxgain=%d (reboot to apply)", _prefs->rx_boost);
+                if (_callbacks->setRxBoostedGain(val == 1)) {
+                    snprintf(reply, CLI_REPLY_SIZE, "OK - radio.rxgain=%d", _prefs->rx_boost);
+                } else {
+                    strcpy(reply, "Error: unsupported");
+                }
             } else {
                 strcpy(reply, "Error: must be 0, 1, on, or off");
             }

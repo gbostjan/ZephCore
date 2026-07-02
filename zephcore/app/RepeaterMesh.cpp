@@ -1146,6 +1146,10 @@ void RepeaterMesh::setTxPower(int8_t power_dbm) {
     radio_set_tx_power(power_dbm);
 }
 
+bool RepeaterMesh::setRxBoostedGain(bool enable) {
+    return getRadioDriver(_radio).setRxBoost(enable);
+}
+
 void RepeaterMesh::formatNeighborsReply(char* reply) {
     char* dp = reply;
 

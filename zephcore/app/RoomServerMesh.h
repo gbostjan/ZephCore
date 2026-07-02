@@ -182,6 +182,7 @@ public:
     void eraseLogFile() override;
     void dumpLogFile() override;
     void setTxPower(int8_t power_dbm) override;
+    bool setRxBoostedGain(bool enable) override;
     void formatNeighborsReply(char* reply) override;
     void formatStatsReply(char* reply) override;
     void formatRadioStatsReply(char* reply) override;

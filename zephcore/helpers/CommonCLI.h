@@ -35,6 +35,9 @@ public:
     virtual void eraseLogFile() = 0;
     virtual void dumpLogFile() = 0;
     virtual void setTxPower(int8_t power_dbm) = 0;
+    /* Apply RX boosted gain live; returns false when the radio has no
+     * RX boost feature (upstream PR #2844 semantics). */
+    virtual bool setRxBoostedGain(bool enable) { (void)enable; return false; }
     /* Repeater-specific — default replies keep companion builds clean.
      * Repeater overrides all four; companions get "not available". */
     virtual void formatNeighborsReply(char* reply)      { strcpy(reply, "not available"); }

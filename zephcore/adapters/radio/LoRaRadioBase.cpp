@@ -881,7 +881,7 @@ void LoRaRadioBase::enableRxDutyCycle(bool enable)
 	}
 }
 
-void LoRaRadioBase::setRxBoost(bool enable)
+bool LoRaRadioBase::setRxBoost(bool enable)
 {
 	_rx_boost_enabled = enable;
 	LOG_INF("RX boost %s (+3dB sensitivity, +2mA)",
@@ -889,6 +889,7 @@ void LoRaRadioBase::setRxBoost(bool enable)
 	if (atomic_get(&_in_recv_mode)) {
 		hwSetRxBoost(enable);
 	}
+	return true;
 }
 
 } /* namespace mesh */

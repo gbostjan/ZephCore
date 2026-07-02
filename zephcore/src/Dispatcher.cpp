@@ -431,6 +431,12 @@ void Dispatcher::checkSend()
 			len += outbound->payload_len;
 
 			uint32_t max_airtime = _radio->getEstAirtimeFor(len) * 3 / 2;
+			/* Short packets (ACKs) have est airtimes small enough that
+			 * IRQ/work-queue latency alone can blow the watchdog and clip
+			 * the TX mid-air (upstream 4f8cb8db: 200ms est floor, x1.5). */
+			if (max_airtime < 300) {
+				max_airtime = 300;
+			}
 			outbound_start = now;
 
 #if IS_ENABLED(CONFIG_ZEPHCORE_PACKET_LOGGING)
