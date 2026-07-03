@@ -6,9 +6,11 @@
 #pragma once
 
 #include <helpers/BaseChatMesh.h>
+#include <helpers/MeshTimeSync.h>
 #include <helpers/TransportKeyStore.h>
 #include <ZephyrDataStore.h>
 #include <NodePrefs.h>
+#include <zephyr/kernel.h>
 
 /* BLE push notification codes */
 #define PUSH_CODE_ADVERT              0x80
@@ -231,6 +233,15 @@ public:
 	bool onChannelLoaded(uint8_t idx, const ChannelDetails &ch) override;
 	bool getChannelForSave(uint8_t idx, ChannelDetails &ch) override;
 
+	/* Mesh time sync (forward-only: our clock stamps outgoing DMs and peers
+	 * hold per-sender replay high-water marks, so a backward step gets our
+	 * messages dropped as replays until wall-clock catches up) */
+	MeshTimeSync *getMeshTimeSync() { return &_timesync; }
+	void noteGPSTimeSync() { _timesync.noteGPSSync((uint32_t)(k_uptime_get() / 1000)); }
+	/* Paced evaluation — called from the housekeeping event (loop() only runs
+	 * on packet-driven events). */
+	void timeSyncTick();
+
 	/* Prefs (includes node_lat/lon) */
 	NodePrefs prefs;
 
@@ -368,6 +379,13 @@ private:
 	void markChannelsDirty();
 	void flushDirtyContacts();
 	void flushDirtyChannels();
+
+	/* Mesh time sync */
+	MeshTimeSync _timesync{FIRMWARE_BUILD_EPOCH};
+	void onAdvertTimeSample(const mesh::Identity &id, uint32_t timestamp,
+		uint8_t hops) override;
+	void applyTimeSyncStep(const MeshTimeSync::Verdict &v, uint32_t now,
+		uint32_t uptime_secs);
 
 	/* Protocol version negotiation */
 	uint8_t _app_target_ver;

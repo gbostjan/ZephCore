@@ -287,6 +287,44 @@ Direct (source-routed) packets bypass adaptive scaling entirely. They use minima
 - **Advertisements**: Ed25519 signature over (pubkey + timestamp + app_data)
 - **ACKs**: SHA-256(shared_secret + packet_hash) truncated to 4 bytes
 
+### 4.9 Mesh Time Sync (Clock Consensus)
+
+ZephCore-only divergence from Arduino MeshCore (like the Adaptive Contention Window). A node senses its own clock error from the Ed25519-signed timestamps in other nodes' adverts and — **opt-in, default off** (`set meshtimesync on`) — corrects it automatically. There is no trusted reference clock on a mesh, so this is a *consensus estimation* problem: the node assumes the majority of tenured advert senders within 3 flood hops is right. User-facing doc: `MESHTIMESYNC.md` at the repo root.
+
+**Module**: `helpers/MeshTimeSync.{h,cpp}` — role-agnostic estimator, owns no clock. Each role feeds it verified adverts (`onAdvertHeard`), calls `tick()` periodically (15-min pacing internal), and applies STEP verdicts under its own policy.
+
+**Sample table** (per-sender, `CONFIG_ZEPHCORE_TIMESYNC_TABLE_SIZE` slots: 32 default, 16 on RAM-bound companions; 24 B/slot):
+- 8-byte pubkey prefix — a security floor, not a tuning knob (shorter prefixes are grindable: an attacker could collide a tenured voter's prefix and reset its tenure with validly-signed adverts).
+- Latest advert timestamp (= the vote, per-sender monotonic — replays and flood dupes are inert) + arrival **uptime**. Skew is recomputed at evaluate time from the uptime anchor, so the node's own steps never stale stored samples.
+- Tenure tracking: first-heard uptime, advert count. Eligibility = heard ≥ 1 h, ≥ 2 adverts, latest sample ≤ 5 days old (bridges the 47 h flood-advert cadence).
+- Self-consistency: consecutive samples must satisfy `|Δadvert_ts − Δuptime| ≤ 45 s + 150 ppm × Δuptime`; violation (sender rebooted/corrected/lying) resets that sender's tenure.
+- **Hop-priority admission** (hop cap 3): a new sender may only displace a young entry farther (higher hop) than it; mature entries are protected unless silent > 24 h. Naive LRU churned hub nodes to zero eligible voters in simulation.
+
+**Consensus**: Marzullo interval intersection over eligible votes, each `[skew − r, skew + r]` with `r = 150 s + 15 s × hop` (the 150 s base covers the real fleet's good-clock scatter, not just RF delay). No absolute outlier thresholds against the local clock — clustering does the rejection, so an epoch-reset clock still finds the true cluster. Stepping requires `CONFIG_ZEPHCORE_TIMESYNC_QUORUM` (default 6, floor 3, build-time security knob) eligible senders AND a strict majority inside the intersection; otherwise abstain.
+
+**Correction policy** (priority: GPS > manual set > mesh consensus):
+- GPS gate: boards with GPS available + enabled never step (sensing continues).
+- Manual set (`time`, `clock sync`, app time set) arms a **7-day suppression** of all stepping, bootstrap included, plus drift-envelope pedigree.
+- Step trigger 10 min, dead band 5 min, step capped **±1 h**, one step per **6 h**, logged loudly. Production contains coherent wrong-time islands (+28 h × 63 repeaters at analysis time); the cap bounds capture drag to 4 h/day.
+- **Drift-envelope gate**: with a trusted sync + continuous uptime since (pedigree, RAM-only), corrections beyond `elapsed × 300 ppm + 10 min` are physically impossible for a crystal — refused regardless of quorum.
+- **Bootstrap**: local time < firmware build epoch (`FIRMWARE_BUILD_EPOCH`, CMake-injected) is provably wrong → any 3 agreeing senders, step to the cluster's **low edge** (midpoint − 150 s; undershoot so later refinement is always forward = monotonicity-safe).
+
+**Per-role step policy** (policy lives in the role, not the estimator):
+| Role | Policy | Why |
+|---|---|---|
+| Repeater | bidirectional | clock not load-bearing: forwarding/dedup/remote-admin run on `millis()`/hashes; a backward step only mutes own adverts at peers for a window equal to the step |
+| Observer | bidirectional | clock only stamps observations — exactly what this fixes |
+| Room server | forward-only | post timestamps feed client `sync_since` ordering |
+| Companion | forward-only | own clock stamps outgoing DMs; peers hold per-sender replay high-water marks |
+
+**Step application** (repeater reference, `applyTimeSyncStep`): set clock, one `zephcore_rtc_save` per step (never per evaluation), shift neighbor `heard_timestamp`s and ACL `last_activity` by the delta (unsigned "seconds ago" math), reset the login/anon/discover rate limiters.
+
+All policy timers (6 h rate limit, 7-day suppression, tenure, sample age) anchor on **uptime, never wall clock** — otherwise the very steps they govern would distort them.
+
+**CLI**: `set meshtimesync {on|off}`, `get meshtimesync` → state + live dry-run (eligible count, votes for/against, skew/radius, would-be verdict) + per-sender evidence table (full table over local USB; remote admin replies are summary-truncated to fit the packet). Sensing always runs, so the dry-run works before enabling.
+
+**Accepted limits**: a coordinated same-offset majority around a node captures it (no consensus survives that — Bitcoin timejacking lesson; mitigations: default-off, manual override, caps); sub-quorum islands abstain forever (bootstrap still heals dead clocks with 3 senders).
+
 ---
 
 ## 5. Radio Subsystem

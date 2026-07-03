@@ -427,6 +427,12 @@ project(zephcore)
 string(TIMESTAMP ZEPHCORE_BUILD_DATE "%Y %b %d" UTC)
 add_definitions(-DFIRMWARE_BUILD_DATE="${ZEPHCORE_BUILD_DATE}")
 
+# Build-time UNIX epoch: mesh time sync's "provably dead clock" floor (a local
+# time below this is impossible for a running build). string(TIMESTAMP) honors
+# SOURCE_DATE_EPOCH for reproducible builds.
+string(TIMESTAMP ZEPHCORE_BUILD_EPOCH "%s" UTC)
+add_definitions(-DFIRMWARE_BUILD_EPOCH=${ZEPHCORE_BUILD_EPOCH}u)
+
 # Single source of truth for the firmware version string (vMAJOR.MINOR.PATCH-zephyr).
 # Injected globally like FIRMWARE_BUILD_DATE above, so every app TU sees the same
 # value; the per-app `#ifndef FIRMWARE_VERSION` fallbacks only apply to builds that
@@ -473,6 +479,7 @@ target_sources(app PRIVATE
   adapters/gps/ZephyrGPSManager.cpp
   adapters/sensors/ZephyrEnvSensors.cpp
   helpers/AdvertDataHelpers.cpp
+  helpers/MeshTimeSync.cpp
   helpers/oled_power.c
   helpers/fatal_reboot.c
 )

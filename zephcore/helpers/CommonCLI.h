@@ -12,6 +12,8 @@
 #include <helpers/ClientACL.h>
 #include "NodePrefs.h"
 
+class MeshTimeSync;
+
 /* CLI reply buffer size — callers must provide at least this many bytes */
 #define CLI_REPLY_SIZE 256
 
@@ -73,6 +75,9 @@ public:
     virtual void setAPCEnabled(bool en) { (void)en; }
     virtual uint8_t getAPCTargetMargin() const { return 16; }
     virtual void setAPCTargetMargin(uint8_t margin_db) { (void)margin_db; }
+
+    // Mesh time sync (all roles wire one; nullptr = not compiled/available)
+    virtual MeshTimeSync* getMeshTimeSync() { return nullptr; }
 
     // Sensor manager interface (for GPS)
     virtual double getNodeLat() const { return 0.0; }

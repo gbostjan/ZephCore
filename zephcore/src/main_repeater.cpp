@@ -447,6 +447,12 @@ static void repeater_event_loop(void)
 		 * write here on the main thread instead. */
 		if (events & MESH_EVENT_RTC_SAVE) {
 			zephcore_rtc_save((uint32_t)atomic_get(&pending_rtc_epoch));
+#ifdef ZEPHCORE_LORA
+			/* GPS just set the clock — arm the mesh time-sync drift envelope. */
+			if (repeater_mesh_ptr) {
+				repeater_mesh_ptr->noteGPSTimeSync();
+			}
+#endif
 		}
 	}
 }

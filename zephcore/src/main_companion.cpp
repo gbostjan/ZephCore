@@ -525,6 +525,12 @@ static void mesh_event_loop(void)
 
 			mesh_housekeeping_ui_refresh();
 
+			/* Mesh time-sync paced evaluation — loop() only runs on
+			 * packet-driven events, so drive the 15-min tick here. */
+			if (companion_mesh_ptr) {
+				companion_mesh_ptr->timeSyncTick();
+			}
+
 			/* Low-battery auto-shutdown (companion only). Self-throttled
 			 * and compiled out unless the board sets a threshold — no
 			 * extra poll, just a cheap call on the existing tick. */
@@ -546,6 +552,12 @@ static void mesh_event_loop(void)
 		 * write here on the main thread instead. */
 		if (events & MESH_EVENT_RTC_SAVE) {
 			zephcore_rtc_save((uint32_t)atomic_get(&pending_rtc_epoch));
+#ifdef ZEPHCORE_LORA
+			/* GPS just set the clock — arm the mesh time-sync drift envelope. */
+			if (companion_mesh_ptr) {
+				companion_mesh_ptr->noteGPSTimeSync();
+			}
+#endif
 		}
 
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_DESIGN_JOYSTICK)
@@ -702,6 +714,10 @@ public:
 	void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr,
 				  int timeout_mins) override {
 		(void)freq; (void)bw; (void)sf; (void)cr; (void)timeout_mins;
+	}
+
+	MeshTimeSync* getMeshTimeSync() override {
+		return companion_mesh.getMeshTimeSync();
 	}
 };
 

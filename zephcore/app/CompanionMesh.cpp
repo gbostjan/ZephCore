@@ -342,6 +342,56 @@ void CompanionMesh::loop()
 	}
 }
 
+void CompanionMesh::onAdvertTimeSample(const mesh::Identity &id, uint32_t timestamp,
+				       uint8_t hops)
+{
+	/* Signature already verified by mesh::Mesh before this hook fires. */
+	_timesync.onAdvertHeard(id.pub_key, timestamp, hops,
+				(uint32_t)(k_uptime_get() / 1000));
+}
+
+void CompanionMesh::timeSyncTick()
+{
+	if (!prefs.meshtimesync) return;
+
+	uint32_t up = (uint32_t)(k_uptime_get() / 1000);
+	uint32_t now = getRTCClock()->getCurrentTime();
+	MeshTimeSync::Verdict v = _timesync.tick(now, up);
+	if (v.type != MeshTimeSync::VERDICT_STEP) return;
+
+	/* GPS gate: sense only while GPS owns the clock. */
+	if (gps_is_available() && gps_is_enabled()) {
+		LOG_INF("meshtimesync: step %+d s wanted, GPS gate active - not applied",
+			(int)v.delta);
+		return;
+	}
+	/* Forward-only role: our clock stamps outgoing DMs and peers hold
+	 * per-sender replay high-water marks — a backward step gets our
+	 * messages dropped as replays. Report, never apply. */
+	if (v.delta < 0) {
+		_timesync.noteBackwardSkipped();
+		LOG_WRN("meshtimesync: backward step %+d s wanted - skipped (companion is forward-only)",
+			(int)v.delta);
+		return;
+	}
+	applyTimeSyncStep(v, now, up);
+}
+
+void CompanionMesh::applyTimeSyncStep(const MeshTimeSync::Verdict &v, uint32_t now,
+				      uint32_t uptime_secs)
+{
+	uint32_t new_time = (uint32_t)((int64_t)now + v.delta);
+	getRTCClock()->setCurrentTime(new_time);
+	zephcore_rtc_save(new_time);
+	time_sync_report(TIME_SYNC_MESH);
+
+	_timesync.noteStepApplied(v.delta, new_time, uptime_secs, v.bootstrap);
+	LOG_WRN("meshtimesync: stepped clock %+d s (%s, votes %u/%u) -> %u",
+		(int)v.delta, v.bootstrap ? "bootstrap" : "consensus",
+		(unsigned)v.consensus.votes_for, (unsigned)v.consensus.votes_against,
+		(unsigned)new_time);
+}
+
 void CompanionMesh::onLoginSent(const ContactInfo &contact)
 {
 	memcpy(&_pending_login, contact.id.pub_key, 4);
@@ -2237,6 +2287,7 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 				getRTCClock()->setCurrentTime(secs);
 				time_sync_report(TIME_SYNC_APP);
 				zephcore_rtc_save(secs);  /* persist to hardware RTC */
+				_timesync.noteManualSync((uint32_t)(k_uptime_get() / 1000));
 				sendPacketOk();
 			} else {
 				sendPacketError(ERR_ILLEGAL_ARG);
@@ -2750,9 +2801,22 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			int n = snprintf(dp, remaining, "gps_interval:%u", (unsigned)gps_interval);
 			if (n > 0 && (size_t)n < remaining) {
 				dp += n;
+				first = false;
 			}
 			// If snprintf would have truncated, dp stays put — writeFrame
 			// sends only what we successfully wrote.
+		}
+		{
+			size_t remaining = (size_t)(rsp_end - dp);
+			if (!first && remaining > 0) {
+				*dp++ = ',';
+				remaining--;
+			}
+			int n = snprintf(dp, remaining, "meshtimesync:%d",
+					 prefs.meshtimesync ? 1 : 0);
+			if (n > 0 && (size_t)n < remaining) {
+				dp += n;
+			}
 		}
 		// Note: Environment sensors are auto-detected, no settings needed
 
@@ -2792,6 +2856,10 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 					} else {
 						sendPacketError(ERR_ILLEGAL_ARG);
 					}
+				} else if (strcmp(key, "meshtimesync") == 0) {
+					prefs.meshtimesync = (val[0] == '1') ? 1 : 0;
+					_store->savePrefs(prefs);
+					sendPacketOk();
 				} else {
 					sendPacketError(ERR_ILLEGAL_ARG);
 				}

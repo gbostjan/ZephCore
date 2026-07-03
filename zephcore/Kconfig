@@ -201,6 +201,31 @@ config ZEPHCORE_MAX_UNSYNCED_POSTS
 
 endif # ZEPHCORE_ROLE_REPEATER || ZEPHCORE_ROLE_ROOM_SERVER
 
+config ZEPHCORE_TIMESYNC_QUORUM
+	int "Mesh time sync: consensus quorum"
+	default 6
+	range 3 32
+	help
+	  Minimum eligible advert senders required before a mesh time-sync
+	  consensus may step the clock (a strict majority of them must also
+	  agree). Each quorum unit costs a local attacker one more physical
+	  radio sustained for tenure-hours, so lowering this trades eclipse
+	  resistance for coverage on small meshes (e.g. 7 repeaters = exactly
+	  6 potential voters). Floor 3 matches the bootstrap quorum — below
+	  that the interval intersection degenerates. Deliberately a build-time
+	  knob, not a runtime pref: this is a security parameter.
+
+config ZEPHCORE_TIMESYNC_TABLE_SIZE
+	int "Mesh time sync: sample table slots"
+	default 16 if ZEPHCORE_ROLE_COMPANION
+	default 32
+	range 8 64
+	help
+	  Per-sender advert sample slots (24 bytes each) for the mesh
+	  time-sync consensus. 32 fits dense neighborhoods; companions
+	  default to 16 (RAM-bound role). Must be at least the quorum for
+	  normal-mode stepping to be reachable.
+
 endmenu # Device Role
 
 if ZEPHCORE_ROLE_COMPANION

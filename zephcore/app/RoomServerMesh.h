@@ -19,6 +19,7 @@
 #include <mesh/SimpleMeshTables.h>
 #include <helpers/ClientACL.h>
 #include <helpers/CommonCLI.h>
+#include <helpers/MeshTimeSync.h>
 #include <helpers/RegionMap.h>
 #include <helpers/TransportKeyStore.h>
 #include <helpers/RateLimiter.h>
@@ -94,9 +95,12 @@ class RoomServerMesh : public mesh::Mesh, public CommonCLICallbacks {
     uint8_t pending_sf;
     uint8_t pending_cr;
     int matching_peer_indexes[MAX_CLIENTS];
+    MeshTimeSync _timesync{FIRMWARE_BUILD_EPOCH};
 
     int handleRequest(ClientInfo* sender, uint32_t sender_timestamp, uint8_t* payload, size_t payload_len);
     mesh::Packet* createSelfAdvert();
+    void timeSyncTick();
+    void applyTimeSyncStep(const MeshTimeSync::Verdict& v, uint32_t now, uint32_t uptime_secs);
 
     /* Room server: shared-post buffer + push-to-client sync */
     void addPost(ClientInfo* client, const char* postData);
@@ -145,6 +149,7 @@ protected:
 
     bool filterRecvFloodPacket(mesh::Packet* pkt) override;
 
+    void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) override;
     void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
     int searchPeersByHash(const uint8_t* hash) override;
     void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
@@ -191,6 +196,11 @@ public:
     mesh::LocalIdentity& getSelfId() override { return self_id; }
     void saveIdentity(const mesh::LocalIdentity& new_id) override;
     void clearStats() override;
+
+    /* Mesh time sync (forward-only: post timestamps feed client sync_since
+     * ordering, so a backward step would corrupt message sync) */
+    MeshTimeSync* getMeshTimeSync() override { return &_timesync; }
+    void noteGPSTimeSync() { _timesync.noteGPSSync((uint32_t)(k_uptime_get() / 1000)); }
 
     /* Adaptive contention window callbacks */
     float getContentionEstimate() const override {

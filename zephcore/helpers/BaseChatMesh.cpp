@@ -139,6 +139,8 @@ void BaseChatMesh::onAdvertRecv(mesh::Packet *packet, const mesh::Identity &id, 
 {
 	LOG_DBG("onAdvertRecv: timestamp=%u app_data_len=%u", timestamp, (unsigned)app_data_len);
 
+	onAdvertTimeSample(id, timestamp, packet->getPathHashCount());
+
 	AdvertDataParser parser(app_data, app_data_len);
 	if (!(parser.isValid() && parser.hasName())) {
 		LOG_WRN("onAdvertRecv: invalid parser or no name (valid=%d, hasName=%d)",

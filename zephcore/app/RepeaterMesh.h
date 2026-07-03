@@ -18,6 +18,7 @@
 #include <mesh/SimpleMeshTables.h>
 #include <helpers/ClientACL.h>
 #include <helpers/CommonCLI.h>
+#include <helpers/MeshTimeSync.h>
 #include <helpers/RegionMap.h>
 #include <helpers/TransportKeyStore.h>
 #include <helpers/RateLimiter.h>
@@ -112,6 +113,7 @@ class RepeaterMesh : public mesh::Mesh, public CommonCLICallbacks {
     uint8_t pending_sf;
     uint8_t pending_cr;
     int matching_peer_indexes[MAX_CLIENTS];
+    MeshTimeSync _timesync{FIRMWARE_BUILD_EPOCH};
 #if IS_ENABLED(CONFIG_ZEPHCORE_REPEATER_UPLINK)
     ObserverCreds _uplink_creds;
     bool _uplink_reboot_required;
@@ -131,6 +133,8 @@ class RepeaterMesh : public mesh::Mesh, public CommonCLICallbacks {
 #endif
 
     void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
+    void timeSyncTick();
+    void applyTimeSyncStep(const MeshTimeSync::Verdict& v, uint32_t now, uint32_t uptime_secs);
     uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
     uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data, size_t data_len);
     uint8_t handleAnonOwnerReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data, size_t data_len);
@@ -243,6 +247,10 @@ public:
     mesh::LocalIdentity& getSelfId() override { return self_id; }
     void saveIdentity(const mesh::LocalIdentity& new_id) override;
     void clearStats() override;
+
+    /* Mesh time sync */
+    MeshTimeSync* getMeshTimeSync() override { return &_timesync; }
+    void noteGPSTimeSync() { _timesync.noteGPSSync((uint32_t)(k_uptime_get() / 1000)); }
 
     /* Adaptive contention window callbacks */
     float getContentionEstimate() const override {

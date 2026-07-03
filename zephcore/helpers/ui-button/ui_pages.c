@@ -133,6 +133,7 @@ static char time_source_tag(enum time_sync_source src)
 	case TIME_SYNC_GPS:  return 'G';  /* GPS fix */
 	case TIME_SYNC_APP:  return 'A';  /* phone/companion app */
 	case TIME_SYNC_WIFI: return 'N';  /* network (SNTP) */
+	case TIME_SYNC_MESH: return 'M';  /* mesh time-sync consensus */
 	default:             return 'L';  /* local: manual/CLI or stale/none */
 	}
 }

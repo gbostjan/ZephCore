@@ -5,6 +5,7 @@
 
 #include "CommonCLI.h"
 #include "battery_curve.h"
+#include <helpers/MeshTimeSync.h>
 #include <helpers/time_sync.h>
 #include <adapters/clock/ZephyrRTCDiscover.h>
 #include <helpers/TxtDataHelpers.h>
@@ -119,6 +120,7 @@ void CommonCLI::loadPrefs(const char* path) {
     ok = ok && prefs_read(&file, &_prefs->apc_margin, sizeof(_prefs->apc_margin));           // 293
     ok = ok && prefs_read(&file, &_prefs->flood_max_unscoped, sizeof(_prefs->flood_max_unscoped)); // 294
     ok = ok && prefs_read(&file, &_prefs->flood_max_advert, sizeof(_prefs->flood_max_advert)); // 295
+    ok = ok && prefs_read(&file, &_prefs->meshtimesync, sizeof(_prefs->meshtimesync));         // 296
 
     if (!ok) {
         LOG_WRN("Prefs file %s truncated, some fields use defaults", path);
@@ -164,6 +166,7 @@ void CommonCLI::loadPrefs(const char* path) {
     _prefs->apc_margin = constrain(_prefs->apc_margin, (uint8_t)6, (uint8_t)30);
     _prefs->flood_max_unscoped = constrain(_prefs->flood_max_unscoped, (uint8_t)0, (uint8_t)64);
     _prefs->flood_max_advert = constrain(_prefs->flood_max_advert, (uint8_t)0, (uint8_t)64);
+    _prefs->meshtimesync = constrain(_prefs->meshtimesync, (uint8_t)0, (uint8_t)1);
 
     LOG_INF("Loaded prefs from %s", path);
 }
@@ -231,6 +234,7 @@ void CommonCLI::savePrefs(const char* path) {
     fs_write(&file, &_prefs->apc_margin, sizeof(_prefs->apc_margin));
     fs_write(&file, &_prefs->flood_max_unscoped, sizeof(_prefs->flood_max_unscoped));
     fs_write(&file, &_prefs->flood_max_advert, sizeof(_prefs->flood_max_advert));
+    fs_write(&file, &_prefs->meshtimesync, sizeof(_prefs->meshtimesync));
 
     fs_close(&file);
     LOG_INF("Saved prefs to %s", path);
@@ -339,6 +343,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             getRTCClock()->setCurrentTime(sender_timestamp + 1);
             time_sync_report(TIME_SYNC_CLI);
             zephcore_rtc_save(sender_timestamp + 1);  /* persist to hardware RTC */
+            MeshTimeSync* ts = _callbacks->getMeshTimeSync();
+            if (ts) ts->noteManualSync((uint32_t)(k_uptime_get() / 1000));
             uint32_t now = getRTCClock()->getCurrentTime();
             time_t t = (time_t)now;
             struct tm *tm = gmtime(&t);
@@ -360,6 +366,8 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             getRTCClock()->setCurrentTime(secs);
             time_sync_report(TIME_SYNC_CLI);
             zephcore_rtc_save(secs);  /* persist to hardware RTC */
+            MeshTimeSync* ts = _callbacks->getMeshTimeSync();
+            if (ts) ts->noteManualSync((uint32_t)(k_uptime_get() / 1000));
             time_t t = (time_t)secs;
             struct tm *tm = gmtime(&t);
             snprintf(reply, CLI_REPLY_SIZE, "OK - clock set: %02d:%02d - %d/%d/%d UTC",
@@ -538,6 +546,19 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         } else if (memcmp(config, "dc.restarts", 11) == 0) {
             snprintf(reply, CLI_REPLY_SIZE, "> %u",
                      (uint32_t)_callbacks->getDutyCycleTimeoutRestarts());
+        } else if (memcmp(config, "meshtimesync", 12) == 0) {
+            MeshTimeSync* ts = _callbacks->getMeshTimeSync();
+            if (ts == nullptr) {
+                strcpy(reply, "not available");
+            } else {
+                /* Remote replies ride in a ~160-byte packet buffer; only the
+                 * local USB CLI (sender_timestamp == 0) gets the full evidence
+                 * table. */
+                size_t cap = (sender_timestamp == 0) ? CLI_REPLY_SIZE : 158;
+                ts->formatStatus(reply, cap, getRTCClock()->getCurrentTime(),
+                                 (uint32_t)(k_uptime_get() / 1000),
+                                 _prefs->meshtimesync != 0);
+            }
         } else {
             snprintf(reply, CLI_REPLY_SIZE, "??: %s", config);
         }
@@ -947,6 +968,21 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 savePrefs();
                 if (val == 0) strcpy(reply, "OK - gps duty=0 (always on)");
                 else snprintf(reply, CLI_REPLY_SIZE, "OK - gps duty=%u s", (unsigned)val);
+            }
+        } else if (memcmp(config, "meshtimesync ", 13) == 0) {
+            const char* arg = &config[13];
+            if (_callbacks->getMeshTimeSync() == nullptr) {
+                strcpy(reply, "not available");
+            } else if (memcmp(arg, "on", 2) == 0) {
+                _prefs->meshtimesync = 1;
+                savePrefs();
+                strcpy(reply, "OK - meshtimesync on");
+            } else if (memcmp(arg, "off", 3) == 0) {
+                _prefs->meshtimesync = 0;
+                savePrefs();
+                strcpy(reply, "OK - meshtimesync off");
+            } else {
+                strcpy(reply, "Error: must be on or off");
             }
         } else {
             snprintf(reply, CLI_REPLY_SIZE, "unknown config: %s", config);

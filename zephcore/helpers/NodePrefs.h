@@ -64,6 +64,7 @@ struct NodePrefs {
 	uint8_t rx_duty_cycle;          // 1 = RX duty cycle, 0 = continuous RX
 	uint8_t apc_enabled;            // 1 = APC on, 0 = fixed TX power
 	uint8_t apc_margin;             // APC target link margin dB (6-30)
+	uint8_t meshtimesync;           // 1 = mesh time-sync clock correction on (default off)
 
 	/* ---- Companion-only fields ---- */
 	uint8_t manual_add_contacts;

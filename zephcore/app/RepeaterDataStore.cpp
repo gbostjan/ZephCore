@@ -201,6 +201,8 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
      * read leaves the constructor defaults flood_max_unscoped=64, flood_max_advert=8). */
     fs_read(&file, &prefs.flood_max_unscoped, sizeof(prefs.flood_max_unscoped));
     fs_read(&file, &prefs.flood_max_advert, sizeof(prefs.flood_max_advert));
+    /* Mesh time sync (absent in <297-byte files; no-op EOF read keeps default 0 = off) */
+    fs_read(&file, &prefs.meshtimesync, sizeof(prefs.meshtimesync));
 
     fs_close(&file);
 
@@ -231,6 +233,7 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
     if (prefs.rx_duty_cycle > 1) prefs.rx_duty_cycle = 0;
     if (prefs.apc_enabled > 1) prefs.apc_enabled = 0;
     if (prefs.apc_margin < 6 || prefs.apc_margin > 30) prefs.apc_margin = 16;
+    if (prefs.meshtimesync > 1) prefs.meshtimesync = 0;
 
     /* One-time format upgrade: old files (< 294 bytes) never saved the ZephCore
      * extension fields, and stored path_hash_mode/loop_detect as zero padding.
@@ -328,6 +331,8 @@ bool RepeaterDataStore::savePrefs(const NodePrefs& prefs) {
     /* Flood hop-ceiling extensions (extend the format past 294 bytes) */
     fs_write(&file, &prefs.flood_max_unscoped, sizeof(prefs.flood_max_unscoped));
     fs_write(&file, &prefs.flood_max_advert, sizeof(prefs.flood_max_advert));
+    /* Mesh time sync on/off (offset 296) */
+    fs_write(&file, &prefs.meshtimesync, sizeof(prefs.meshtimesync));
 
     ret = fs_sync(&file);
     fs_close(&file);
