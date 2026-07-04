@@ -68,8 +68,6 @@ WEAK void ui_set_radio_stats(uint32_t packets_rx, uint32_t packets_tx,
 	ARG_UNUSED(packets_rx); ARG_UNUSED(packets_tx); ARG_UNUSED(packets_err);
 }
 
-WEAK void ui_refresh_display(void) { }
-
 WEAK void ui_set_gps_data(bool has_fix, uint8_t sats,
 			   int32_t lat_mdeg, int32_t lon_mdeg, int32_t alt_mm)
 {

@@ -141,7 +141,7 @@ K_TIMER_DEFINE(housekeeping_timer, housekeeping_timer_fn, NULL);
 /* Forward declarations */
 #ifdef ZEPHCORE_LORA
 static RepeaterMesh *repeater_mesh_ptr;
-static void refresh_repeater_ui_radio_state(bool redraw);
+static void refresh_repeater_ui_radio_state(void);
 #endif
 
 /* Print string to USB serial */
@@ -234,7 +234,7 @@ static void process_cli_commands(void)
 	while (repeater_mesh_ptr && k_msgq_get(&cli_cmd_queue, &c, K_NO_WAIT) == 0) {
 		cli_reply_buf[0] = '\0';
 		repeater_mesh_ptr->handleCommand(0, c.buf, cli_reply_buf);
-		refresh_repeater_ui_radio_state(true);
+		refresh_repeater_ui_radio_state();
 		if (cli_reply_buf[0] != '\0') {
 			cli_print("\r\n  -> ");
 			cli_print(cli_reply_buf);
@@ -361,7 +361,7 @@ static mesh::SimpleMeshTables mesh_tables;
 /* RepeaterMesh requires: board, radio, ms_clock, rng, rtc, tables */
 static RepeaterMesh repeater_mesh(zephyr_board, lora_radio, ms_clock, zephyr_rng, rtc_clock, mesh_tables);
 
-static void refresh_repeater_ui_radio_state(bool redraw)
+static void refresh_repeater_ui_radio_state(void)
 {
 	if (!repeater_mesh_ptr) {
 		return;
@@ -404,10 +404,6 @@ static void refresh_repeater_ui_radio_state(bool redraw)
 		lora_radio.getPacketsRecv(),
 		lora_radio.getPacketsSent(),
 		lora_radio.getPacketsRecvErrors());
-
-	if (redraw) {
-		ui_refresh_display();
-	}
 }
 #endif
 
@@ -478,7 +474,7 @@ static void repeater_event_loop(void)
 #ifdef ZEPHCORE_LORA
 			/* Refresh live radio/APC state (noise floor, TX power
 			 * reduction, RX/TX mode, packet counters). */
-			refresh_repeater_ui_radio_state(true);
+			refresh_repeater_ui_radio_state();
 
 			/* Battery is now refreshed lazily from ui_pages_render() with
 			 * a 30 s freshness guard — no periodic ADC fire here. */
@@ -637,7 +633,7 @@ int main(void)
 
 	/* Feed initial UI state from loaded prefs */
 	ui_set_node_name(prefs->node_name);
-	refresh_repeater_ui_radio_state(false);
+	refresh_repeater_ui_radio_state();
 	ui_set_battery_provider(get_battery_mv);
 	ui_set_battery(zephyr_board.getBattMilliVolts(), 0);
 	ui_set_gps_available(gps_is_available());

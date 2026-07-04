@@ -100,12 +100,6 @@ void ui_set_radio_stats(uint32_t packets_rx, uint32_t packets_tx,
 			uint32_t packets_err);
 
 /**
- * Request an immediate display redraw for the current UI state.
- * No-op on headless builds.
- */
-void ui_refresh_display(void);
-
-/**
  * Update GPS data for display.
  */
 void ui_set_gps_data(bool has_fix, uint8_t sats,

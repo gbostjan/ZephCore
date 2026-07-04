@@ -63,7 +63,6 @@ LOG_MODULE_REGISTER(ui_pages, CONFIG_ZEPHCORE_BOARD_LOG_LEVEL);
 #define UI_COLOR_TITLE      0xffde  /* warm white */
 #define UI_COLOR_LABEL      0x8410  /* muted gray */
 #define UI_COLOR_VALUE      MC_COLOR_WHITE
-#define UI_COLOR_SECONDARY  0xbdf7  /* soft gray-white */
 #define UI_COLOR_OK         0x07e0
 #define UI_COLOR_ACTIVE     UI_COLOR_OK
 #define UI_COLOR_WARN       0xffa0
@@ -383,6 +382,14 @@ static bool use_compact_color_home(void)
 	return mc_display_has_color() && DISP_W <= 180 && DISP_H <= 100;
 }
 
+/* Short label for the current LoRa radio state, shared across pages. */
+static const char *radio_state_label(void)
+{
+	return state.lora_tx_active ? "TX" :
+	       state.lora_in_rx ? "RX" :
+	       state.lora_radio_ready ? "RDY" : "WAIT";
+}
+
 static uint8_t clamp_activity_delta(uint32_t delta)
 {
 	return (delta > 15U) ? 15U : (uint8_t)delta;
@@ -491,9 +498,7 @@ static void render_messages(void)
 		int y = CONTENT_Y;
 		uint16_t ble_color = state.ble_connected ? UI_COLOR_OK : UI_COLOR_WARN;
 		const char *ble = state.ble_connected ? "BLE OK" : "BLE ADV";
-		const char *radio = state.lora_tx_active ? "TX" :
-				    (state.lora_in_rx ? "RX" :
-				     (state.lora_radio_ready ? "RDY" : "WAIT"));
+		const char *radio = radio_state_label();
 		uint16_t radio_color = state.lora_tx_active ? UI_COLOR_TX :
 				       state.lora_in_rx ? UI_COLOR_RX :
 				       state.lora_radio_ready ? UI_COLOR_OK
@@ -632,9 +637,7 @@ static void render_radio(void)
 	uint32_t freq_frac = (state.lora_freq_hz % 1000000 + 500) / 1000;
 	uint16_t bw_int = state.lora_bw_khz_x10 / 10;
 	uint16_t bw_frac = state.lora_bw_khz_x10 % 10;
-	const char *packet_state = state.lora_tx_active ? "TX" :
-				   (state.lora_in_rx ? "RX" :
-				    (state.lora_radio_ready ? "RDY" : "WAIT"));
+	const char *packet_state = radio_state_label();
 	const char *rx_mode = state.lora_rx_duty_cycle ? "DC" : "CONT";
 	uint16_t warn_color = (state.lora_apc_enabled && state.lora_apc_reduction > 0)
 			      ? UI_COLOR_WARN : UI_COLOR_OK;

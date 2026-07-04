@@ -266,14 +266,6 @@ extern "C" void ui_set_ble_enabled(bool enabled)
 	}
 }
 
-extern "C" void ui_refresh_display(void)
-{
-	if (s_task) {
-		s_task->forceRefresh();
-	}
-}
-
-
 /* ===== Pull-model no-ops =====
  * The joystick UI reads all hardware state on demand at render time, so these
  * push-model hooks from the old button UI have no work to do. */
