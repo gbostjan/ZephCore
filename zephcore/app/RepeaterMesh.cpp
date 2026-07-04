@@ -50,10 +50,14 @@ LOG_MODULE_REGISTER(zephcore_repeater, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #if IS_ENABLED(CONFIG_ZEPHCORE_REPEATER_UPLINK) && IS_ENABLED(CONFIG_MQTT_LIB)
 static RepeaterMesh *s_uplink_mesh;
+/* Runs on the WiFi thread; the mesh time-sync module is main-thread-only, so
+ * flag the trusted sync and let loop() arm suppression + drift envelope. */
+static atomic_t s_uplink_sntp_pending;
 static void uplink_time_sync_cb(uint32_t unix_ts)
 {
 	if (s_uplink_mesh) {
 		s_uplink_mesh->getRTCClock()->setCurrentTime(unix_ts);
+		atomic_set(&s_uplink_sntp_pending, 1);
 	}
 }
 #endif
@@ -631,7 +635,10 @@ uint32_t RepeaterMesh::getDirectRetransmitDelay(const mesh::Packet* packet) {
     return computeAdaptiveDirectDelay(packet);
 }
 
-bool RepeaterMesh::filterRecvFloodPacket(mesh::Packet* pkt) {
+mesh::DispatcherAction RepeaterMesh::onRecvPacket(mesh::Packet* pkt) {
+    // Determine the request packet's region so sendFloodReply() can echo the same
+    // scope. Runs for every packet (not just floods) so recv_pkt_region is cleared
+    // for direct packets instead of inheriting the last flood's region.
     if (pkt->getRouteType() == ROUTE_TYPE_TRANSPORT_FLOOD) {
         recv_pkt_region = region_map.findMatch(pkt, REGION_DENY_FLOOD);
     } else if (pkt->getRouteType() == ROUTE_TYPE_FLOOD) {
@@ -643,7 +650,7 @@ bool RepeaterMesh::filterRecvFloodPacket(mesh::Packet* pkt) {
     } else {
         recv_pkt_region = nullptr;
     }
-    return false;
+    return Mesh::onRecvPacket(pkt);
 }
 
 void RepeaterMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) {
@@ -710,6 +717,14 @@ static bool isShare(const mesh::Packet* packet) {
 void RepeaterMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
                                 const uint8_t* app_data, size_t app_data_len) {
     mesh::Mesh::onAdvertRecv(packet, id, timestamp, app_data, app_data_len);
+
+    /* Signature already verified by mesh::Mesh before this hook fires.
+     * Skip share rebroadcasts — they replay stale stored adverts and would
+     * churn the original sender's tenure. */
+    if (!isShare(packet)) {
+        _timesync.onAdvertHeard(id.pub_key, timestamp, packet->getPathHashCount(),
+                                (uint32_t)(k_uptime_get() / 1000));
+    }
 
     if (packet->getPathHashCount() == 0 && !isShare(packet)) {
         AdvertDataParser parser(app_data, app_data_len);
@@ -784,7 +799,7 @@ void RepeaterMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender
                 }
             }
 
-            uint8_t temp[166];
+            uint8_t temp[5 + CLI_REMOTE_REPLY_SIZE];
             char* command = (char*)&data[5];
             char* reply = (char*)&temp[5];
             if (is_retry) {
@@ -1146,6 +1161,10 @@ void RepeaterMesh::setTxPower(int8_t power_dbm) {
     radio_set_tx_power(power_dbm);
 }
 
+bool RepeaterMesh::setRxBoostedGain(bool enable) {
+    return getRadioDriver(_radio).setRxBoost(enable);
+}
+
 void RepeaterMesh::formatNeighborsReply(char* reply) {
     char* dp = reply;
 
@@ -1368,11 +1387,45 @@ void RepeaterMesh::loop() {
         publishUplinkStatus("online");
         _uplink_next_status_at = futureMillis(300000);
     }
+    if (atomic_cas(&s_uplink_sntp_pending, 1, 0)) {
+        /* SNTP set the clock (trusted) — arm suppression + drift envelope. */
+        _timesync.noteManualSync((uint32_t)(k_uptime_get() / 1000));
+    }
 #endif
+
+    timeSyncTick();
 
     uint32_t now = k_uptime_get();
     uptime_millis += now - last_millis;
     last_millis = now;
+}
+
+void RepeaterMesh::timeSyncTick() {
+    if (!_prefs.meshtimesync) return;
+    if (!_timesync.runTick(*getRTCClock())) return;
+
+    /* Step applied — wall-clock-anchored bookkeeping must move with it, or a
+     * backward step underflows the unsigned "seconds ago" math. 0 = unset
+     * sentinel. */
+    int64_t delta = _timesync.lastStepDelta();
+#if MAX_NEIGHBOURS > 0
+    for (int i = 0; i < MAX_NEIGHBOURS; i++) {
+        if (neighbours[i].heard_timestamp == 0) continue;
+        int64_t shifted = (int64_t)neighbours[i].heard_timestamp + delta;
+        neighbours[i].heard_timestamp = (shifted > 0) ? (uint32_t)shifted : 1;
+    }
+#endif
+    for (int i = 0; i < acl.getNumClients(); i++) {
+        ClientInfo* c = acl.getClientByIdx(i);
+        if (c->last_activity == 0) continue;
+        int64_t shifted = (int64_t)c->last_activity + delta;
+        c->last_activity = (shifted > 0) ? (uint32_t)shifted : 1;
+    }
+    /* A backward step would otherwise wedge these shut until wall-clock
+     * catch-up. */
+    discover_limiter.reset();
+    anon_limiter.reset();
+    login_fail_limiter.reset();
 }
 
 bool RepeaterMesh::hasPendingWork() const {

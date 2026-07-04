@@ -6,9 +6,11 @@
 #pragma once
 
 #include <helpers/BaseChatMesh.h>
+#include <helpers/MeshTimeSync.h>
 #include <helpers/TransportKeyStore.h>
 #include <ZephyrDataStore.h>
 #include <NodePrefs.h>
+#include <zephyr/kernel.h>
 
 /* BLE push notification codes */
 #define PUSH_CODE_ADVERT              0x80
@@ -152,6 +154,31 @@ public:
 	 */
 	void setPinChangeCallback(PinChangeCallback cb) { _pin_change_cb = cb; }
 
+#ifdef CONFIG_ZEPHCORE_APC
+	/* Adaptive Power Control hooks used by the USB text CLI. */
+	int8_t getAPCReduction() const {
+		return getPowerController().getPowerReduction();
+	}
+	float getAPCMargin() const {
+		return getPowerController().getMarginEstimate();
+	}
+	bool isAPCEnabled() const {
+		return getPowerController().isEnabled();
+	}
+	void setAPCEnabled(bool en) {
+		getPowerController().setEnabled(en);
+		if (!en) {
+			_radio->setTxPowerReduction(0);
+		}
+	}
+	uint8_t getAPCTargetMargin() const {
+		return getPowerController().getTargetMargin();
+	}
+	void setAPCTargetMargin(uint8_t margin_db) {
+		getPowerController().setTargetMargin(margin_db);
+	}
+#endif
+
 	/**
 	 * Continue contact iteration (call each main loop iteration).
 	 * Returns true if contacts are still being sent.
@@ -230,6 +257,13 @@ public:
 	bool getContactForSave(uint32_t idx, ContactInfo &c) override;
 	bool onChannelLoaded(uint8_t idx, const ChannelDetails &ch) override;
 	bool getChannelForSave(uint8_t idx, ChannelDetails &ch) override;
+
+	/* Mesh time sync */
+	MeshTimeSync *getMeshTimeSync() { return &_timesync; }
+	void noteGPSTimeSync() { _timesync.noteGPSSync((uint32_t)(k_uptime_get() / 1000)); }
+	/* Paced evaluation — called from the housekeeping event (loop() only runs
+	 * on packet-driven events). */
+	void timeSyncTick();
 
 	/* Prefs (includes node_lat/lon) */
 	NodePrefs prefs;
@@ -368,6 +402,12 @@ private:
 	void markChannelsDirty();
 	void flushDirtyContacts();
 	void flushDirtyChannels();
+
+	/* Mesh time sync (forward-only: our clock stamps outgoing DMs and peers
+	 * hold per-sender replay high-water marks) */
+	MeshTimeSync _timesync{FIRMWARE_BUILD_EPOCH, true};
+	void onAdvertTimeSample(const mesh::Identity &id, uint32_t timestamp,
+		uint8_t hops) override;
 
 	/* Protocol version negotiation */
 	uint8_t _app_target_ver;

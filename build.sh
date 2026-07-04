@@ -18,8 +18,10 @@ nRF_boards=(
     sensecap_solar
     xiao_nrf52840
     lilygo_techo
+    lilygo_timpulse_plus
     promicro_sx1262
     heltec_t114
+    heltec_t096
     gat562_30s
 )
 
@@ -41,6 +43,7 @@ ESP32_boards=(
     heltec_wifi_lora32_v4/esp32s3/procpu
     heltec_wifi_lora32_v43/esp32s3/procpu
     heltec_wireless_tracker/esp32s3/procpu
+    heltec_wireless_tracker_v2/esp32s3/procpu
     ttgo_tbeam/esp32/procpu
 )
 
@@ -199,12 +202,17 @@ size = parse_cell(m.group(1))
 print(str(size // 1048576) + "MB")
                 ' "${ZEPHYR_DTS:-build/zephcore/zephyr/zephyr.dts}"
             )
+            # MCUboot/sysbuild boards: only the merged (MCUboot + signed app)
+            # image is bootable on a bare/existing chip at 0x0. The signed app
+            # alone requires MCUboot already present and must land at 0x20000 —
+            # publishing it standalone as a "plain .bin" bricks boards when
+            # flashed the same way as classic-ESP32's self-contained zephyr.bin
+            # (see GH #42). Don't ship it.
             python -m esptool --chip "$chip" merge-bin \
             --output firmware/"$board_clean_for_path"-companion-"$COMMIT_HASH"-merged.bin \
             --flash-mode dio --flash-freq 40m --flash-size "$FLASH_SIZE" \
             0x00000 build/mcuboot/zephyr/zephyr.bin \
             0x20000 build/zephcore/zephyr/zephyr.signed.bin
-            mv build/zephcore/zephyr/zephyr.signed.bin firmware/"$board_clean_for_path"-companion-"$COMMIT_HASH".bin
         fi
         
         if [[ $2 == "repeaters" ]]; then
@@ -242,12 +250,13 @@ size = parse_cell(m.group(1))
 print(str(size // 1048576) + "MB")
                 ' "${ZEPHYR_DTS:-build/zephcore/zephyr/zephyr.dts}"
             )
+            # See companion branch above — the signed app alone isn't bootable
+            # standalone, so only publish the merged image for these boards.
             python -m esptool --chip "$chip" merge-bin \
             --output firmware/"$board_clean_for_path"-repeater-"$COMMIT_HASH"-merged.bin \
             --flash-mode dio --flash-freq 40m --flash-size "$FLASH_SIZE" \
             0x00000 build/mcuboot/zephyr/zephyr.bin \
             0x20000 build/zephcore/zephyr/zephyr.signed.bin
-            mv build/zephcore/zephyr/zephyr.signed.bin firmware/"$board_clean_for_path"-repeater-"$COMMIT_HASH".bin
         fi
     done
 fi

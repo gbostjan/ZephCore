@@ -303,7 +303,7 @@ bool CompanionMesh::onContactPathRecv(ContactInfo &from, uint8_t *in_path, uint8
 		if (tag == _pending_discovery) {
 			_pending_discovery = 0;
 
-			if (in_path_len <= MAX_PATH_SIZE && out_path_len <= MAX_PATH_SIZE) {
+			if (mesh::Packet::isValidPathLen(in_path_len) && mesh::Packet::isValidPathLen(out_path_len)) {
 				uint8_t rsp[172];
 				int i = 0;
 				rsp[i++] = PUSH_CODE_PATH_DISCOVERY_RESP;
@@ -311,11 +311,9 @@ bool CompanionMesh::onContactPathRecv(ContactInfo &from, uint8_t *in_path, uint8
 				memcpy(&rsp[i], from.id.pub_key, 6);
 				i += 6;
 				rsp[i++] = out_path_len;
-				memcpy(&rsp[i], out_path, out_path_len);
-				i += out_path_len;
+				i += mesh::Packet::writePath(&rsp[i], out_path, MAX_PATH_SIZE, out_path_len);
 				rsp[i++] = in_path_len;
-				memcpy(&rsp[i], in_path, in_path_len);
-				i += in_path_len;
+				i += mesh::Packet::writePath(&rsp[i], in_path, MAX_PATH_SIZE, in_path_len);
 				sendPush(rsp[0], &rsp[1], i - 1);
 			} else {
 				LOG_WRN("onContactPathRecv: invalid path sizes: out=%d in=%d",
@@ -342,6 +340,22 @@ void CompanionMesh::loop()
 	if (_dirty_channels_expiry && now >= _dirty_channels_expiry) {
 		flushDirtyChannels();
 	}
+}
+
+void CompanionMesh::onAdvertTimeSample(const mesh::Identity &id, uint32_t timestamp,
+				       uint8_t hops)
+{
+	/* Signature already verified by mesh::Mesh before this hook fires. */
+	_timesync.onAdvertHeard(id.pub_key, timestamp, hops,
+				(uint32_t)(k_uptime_get() / 1000));
+}
+
+void CompanionMesh::timeSyncTick()
+{
+	if (!prefs.meshtimesync) return;
+	/* Shared policy (GPS fix-freshness gate, forward-only) lives in
+	 * runTick; no companion-side bookkeeping needs shifting on a step. */
+	_timesync.runTick(*getRTCClock());
 }
 
 void CompanionMesh::onLoginSent(const ContactInfo &contact)
@@ -937,7 +951,12 @@ uint32_t CompanionMesh::calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) c
 
 uint32_t CompanionMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t path_len) const
 {
-	return 500 + (uint32_t)((pkt_airtime_millis * 6.0f + 250) * (path_len + 1));
+	/* path_len is the packed hash-size-encoded byte (top 2 bits = hash_size-1,
+	 * bottom 6 = hop count) — mask to the real hop count before scaling, or
+	 * any path learned at path_hash_mode>0 inflates this by up to ~17x
+	 * (e.g. a 3-hop path at 2-byte hashes encodes as 67, not 3). */
+	uint8_t path_hash_count = path_len & 63;
+	return 500 + (uint32_t)((pkt_airtime_millis * 6.0f + 250) * (path_hash_count + 1));
 }
 
 void CompanionMesh::onSendTimeout()
@@ -1635,8 +1654,17 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			sendPacketError(ERR_ILLEGAL_ARG);
 			return true;
 		}
-		// Reset contact iterator for fresh start
+		// Reset per-session state for a fresh app session. BLE/USB also run
+		// this cleanup on disconnect, but the serial transport has no
+		// disconnect event, so APP_START is its authoritative session-reset
+		// point: drop a stale contact iteration (a leftover PACKET_CONTACT_END
+		// would confuse the new session's sync state machine), a half-finished
+		// message sync, and free an abandoned Ed25519 sign buffer (else an 8KB
+		// leak if the previous session dropped mid-CMD_SIGN). Idempotent — all
+		// no-ops when the state is already clean.
 		_contact_iter_active = false;
+		cancelSyncPending();
+		cleanupSignState();
 
 		// Return SELF_INFO
 		uint8_t rsp[90];  // 58 fixed + up to 32 bytes name
@@ -2225,6 +2253,7 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 				getRTCClock()->setCurrentTime(secs);
 				time_sync_report(TIME_SYNC_APP);
 				zephcore_rtc_save(secs);  /* persist to hardware RTC */
+				_timesync.noteManualSync((uint32_t)(k_uptime_get() / 1000));
 				sendPacketOk();
 			} else {
 				sendPacketError(ERR_ILLEGAL_ARG);
@@ -2738,9 +2767,22 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			int n = snprintf(dp, remaining, "gps_interval:%u", (unsigned)gps_interval);
 			if (n > 0 && (size_t)n < remaining) {
 				dp += n;
+				first = false;
 			}
 			// If snprintf would have truncated, dp stays put — writeFrame
 			// sends only what we successfully wrote.
+		}
+		{
+			size_t remaining = (size_t)(rsp_end - dp);
+			if (!first && remaining > 0) {
+				*dp++ = ',';
+				remaining--;
+			}
+			int n = snprintf(dp, remaining, "meshtimesync:%d",
+					 prefs.meshtimesync ? 1 : 0);
+			if (n > 0 && (size_t)n < remaining) {
+				dp += n;
+			}
 		}
 		// Note: Environment sensors are auto-detected, no settings needed
 
@@ -2780,6 +2822,10 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 					} else {
 						sendPacketError(ERR_ILLEGAL_ARG);
 					}
+				} else if (strcmp(key, "meshtimesync") == 0) {
+					prefs.meshtimesync = (val[0] == '1') ? 1 : 0;
+					_store->savePrefs(prefs);
+					sendPacketOk();
 				} else {
 					sendPacketError(ERR_ILLEGAL_ARG);
 				}

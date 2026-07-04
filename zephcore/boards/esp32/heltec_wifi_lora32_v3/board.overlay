@@ -22,6 +22,11 @@
 		/* Keep console/shell on UART0 for stable host logging on V3 */
 		zephyr,console = &uart0;
 		zephyr,shell-uart = &uart0;
+		/* Plain-UART companion backend (CONFIG_ZEPHCORE_COMPANION_SERIAL):
+		 * the wired companion + text CLI run over uart0 (USB-C via CP2102).
+		 * Inert unless that conf is built; in a serial-companion build the
+		 * conf also moves console/shell off uart0 so the companion owns it. */
+		zephcore,companion-uart = &uart0;
 	};
 
 	/* Add label to upstream buttons node (defined without one) */

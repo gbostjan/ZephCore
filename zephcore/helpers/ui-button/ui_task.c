@@ -185,6 +185,7 @@ static void splash_work_handler(struct k_work *work)
 }
 
 static void schedule_render(void);
+static void schedule_render_auto(void);
 
 static void advert_defer_handler(struct k_work *work)
 {
@@ -503,6 +504,10 @@ static void action_deep_sleep(void)
 		k_sleep(K_MSEC(50));
 	}
 	buzzer_stop();
+
+	if (buzzer_is_quiet()) {
+		ui_led_flash_shutdown();
+	}
 #endif
 
 	/* Shared peripheral teardown + SENSE config for sw0 wake.
@@ -878,6 +883,10 @@ void ui_set_radio_params(uint32_t freq_hz, uint8_t sf, uint16_t bw_khz_x10,
 			 uint8_t cr, int8_t tx_power, int16_t noise_floor)
 {
 	struct ui_state *s = get_state();
+	bool changed = s->lora_freq_hz != freq_hz || s->lora_sf != sf ||
+		       s->lora_bw_khz_x10 != bw_khz_x10 || s->lora_cr != cr ||
+		       s->lora_tx_power != tx_power ||
+		       s->lora_noise_floor != noise_floor;
 
 	s->lora_freq_hz = freq_hz;
 	s->lora_sf = sf;
@@ -885,6 +894,65 @@ void ui_set_radio_params(uint32_t freq_hz, uint8_t sf, uint16_t bw_khz_x10,
 	s->lora_cr = cr;
 	s->lora_tx_power = tx_power;
 	s->lora_noise_floor = noise_floor;
+
+	if (changed) {
+		schedule_render_auto();
+	}
+}
+
+void ui_set_radio_runtime(int8_t effective_tx_power, bool apc_enabled,
+			  int8_t apc_reduction, int16_t apc_margin_x10,
+			  uint8_t apc_target_margin, uint8_t sync_word,
+			  uint16_t preamble_len, bool rx_duty_cycle,
+			  bool radio_ready, bool in_rx, bool tx_active)
+{
+	struct ui_state *s = get_state();
+	bool changed = s->lora_effective_tx_power != effective_tx_power ||
+		       s->lora_apc_enabled != apc_enabled ||
+		       s->lora_apc_reduction != apc_reduction ||
+		       s->lora_apc_margin_x10 != apc_margin_x10 ||
+		       s->lora_apc_target_margin != apc_target_margin ||
+		       s->lora_sync_word != sync_word ||
+		       s->lora_preamble_len != preamble_len ||
+		       s->lora_rx_duty_cycle != rx_duty_cycle ||
+		       s->lora_radio_ready != radio_ready ||
+		       s->lora_in_rx != in_rx ||
+		       s->lora_tx_active != tx_active;
+
+	s->lora_effective_tx_power = effective_tx_power;
+	s->lora_apc_enabled = apc_enabled;
+	s->lora_apc_reduction = apc_reduction;
+	s->lora_apc_margin_x10 = apc_margin_x10;
+	s->lora_apc_target_margin = apc_target_margin;
+	s->lora_sync_word = sync_word;
+	s->lora_preamble_len = preamble_len;
+	s->lora_rx_duty_cycle = rx_duty_cycle;
+	s->lora_radio_ready = radio_ready;
+	s->lora_in_rx = in_rx;
+	s->lora_tx_active = tx_active;
+
+	if (changed) {
+		schedule_render_auto();
+	}
+}
+
+void ui_set_radio_stats(uint32_t packets_rx, uint32_t packets_tx,
+			uint32_t packets_err)
+{
+	struct ui_state *s = get_state();
+	bool activity_changed = packets_rx != s->lora_packets_rx ||
+				packets_tx != s->lora_packets_tx;
+
+	s->lora_packets_rx = packets_rx;
+	s->lora_packets_tx = packets_tx;
+	s->lora_packets_err = packets_err;
+
+#ifdef CONFIG_ZEPHCORE_UI_DISPLAY
+	if (ui_initialized && activity_changed && mc_display_has_color() &&
+	    ui_pages_current() == UI_PAGE_TRAFFIC) {
+		schedule_render();
+	}
+#endif
 }
 
 void ui_set_gps_data(bool has_fix, uint8_t sats,
@@ -1036,7 +1104,10 @@ void ui_set_offgrid_mode(bool enabled)
 	s->offgrid_enabled = enabled;
 }
 
-void ui_refresh_display(void)
+/* Schedule a redraw for an automatic (non-interactive) state update, e.g. a
+ * live radio value changing. Skips EPD panels, which only repaint on real
+ * events to avoid ~2s flashes. */
+static void schedule_render_auto(void)
 {
 	if (!ui_initialized) {
 		return;

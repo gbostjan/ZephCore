@@ -916,6 +916,30 @@ void JoystickUITask::toggleGPS()
 	mesh_gps_set_enabled(!gps_is_enabled());
 }
 
+uint32_t JoystickUITask::getGpsDutySec() const
+{
+	return gps_get_poll_interval_sec();
+}
+
+void JoystickUITask::adjustGpsDuty(int step)
+{
+	static const uint32_t kPresets[] = {
+		0, 10, 30, 60, 120, 300, 600, 900, 1800, 3600,
+		7200, 21600, 43200, 86400, 172800, 604800
+	};
+	const int kCount = (int)(sizeof(kPresets) / sizeof(kPresets[0]));
+
+	uint32_t cur = gps_get_poll_interval_sec();
+	int idx = kCount - 1;
+	for (int i = 0; i < kCount; i++) {
+		if (kPresets[i] >= cur) { idx = i; break; }
+	}
+	idx += step;
+	if (idx < 0) idx = 0;
+	if (idx >= kCount) idx = kCount - 1;
+	mesh_save_gps_duty_sec(kPresets[idx]);
+}
+
 void JoystickUITask::playCountdownAlarm()
 {
 #ifdef CONFIG_ZEPHCORE_UI_BUZZER

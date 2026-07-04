@@ -36,11 +36,15 @@ LOG_MODULE_REGISTER(zephcore_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #include <ZephyrBLE.h>
 
-/* The USB CDC companion stack is compiled when either logging needs the CDC
- * console (debug builds) or the binary companion transport is explicitly
- * enabled (CONFIG_ZEPHCORE_COMPANION_USB, default-y on USB-capable boards). */
+/* The wired-companion stack (ZephyrCompanionUSB) is compiled when either
+ * logging needs the CDC console (debug builds), the native-USB companion is
+ * enabled (CONFIG_ZEPHCORE_COMPANION_USB, default-y on USB-capable boards), or
+ * the plain-UART companion is enabled (CONFIG_ZEPHCORE_COMPANION_SERIAL, for
+ * USB-UART-bridge / no-USB boards).  All three share the same frame parser,
+ * TX ring, CLI, and BLE arbitration — only the byte backend differs. */
 #define ZEPHCORE_USB_STACK \
-	(IS_ENABLED(CONFIG_LOG) || IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_USB))
+	(IS_ENABLED(CONFIG_LOG) || IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_USB) || \
+	 IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_SERIAL))
 
 #if ZEPHCORE_USB_STACK
 #include <ZephyrCompanionUSB.h>
@@ -521,17 +525,23 @@ static void mesh_event_loop(void)
 
 			mesh_housekeeping_ui_refresh();
 
+			/* Mesh time-sync paced evaluation — loop() only runs on
+			 * packet-driven events, so drive the 15-min tick here. */
+			if (companion_mesh_ptr) {
+				companion_mesh_ptr->timeSyncTick();
+			}
+
 			/* Low-battery auto-shutdown (companion only). Self-throttled
 			 * and compiled out unless the board sets a threshold — no
 			 * extra poll, just a cheap call on the existing tick. */
 			ui_auto_shutdown_check();
 		}
 
-		/* Off-main pref mutators (e.g. gps_fix_callback in modem_chat
-		 * context) post this bit and update _prefs in memory; we flush
-		 * to flash here so the synchronous LittleFS write doesn't block
-		 * the originating thread.  Multiple posts coalesce into one
-		 * write of the latest _prefs values — desired behaviour. */
+		/* Off-main pref mutators (e.g. the autoshutdown CLI handler on
+		 * the sysworkq USB RX path) post this bit and update _prefs in
+		 * memory; we flush to flash here so the synchronous LittleFS
+		 * write doesn't block the originating thread.  Multiple posts
+		 * coalesce into one write of the latest _prefs values. */
 		if ((events & MESH_EVENT_PREFS_DIRTY) && companion_mesh_ptr) {
 			save_prefs_to_flash();
 		}
@@ -542,6 +552,12 @@ static void mesh_event_loop(void)
 		 * write here on the main thread instead. */
 		if (events & MESH_EVENT_RTC_SAVE) {
 			zephcore_rtc_save((uint32_t)atomic_get(&pending_rtc_epoch));
+#ifdef ZEPHCORE_LORA
+			/* GPS just set the clock — arm the mesh time-sync drift envelope. */
+			if (companion_mesh_ptr) {
+				companion_mesh_ptr->noteGPSTimeSync();
+			}
+#endif
 		}
 
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_DESIGN_JOYSTICK)
@@ -678,6 +694,31 @@ public:
 		LOG_INF("TX power %d dBm requested (reboot to apply)", power_dbm);
 	}
 
+	bool setRxBoostedGain(bool enable) override {
+		return lora_radio.setRxBoost(enable);
+	}
+
+#ifdef CONFIG_ZEPHCORE_APC
+	int8_t getAPCReduction() const override {
+		return companion_mesh.getAPCReduction();
+	}
+	float getAPCMargin() const override {
+		return companion_mesh.getAPCMargin();
+	}
+	bool isAPCEnabled() const override {
+		return companion_mesh.isAPCEnabled();
+	}
+	void setAPCEnabled(bool en) override {
+		companion_mesh.setAPCEnabled(en);
+	}
+	uint8_t getAPCTargetMargin() const override {
+		return companion_mesh.getAPCTargetMargin();
+	}
+	void setAPCTargetMargin(uint8_t margin_db) override {
+		companion_mesh.setAPCTargetMargin(margin_db);
+	}
+#endif
+
 	mesh::LocalIdentity& getSelfId() override { return companion_mesh.self_id; }
 
 	void saveIdentity(const mesh::LocalIdentity& new_id) override {
@@ -694,6 +735,10 @@ public:
 	void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr,
 				  int timeout_mins) override {
 		(void)freq; (void)bw; (void)sf; (void)cr; (void)timeout_mins;
+	}
+
+	MeshTimeSync* getMeshTimeSync() override {
+		return companion_mesh.getMeshTimeSync();
 	}
 };
 
@@ -754,8 +799,8 @@ static bool handle_autoshutdown_cli(const char *line, char *reply)
 		companion_mesh.prefs.auto_shutdown_mv = (uint16_t)v;
 		/* Defer the flash write to the main thread (this runs on sysworkq via
 		 * the USB RX work handler). A synchronous savePrefs here could race a
-		 * concurrent main-thread save (e.g. GPS-fix MESH_EVENT_PREFS_DIRTY) on
-		 * the same prefs .tmp file. Posting the event coalesces both onto main. */
+		 * concurrent main-thread save (e.g. a companion-app command handler)
+		 * on the same prefs .tmp file. Posting the event coalesces onto main. */
 		k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
 		ui_set_auto_shutdown_mv((uint16_t)v);
 		if (v == 0) {
@@ -843,7 +888,12 @@ static void gps_fix_callback(double lat, double lon, int64_t utc_time)
 	}
 
 #ifdef ZEPHCORE_LORA
-	/* Update node position for mesh advertising */
+	/* Update node position for mesh advertising — RAM only, no flash
+	 * write. Matches upstream Arduino (sensors.node_lat/lon): the
+	 * position reaches flash only piggybacked on the next savePrefs()
+	 * triggered by an actual settings change. Persisting from here
+	 * would rewrite the full prefs blob on nearly every promoted fix,
+	 * since GPS jitter defeats the exact-double comparison below. */
 	if (lat != companion_mesh.prefs.node_lat || lon != companion_mesh.prefs.node_lon) {
 		companion_mesh.prefs.node_lat = lat;
 		companion_mesh.prefs.node_lon = lon;
@@ -856,13 +906,6 @@ static void gps_fix_callback(double lat, double lon, int64_t utc_time)
 		if (lon_frac < 0) lon_frac = -lon_frac;
 		LOG_INF("GPS fix: position updated lat=%d.%06d lon=%d.%06d",
 			lat_deg, lat_frac, lon_deg, lon_frac);
-		/* Defer flash write to main thread — gps_fix_callback runs in
-		 * the GNSS modem_chat worker; a synchronous LittleFS write here
-		 * (10-50 ms on nRF52 QSPI) would block NMEA ingest and risk
-		 * UART buffer overflow / lost fixes.  Main handles the save
-		 * via MESH_EVENT_PREFS_DIRTY; multiple fixes coalesce into one
-		 * write (the latest prefs values are written). */
-		k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
 	}
 
 	/* Update UI with GPS data */
@@ -1107,12 +1150,39 @@ int main(void)
 	/* Push initial state to UI display */
 	ui_set_node_name(companion_mesh.prefs.node_name);
 	ui_set_radio_params(
-		(uint32_t)(companion_mesh.prefs.freq * 1000000.0f + 0.5f),
-		companion_mesh.prefs.sf,
-		(uint16_t)(companion_mesh.prefs.bw * 10.0f + 0.5f),
-		companion_mesh.prefs.cr,
-		companion_mesh.prefs.tx_power_dbm,
+		lora_radio.getActiveFrequencyHz(),
+		lora_radio.getActiveSpreadingFactor(),
+		lora_radio.getActiveBandwidthKHzX10(),
+		lora_radio.getActiveCodingRate(),
+		lora_radio.getConfiguredTxPower(),
 		lora_radio.getNoiseFloor());
+#ifdef CONFIG_ZEPHCORE_APC
+	ui_set_radio_runtime(
+		lora_radio.getEffectiveTxPower(),
+		companion_mesh.isAPCEnabled(),
+		companion_mesh.getAPCReduction(),
+		(int16_t)(companion_mesh.getAPCMargin() * 10.0f),
+		companion_mesh.getAPCTargetMargin(),
+		lora_radio.getActiveSyncWord(),
+		lora_radio.getActivePreambleLength(),
+		lora_radio.isRxDutyCycleEnabled(),
+		lora_radio.isRadioReady(),
+		lora_radio.isInRecvMode(),
+		lora_radio.isTxActive());
+#else
+	ui_set_radio_runtime(
+		lora_radio.getEffectiveTxPower(),
+		false, 0, 0, companion_mesh.prefs.apc_margin,
+		lora_radio.getActiveSyncWord(),
+		lora_radio.getActivePreambleLength(),
+		lora_radio.isRxDutyCycleEnabled(),
+		lora_radio.isRadioReady(),
+		lora_radio.isInRecvMode(),
+		lora_radio.isTxActive());
+#endif
+	ui_set_radio_stats(lora_radio.getPacketsRecv(),
+			   lora_radio.getPacketsSent(),
+			   lora_radio.getPacketsRecvErrors());
 	ui_set_battery(zephyr_board.getBattMilliVolts(), 0);
 	ui_set_gps_available(gps_is_available());
 	ui_set_gps_enabled(companion_mesh.prefs.gps_enabled != 0);
@@ -1163,6 +1233,30 @@ int main(void)
 	/* Apply RX boost and duty cycle from prefs */
 	lora_radio.setRxBoost(companion_mesh.prefs.rx_boost != 0);
 	lora_radio.enableRxDutyCycle(companion_mesh.prefs.rx_duty_cycle != 0);
+#ifdef CONFIG_ZEPHCORE_APC
+	ui_set_radio_runtime(
+		lora_radio.getEffectiveTxPower(),
+		companion_mesh.isAPCEnabled(),
+		companion_mesh.getAPCReduction(),
+		(int16_t)(companion_mesh.getAPCMargin() * 10.0f),
+		companion_mesh.getAPCTargetMargin(),
+		lora_radio.getActiveSyncWord(),
+		lora_radio.getActivePreambleLength(),
+		lora_radio.isRxDutyCycleEnabled(),
+		lora_radio.isRadioReady(),
+		lora_radio.isInRecvMode(),
+		lora_radio.isTxActive());
+#else
+	ui_set_radio_runtime(
+		lora_radio.getEffectiveTxPower(),
+		false, 0, 0, companion_mesh.prefs.apc_margin,
+		lora_radio.getActiveSyncWord(),
+		lora_radio.getActivePreambleLength(),
+		lora_radio.isRxDutyCycleEnabled(),
+		lora_radio.isRadioReady(),
+		lora_radio.isInRecvMode(),
+		lora_radio.isTxActive());
+#endif
 
 	/* Restore runtime ADC multiplier override (0 = keep DT default) */
 	zephyr_board.setAdcMultiplier(companion_mesh.prefs.adc_multiplier);

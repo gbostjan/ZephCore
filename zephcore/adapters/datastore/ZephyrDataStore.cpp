@@ -663,6 +663,14 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 			prefs.rx_duty_cycle = 0;
 		}
 	}
+
+	/* Offset 151: meshtimesync (ZephCore extension, default 0 = off) */
+	if (off < len) {
+		prefs.meshtimesync = buf[off++];
+		if (prefs.meshtimesync > 1) {
+			prefs.meshtimesync = 0;
+		}
+	}
 }
 
 void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
@@ -737,7 +745,9 @@ void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
 	buf[off++] = (prefs.auto_shutdown_mv >> 8) & 0xFF;
 	/* Offset 150: rx_duty_cycle (ZephCore extension) */
 	buf[off++] = prefs.rx_duty_cycle;
-	/* Total: 151 bytes */
+	/* Offset 151: meshtimesync (ZephCore extension) */
+	buf[off++] = prefs.meshtimesync;
+	/* Total: 152 bytes */
 
 	bool ok = atomicReplaceFile(PREFS_FILE, buf, off);
 	LOG_DBG("savePrefs: wrote %s, ok=%d (%d bytes), name='%.16s'",

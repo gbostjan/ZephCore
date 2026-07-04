@@ -173,11 +173,13 @@ static void print_banner(void)
 	cli_println("set sf        <7-12>       Spreading factor");
 	cli_println("set bw        <idx>        Bandwidth: 3=62.5 0=125 1=250 2=500 kHz");
 	cli_println("set cr        <5-8>        Coding rate");
+	cli_println("set meshtimesync <on|off>  Mesh clock consensus correction");
 	cli_println("");
 	cli_println("--- Query ---");
 	cli_println("get wifi.status            WiFi connection state");
 	cli_println("get mqtt.status            MQTT connection state");
 	cli_println("get radio                  LoRa radio parameters");
+	cli_println("get meshtimesync           Time-sync consensus state (dry-run)");
 	cli_println("help                       Show this screen");
 	cli_println("=========================");
 }
@@ -228,9 +230,14 @@ static void process_cli_rx(void)
 
 static mesh::ZephyrRTCClock s_rtc_clock;
 
+/* SNTP callback runs on the WiFi thread; the mesh time-sync module is
+ * main-thread-only, so just flag the sync and let the event loop arm it. */
+static atomic_t s_sntp_synced;
+
 static void time_sync_cb(uint32_t unix_ts)
 {
 	s_rtc_clock.setCurrentTime(unix_ts);
+	atomic_set(&s_sntp_synced, 1);
 	LOG_INF("RTC synced from SNTP: %u", unix_ts);
 }
 
@@ -366,8 +373,13 @@ int main(void)
 		if (ev & MESH_EVENT_CLI_RX) {
 			process_cli_rx();
 		}
+		if (atomic_cas(&s_sntp_synced, 1, 0)) {
+			/* SNTP set the clock — arm suppression + drift envelope. */
+			observer_mesh.noteTrustedTimeSync();
+		}
 		if (ev & MESH_EVENT_STATUS) {
 			observer_mesh.publishStatus("online");
+			observer_mesh.timeSyncTick();
 		}
 		if (ev & MESH_EVENT_MQTT_CONNECT) {
 			observer_mesh.publishStatus("online");

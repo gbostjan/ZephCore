@@ -217,7 +217,64 @@ DispatcherAction ObserverMesh::onRecvPacket(Packet *pkt)
 	 * The same flood packet heard from different repeaters is published
 	 * separately, each with its own SNR/RSSI (propagation data). */
 	enqueuePacket(pkt);
+	harvestTimeSample(pkt);
 	return ACTION_RELEASE;  /* never retransmit */
+}
+
+/* ========== Mesh time sync ========== */
+
+void ObserverMesh::harvestTimeSample(Packet *pkt)
+{
+	if (pkt->getPayloadType() != PAYLOAD_TYPE_ADVERT) return;
+	if (pkt->getPathHashCount() > MeshTimeSync::HOP_CAP) return;
+	if (pkt->payload_len < PUB_KEY_SIZE + 4 + SIGNATURE_SIZE) return;
+	/* Skip share rebroadcasts (transport codes {0,0}) — they replay stale
+	 * stored adverts and would churn the original sender's tenure. */
+	if (pkt->hasTransportCodes() &&
+	    pkt->transport_codes[0] == 0 && pkt->transport_codes[1] == 0) {
+		return;
+	}
+
+	int i = 0;
+	Identity id;
+	memcpy(id.pub_key, &pkt->payload[i], PUB_KEY_SIZE);
+	i += PUB_KEY_SIZE;
+	uint32_t timestamp;
+	memcpy(&timestamp, &pkt->payload[i], 4);
+	i += 4;
+	const uint8_t *signature = &pkt->payload[i];
+	i += SIGNATURE_SIZE;
+
+	/* Observers have no dedup and hear every flood copy — skip the
+	 * expensive Ed25519 verify when the sample cannot update the table. */
+	if (!_timesync.wouldAccept(id.pub_key, timestamp)) return;
+
+	size_t app_data_len = pkt->payload_len - (size_t)i;
+	if (app_data_len > MAX_ADVERT_DATA_SIZE) app_data_len = MAX_ADVERT_DATA_SIZE;
+
+	uint8_t message[PUB_KEY_SIZE + 4 + MAX_ADVERT_DATA_SIZE];
+	int msg_len = 0;
+	memcpy(&message[msg_len], id.pub_key, PUB_KEY_SIZE); msg_len += PUB_KEY_SIZE;
+	memcpy(&message[msg_len], &timestamp, 4); msg_len += 4;
+	memcpy(&message[msg_len], &pkt->payload[i], app_data_len); msg_len += app_data_len;
+
+	if (!id.verify(signature, message, msg_len)) return;
+
+	_timesync.onAdvertHeard(id.pub_key, timestamp, pkt->getPathHashCount(),
+				(uint32_t)(k_uptime_get() / 1000));
+}
+
+void ObserverMesh::timeSyncTick()
+{
+	if (!_prefs.meshtimesync || !_rtc) return;
+	/* Shared policy (GPS fix-freshness gate) lives in runTick; no
+	 * observer-side bookkeeping needs shifting on a step. */
+	_timesync.runTick(*_rtc);
+}
+
+void ObserverMesh::noteTrustedTimeSync()
+{
+	_timesync.noteManualSync((uint32_t)(k_uptime_get() / 1000));
 }
 
 /* ========== Serial CLI ========== */
@@ -288,6 +345,12 @@ bool ObserverMesh::handleCLI(const char *command, char *reply, int reply_size)
 		} else if (strcmp(key, "mqtt.port") == 0) {
 			snprintf(reply, reply_size, "%u",
 				 (_creds) ? (unsigned)_creds->mqtt_port : 8883u);
+
+		} else if (strcmp(key, "meshtimesync") == 0) {
+			_timesync.formatStatus(reply, reply_size,
+					       _rtc ? _rtc->getCurrentTime() : 0,
+					       (uint32_t)(k_uptime_get() / 1000),
+					       _prefs.meshtimesync != 0);
 
 		} else if (strcmp(key, "mqtt.tls") == 0) {
 			snprintf(reply, reply_size, "%u",
@@ -390,6 +453,19 @@ bool ObserverMesh::handleCLI(const char *command, char *reply, int reply_size)
 				snprintf(reply, reply_size, "cr=%u", _prefs.cr);
 			} else {
 				snprintf(reply, reply_size, "ERR cr must be 5-8");
+			}
+
+		} else if ((val = find_val(rest, "meshtimesync")) != nullptr) {
+			if (strcmp(val, "on") == 0) {
+				_prefs.meshtimesync = 1;
+				_store->savePrefs(_prefs);
+				snprintf(reply, reply_size, "meshtimesync=on");
+			} else if (strcmp(val, "off") == 0) {
+				_prefs.meshtimesync = 0;
+				_store->savePrefs(_prefs);
+				snprintf(reply, reply_size, "meshtimesync=off");
+			} else {
+				snprintf(reply, reply_size, "ERR must be on or off");
 			}
 
 		} else if (!_creds) {

@@ -40,7 +40,7 @@
 	vbat_enable: vbat-enable {
 		compatible = "regulator-fixed";
 		regulator-name = "vbat-enable";
-		enable-gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;  /* GPIO37 = gpio1 pin 5 */
+		enable-gpios = <&gpio1 5 GPIO_ACTIVE_HIGH>;  /* GPIO37 = gpio1 pin 5, HIGH enables (V4/V4.3) */
 	};
 
 	/* Button chain — same mapping as RAK4631 / WisMesh Pocket (rak4631/board.overlay). */
