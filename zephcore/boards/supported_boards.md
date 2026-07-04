@@ -42,6 +42,7 @@ heltec_wifi_lora32_v4/esp32s3/procpu
 heltec_wifi_lora32_v43/esp32s3/procpu
 heltec_wireless_tracker/esp32s3/procpu
 ttgo_tbeam/esp32/procpu
+ttgo_lora32/esp32/procpu
 ```
 
 > ESP32 boards require `west blobs fetch hal_espressif` before first build.
@@ -55,6 +56,21 @@ ttgo_tbeam/esp32/procpu
 > SX1262, AXP2101 PMU, and GNSS. Use this for the **v1.2 SX1262** variant — the
 > upstream Zephyr DTS models the SX1276 radio, which ZephCore overrides to
 > SX1262 in `board.overlay`. Console/CLI are on `uart0` (onboard USB-UART).
+>
+> **TTGO LoRa32** (`ttgo_lora32/esp32/procpu`): classic ESP32 (PICO-D4) with
+> **SX1276** — the SX127x (loramac-node backend) reference board. Console/CLI
+> on `uart0`.
+
+## STM32WL
+
+```
+lora_e5_mini
+```
+
+> **Seeed LoRa-E5 mini** (`lora_e5_mini`): STM32WLE5JC with the integrated
+> SX1262-class sub-GHz radio. No BLE and no USB device — the companion
+> protocol and the CLI both run over USART1 (bridged to USB-C by the onboard
+> USB-UART chip). Flash over SWD/ST-Link with `west flash`.
 
 ## MG24 (Silicon Labs)
 
@@ -71,3 +87,9 @@ xiao_nrf54l15/nrf54l15/cpuapp
 ```
 
 > Requires `--no-sysbuild` flag: `west build -b xiao_nrf54l15/nrf54l15/cpuapp zephcore --no-sysbuild`
+
+## Native Linux
+
+Not `west build -b` boards — `EXTRA_CONF_FILE` presets on top of `native_sim`
+for SBCs (Femtofox / Luckfox Pico Mini, Raspberry Pi + RAK6421 HAT). See
+[LINUX_NATIVE.md](../LINUX_NATIVE.md) for build commands and wiring.

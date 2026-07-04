@@ -193,16 +193,19 @@ Append `-- -DEXTRA_CONF_FILE="boards/common/room_server.conf"` to any build comm
 west build -b rak4631 zephcore -- -DEXTRA_CONF_FILE="boards/common/room_server.conf"
 ```
 
-### Production Build (logging disabled)
+### Production vs Debug Builds
+
+Production (no logging, no asserts, reboot-on-fatal) is the **default** — no
+extra conf needed. To enable logging, add the debug overlay:
 
 ```
-west build -b rak4631 zephcore -- -DEXTRA_CONF_FILE="boards/common/prod.conf"
+west build -b rak4631 zephcore -- -DEXTRA_CONF_FILE="boards/common/debug.conf"
 ```
 
-### Repeater + Production
+### Repeater + Debug
 
 ```
-west build -b rak4631 zephcore -- -DEXTRA_CONF_FILE="boards/common/repeater.conf;boards/common/prod.conf"
+west build -b rak4631 zephcore -- -DEXTRA_CONF_FILE="boards/common/repeater.conf;boards/common/debug.conf"
 ```
 
 All build commands should include `--pristine` when switching between roles or boards.
@@ -230,11 +233,11 @@ Directory structure:
 
 Steps:
   1. Create directory: `boards/<platform>/<board_name>/`
-     Platform folders: nrf52840, nrf54l, mg24, esp32
+     Platform folders: nrf52840, nrf54l, mg24, esp32, stm32wl
   2. Copy board.conf and board.overlay from THIS directory
   3. Uncomment the sections matching your platform
   4. Fill in YOUR pin numbers and partition layout
-  5. Add board detection to CMakeLists.txt (~line 60-75):
+  5. Add board detection to CMakeLists.txt (platform detection block, ~line 270):
      Add `BOARD MATCHES "your_board"` to the correct platform line
   6. Build and iterate!
 
@@ -390,10 +393,11 @@ Config Inheritance
     zephcore_common.conf               BLE, storage, input, LoRa, crypto, sensors
       |
     <platform>_common.conf             Platform-specific overrides only
-      |                                  nrf52_common.conf  — UF2, USB CDC, DLE, RTT
-      |                                  nrf54l_common.conf — DLE, RTT
-      |                                  mg24_common.conf   — SiLabs blob stacks, heap
-      |                                  esp32_common.conf  — Espressif blob stacks, heap
+      |                                  nrf52_common.conf   — UF2, USB CDC, DLE, RTT
+      |                                  nrf54l_common.conf  — DLE, RTT
+      |                                  mg24_common.conf    — SiLabs blob stacks, heap
+      |                                  esp32_common.conf   — Espressif blob stacks, heap
+      |                                  stm32wl_common.conf — BT off, UART companion/CLI
       |
     board.conf                         Board name, radio type, board-specific
 

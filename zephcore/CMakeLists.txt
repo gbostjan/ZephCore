@@ -353,7 +353,7 @@ if(ZEPHCORE_PLATFORM_CONF MATCHES "esp32_common" AND EXTRA_CONF_FILE MATCHES "re
 endif()
 
 # Append to EXTRA_CONF_FILE — auto-generated configs first, user extras last.
-# User-specified extras (repeater.conf, prod.conf) MUST come after the auto chain
+# User-specified extras (repeater.conf, debug.conf) MUST come after the auto chain
 # so they can override settings (e.g. CONFIG_BT=n in repeater.conf).
 if(ZEPHCORE_CONF_FILES)
     if(EXTRA_CONF_FILE)
@@ -377,7 +377,7 @@ if(ZEPHCORE_PLATFORM_CONF MATCHES "esp32_common"
 endif()
 
 # Auto-pair user-supplied EXTRA_CONF_FILE entries with same-named .overlay files.
-# This allows repeater.conf + repeater.overlay, prod.conf + prod.overlay, etc.
+# This allows repeater.conf + repeater.overlay, wifi_ota.conf + wifi_ota.overlay, etc.
 if(EXTRA_CONF_FILE)
     foreach(_conf IN LISTS EXTRA_CONF_FILE)
         zephcore_auto_pair_overlay("${_conf}")
@@ -605,7 +605,7 @@ if(CONFIG_ZEPHCORE_ROLE_REPEATER)
       ${CMAKE_CURRENT_SOURCE_DIR}/app
     )
   elseif(CONFIG_ZEPHCORE_REPEATER_UPLINK)
-    message(WARNING "ZephCore repeater uplink requested, but MQTT is disabled (likely prod.conf). Build will exclude uplink runtime.")
+    message(WARNING "ZephCore repeater uplink requested, but MQTT is disabled in this configuration. Build will exclude uplink runtime.")
   endif()
   target_compile_definitions(app PRIVATE ZEPHCORE_REPEATER=1)
 elseif(CONFIG_ZEPHCORE_ROLE_ROOM_SERVER)
