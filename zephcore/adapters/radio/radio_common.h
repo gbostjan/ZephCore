@@ -24,7 +24,7 @@
 #define RX_RING_SIZE 8  /* ~2 KB; buffers burst arrivals at SF7/BW500 */
 
 /* --- TX wait thread --- */
-#define TX_WAIT_THREAD_STACK_SIZE 1024
+#define TX_WAIT_THREAD_STACK_SIZE 2048
 #define TX_WAIT_THREAD_PRIORITY   10     /* preemptible, below main thread */
 #define TX_TIMEOUT_MS             5000   /* hard timeout for TX completion signal */
 
