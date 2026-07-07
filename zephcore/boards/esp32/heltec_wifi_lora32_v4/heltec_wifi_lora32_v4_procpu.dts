@@ -8,7 +8,7 @@
  *   OLED:   SSD1306 128x64 on I2C0
  *   Button: GPIO0
  *   LED:    GPIO35 (PWM via LEDC0)
- *   Vext:   GPIO36 active-HIGH (powers OLED and sensors)
+ *   Vext:   GPIO36 active-LOW PMOS rail switch (powers OLED and sensors)
  *   BatADC: GPIO1 = ADC1_CH0 (&adc0), enable GPIO37 active-HIGH (vbat_enable in overlay)
  *
  * V4.2 (this file) — GC1109 PA, TX_EN on GPIO46.
@@ -20,7 +20,7 @@
  *       GPIO7  = VFEM_Ctrl LDO power (active-HIGH, always-on)
  *       GPIO2  = GC1109 CSD (chip enable, active-HIGH)
  *       GPIO46 = GC1109 CPS (TX mode select, active-HIGH)
- *   - Vext control is active-HIGH    (was active-LOW on V3)
+ *   - Vext rail switch is active-LOW (PMOS; GPIO36 low = rail on)
  *   - DIO2 used as RF switch alongside external FEM TX control
  *
  * LoRa SPI2:  SCLK=9, MOSI=10, MISO=11, NSS=8
@@ -83,13 +83,16 @@
 	 * zephyr,user { io-channels } (see board.overlay), and a voltage-divider
 	 * on &adc1 ch0 would target GPIO11 = the SX1262 MISO. See &adc0 below. */
 
-	/* Vext — powers OLED and external peripherals (active-HIGH on GPIO36).
-	 * regulator-fixed + SSD1306 vin-supply: powers rail at boot without relying on
-	 * power-domains (CONFIG_PM_DEVICE is disabled in prj.conf). */
+	/* Vext rail switch — PMOS, ACTIVE LOW (GPIO36 low = rail ON).
+	 * Powers the OLED (incl. its I2C pull-ups) and the expansion header.
+	 * Verified on hardware: GPIO36 driven high leaves the rail floating
+	 * (~1.6 V) and the OLED unpowered; driven low gives a clean 3.3 V.
+	 * regulator-boot-on + always-on: the rail comes up at regulator init,
+	 * well before the SSD1306 driver init. */
 	vext_enable: vext-enable {
 		compatible = "regulator-fixed";
 		regulator-name = "vext";
-		enable-gpios = <&gpio1 4 GPIO_ACTIVE_HIGH>;  /* GPIO36 = gpio1 pin 4 */
+		enable-gpios = <&gpio1 4 GPIO_ACTIVE_LOW>;  /* GPIO36 = gpio1 pin 4 */
 		regulator-boot-on;
 		regulator-always-on;
 	};
