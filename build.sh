@@ -257,6 +257,12 @@ print(str(size // 1048576) + "MB")
             --flash-mode dio --flash-freq 40m --flash-size "$FLASH_SIZE" \
             0x00000 build/mcuboot/zephyr/zephyr.bin \
             0x20000 build/zephcore/zephyr/zephyr.signed.bin
+
+            # Signed app image for WiFi OTA: uploaded to MCUboot slot1 via the
+            # repeater's /update page. NOT bootable standalone — never flash this
+            # at 0x0 (see GH #42). It is ONLY valid as an OTA payload.
+            cp build/zephcore/zephyr/zephyr.signed.bin \
+                firmware/"$board_clean_for_path"-repeater-"$COMMIT_HASH"-update.bin
         fi
     done
 fi
