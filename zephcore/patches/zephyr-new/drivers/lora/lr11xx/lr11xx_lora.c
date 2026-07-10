@@ -104,6 +104,18 @@ struct lr11xx_data {
 	 * the LR1110 is hung — trigger a hardware reset. */
 	int dio1_stuck_count;
 
+	/* Timestamp (k_uptime_get_32(), ms) of the first sighting of a
+	 * latched PREAMBLE_DETECTED by lr11xx_is_receiving() in the current
+	 * RX cycle; 0 = none tracked.  Ported from the SX126x preamble-grace
+	 * logic: PREAMBLE_DETECTED is not DIO1-routed but latches in the IRQ
+	 * status register, and the chip never auto-clears it on a foreign
+	 * sync word — without a software bound a foreign/noise preamble pins
+	 * the TX gate until the next DIO1 bulk-clear or the dispatcher's 4 s
+	 * CAD-fail recovery.  Real packets latch SYNC_WORD_HEADER_VALID
+	 * within the grace window; after grace expires with no header, the
+	 * bit is cleared and TX released.  All accesses under spi_mutex. */
+	uint32_t preamble_seen_at_ms;
+
 	/* RX data buffer — filled in DIO1 handler, passed to callback */
 	uint8_t rx_buf[256];
 };
@@ -256,8 +268,11 @@ static void lr11xx_apply_modem_config(struct lr11xx_data *data,
 	lr11xx_radio_set_lora_sync_word(ctx, mc->public_network ? 0x34 : 0x12);
 
 	if (tx_mode) {
-		lr11xx_radio_set_tx_params(ctx, mc->tx_power,
-					   LR11XX_RADIO_RAMP_48_US);
+		/* PA config BEFORE TX params — the power byte in SetTxParams
+		 * is interpreted against the currently selected PA (Semtech
+		 * convention; RadioLib LR11x0::setOutputPower orders it the
+		 * same).  Reversed order only bites the first TX after a
+		 * (hardware) reset, when the chip default PA is still live. */
 		lr11xx_radio_pa_cfg_t pa = {
 			.pa_sel = LR11XX_RADIO_PA_SEL_HP,
 			.pa_reg_supply = LR11XX_RADIO_PA_REG_SUPPLY_VBAT,
@@ -265,6 +280,8 @@ static void lr11xx_apply_modem_config(struct lr11xx_data *data,
 			.pa_hp_sel = cfg->pa_hp_sel,
 		};
 		lr11xx_radio_set_pa_cfg(ctx, &pa);
+		lr11xx_radio_set_tx_params(ctx, mc->tx_power,
+					   LR11XX_RADIO_RAMP_48_US);
 	}
 
 	lr11xx_system_set_dio_irq_params(
@@ -306,6 +323,7 @@ static void lr11xx_start_rx(struct lr11xx_data *data,
 	}
 
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
+	data->preamble_seen_at_ms = 0;
 
 	/* Apply modem config for RX */
 	lr11xx_apply_modem_config(data, cfg, false);
@@ -366,6 +384,7 @@ static void lr11xx_restart_rx(struct lr11xx_data *data)
 	void *ctx = &data->hal_ctx;
 
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
+	data->preamble_seen_at_ms = 0;
 
 	if (data->rx_duty_cycle_enabled &&
 	    data->dc_rx_ms != 0 && data->dc_sleep_ms != 0) {
@@ -767,12 +786,15 @@ static int lr11xx_lora_send_async(const struct device *dev,
 
 	/* Clear IRQ, enable DIO1 */
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
+	data->preamble_seen_at_ms = 0;
 	lr11xx_hal_enable_dio1_irq(&data->hal_ctx);
 
-	/* Store signal and start TX */
+	/* Store signal and start TX.  10 s timeout: worst legal preset
+	 * (SF12 / BW62.5, max payload) exceeds 5 s airtime — a shorter
+	 * timeout would abort mid-transmission.  Matches the SX126x driver. */
 	data->tx_signal = async;
 	data->tx_active = true;
-	lr11xx_radio_set_tx(ctx, 5000);
+	lr11xx_radio_set_tx(ctx, 10000);
 
 	k_mutex_unlock(&data->spi_mutex);
 	return 0;
@@ -915,6 +937,24 @@ int16_t lr11xx_get_rssi_inst(const struct device *dev)
 	return (int16_t)rssi;
 }
 
+/* Grace period for the PREAMBLE_DETECTED -> SYNC_WORD_HEADER_VALID gap,
+ * SF/BW-aware — same formula as the SX126x driver: (preamble_len + 8)
+ * symbols covers worst-case preamble remainder + sync word + header
+ * decode with margin. */
+static uint32_t lr11xx_preamble_grace_ms(struct lr11xx_data *data)
+{
+	uint8_t sf = (uint8_t)data->modem_cfg.datarate;
+	uint32_t bw_hz = (uint32_t)(bw_enum_to_khz(data->modem_cfg.bandwidth) * 1000.0f);
+	uint16_t preamble = data->modem_cfg.preamble_len;
+
+	if (bw_hz == 0 || sf < 5 || sf > 12) {
+		return 1000;  /* safe default ~1 s if config is uninitialised */
+	}
+	uint64_t us = ((uint64_t)(preamble + 8U) << sf) * 1000000ULL / bw_hz;
+
+	return (uint32_t)((us + 999U) / 1000U);
+}
+
 bool lr11xx_is_receiving(const struct device *dev)
 {
 	struct lr11xx_data *data = dev->data;
@@ -924,12 +964,49 @@ bool lr11xx_is_receiving(const struct device *dev)
 		return false;
 	}
 
-	lr11xx_system_irq_mask_t irq;
+	lr11xx_system_irq_mask_t irq = 0;
 	lr11xx_system_get_irq_status(&data->hal_ctx, &irq);
-	k_mutex_unlock(&data->spi_mutex);
 
-	return (irq & (LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED |
-		       LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID)) != 0;
+	/* Header landed: payload phase in progress.  The bit stays latched
+	 * until the terminal DIO1 event bulk-clears it, so this covers the
+	 * whole packet. */
+	if (irq & LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID) {
+		k_mutex_unlock(&data->spi_mutex);
+		return true;
+	}
+
+	/* PREAMBLE_DETECTED with SF-aware grace (SX126x-parity).  Within
+	 * grace, keep reporting busy so a real packet has time to land its
+	 * header; after grace with no header, assume foreign sync word,
+	 * clear the bit and release TX. */
+	if (irq & LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED) {
+		uint32_t now = k_uptime_get_32();
+		uint32_t seen = data->preamble_seen_at_ms;
+
+		if (seen == 0) {
+			data->preamble_seen_at_ms = (now == 0) ? 1U : now;
+			k_mutex_unlock(&data->spi_mutex);
+			return true;
+		}
+		if ((now - seen) < lr11xx_preamble_grace_ms(data)) {
+			k_mutex_unlock(&data->spi_mutex);
+			return true;
+		}
+		/* Grace expired.  Clear CMD_ERROR along with the preamble
+		 * bit — the LR1110 sets CMD_ERROR whenever ClearIrq is
+		 * called with a mask that excludes it (all FW versions). */
+		lr11xx_system_clear_irq_status(&data->hal_ctx,
+					       LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED |
+					       LR11XX_SYSTEM_IRQ_CMD_ERROR);
+		data->preamble_seen_at_ms = 0;
+		k_mutex_unlock(&data->spi_mutex);
+		return false;
+	}
+
+	/* No preamble, no header: nothing in flight. */
+	data->preamble_seen_at_ms = 0;
+	k_mutex_unlock(&data->spi_mutex);
+	return false;
 }
 
 uint32_t lr11xx_get_wakeup_time_us(const struct device *dev)
@@ -1072,6 +1149,7 @@ static int lr11xx_do_cad(struct lr11xx_data *data)
 	lr11xx_radio_set_cad_params(ctx, &cad);
 
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
+	data->preamble_seen_at_ms = 0;
 	data->cad_active = true;
 	lr11xx_radio_set_cad(ctx);
 
