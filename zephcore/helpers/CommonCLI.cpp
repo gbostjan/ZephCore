@@ -171,7 +171,7 @@ void CommonCLI::loadPrefs(const char* path) {
     _prefs->flood_max_advert = constrain(_prefs->flood_max_advert, (uint8_t)0, (uint8_t)64);
     _prefs->meshtimesync = constrain(_prefs->meshtimesync, (uint8_t)0, (uint8_t)1);
     _prefs->cad_auto = constrain(_prefs->cad_auto, (uint8_t)0, (uint8_t)1);
-    _prefs->cad_offset = constrain(_prefs->cad_offset, (int8_t)-4, (int8_t)4);
+    _prefs->cad_offset = constrain(_prefs->cad_offset, (int8_t)CAD_OFFSET_MIN, (int8_t)CAD_OFFSET_MAX);
     if (_prefs->cad_probe_interval != 0 && _prefs->cad_probe_interval < 10) {
         _prefs->cad_probe_interval = 10;
     }
@@ -304,6 +304,32 @@ void CommonCLI::scheduleReboot(uint8_t type)
 }
 
 void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, char* reply) {
+    /* Case-insensitive command keywords.  Lowercase only the first two
+     * whitespace-delimited tokens (the verb and the config key) — the value
+     * (3rd token onward) is preserved verbatim, so case-sensitive arguments
+     * like passwords, node names, owner info, and keys are never mangled.
+     * Fixes e.g. "Get cad" / "SET Cad.Auto on" not being recognized. */
+    char norm[CLI_REPLY_SIZE];
+    {
+        int tok = 0;          /* completed tokens so far */
+        bool in_tok = false;
+        size_t j = 0;
+        for (size_t i = 0; command[i] != '\0' && j < sizeof(norm) - 1; i++) {
+            char c = command[i];
+            if (c == ' ' || c == '\t') {
+                if (in_tok) { in_tok = false; tok++; }
+            } else {
+                in_tok = true;
+                if (tok < 2 && c >= 'A' && c <= 'Z') {
+                    c = (char)(c - 'A' + 'a');
+                }
+            }
+            norm[j++] = c;
+        }
+        norm[j] = '\0';
+        command = norm;
+    }
+
     if (strcmp(command, "start dfu") == 0) {
         /* Reboot into UF2 bootloader for firmware update */
         strcpy(reply, "OK - rebooting to UF2 DFU");
@@ -637,8 +663,9 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             }
         } else if (memcmp(config, "cad.offset ", 11) == 0) {
             int val = atoi(&config[11]);
-            if (val < -4 || val > 4) {
-                strcpy(reply, "Error: offset range is -4..4");
+            if (val < CAD_OFFSET_MIN || val > CAD_OFFSET_MAX) {
+                snprintf(reply, CLI_REPLY_SIZE, "Error: offset range is %d..%d",
+                         CAD_OFFSET_MIN, CAD_OFFSET_MAX);
             } else {
                 _prefs->cad_offset = (int8_t)val;
                 _callbacks->applyCadPrefs();

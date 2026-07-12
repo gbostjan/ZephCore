@@ -702,10 +702,10 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 		}
 	}
 
-	/* Offset 156: cad_offset (ZephCore extension, signed -4..4, default 0) */
+	/* Offset 156: cad_offset (ZephCore extension, signed, default 0) */
 	if (off < len) {
 		prefs.cad_offset = (int8_t)buf[off++];
-		if (prefs.cad_offset < -4 || prefs.cad_offset > 4) {
+		if (prefs.cad_offset < CAD_OFFSET_MIN || prefs.cad_offset > CAD_OFFSET_MAX) {
 			prefs.cad_offset = 0;
 		}
 	}

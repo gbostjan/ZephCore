@@ -240,7 +240,7 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
     if (prefs.apc_margin < 6 || prefs.apc_margin > 30) prefs.apc_margin = 16;
     if (prefs.meshtimesync > 1) prefs.meshtimesync = 0;
     if (prefs.cad_auto > 1) prefs.cad_auto = 0;
-    if (prefs.cad_offset < -4 || prefs.cad_offset > 4) prefs.cad_offset = 0;
+    if (prefs.cad_offset < CAD_OFFSET_MIN || prefs.cad_offset > CAD_OFFSET_MAX) prefs.cad_offset = 0;
     if (prefs.cad_probe_interval != 0 && prefs.cad_probe_interval < 10) prefs.cad_probe_interval = 10;
 
     /* One-time format upgrade: old files (< 294 bytes) never saved the ZephCore

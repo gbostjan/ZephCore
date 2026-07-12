@@ -1140,15 +1140,20 @@ int LoRaRadioBase::formatCadStatus(char *buf, int cap)
 	int n = 0;
 
 	if (base == 0) {
-		return snprintf(buf, cap, "CAD: not supported by this radio");
+		return snprintf(buf, cap, "cad n/a");
 	}
 
-	int peak = (int)base + _cad_offset;
-
+	/* Terse on purpose — remote replies are capped at ~160 B over LoRa.
+	 * Header:  a:on o:1 pk:22(b21/4s) iv:15s
+	 *   a  auto on/off   o  offset   pk operating peak
+	 *   b  family base   4s symbols   iv probe interval
+	 * Level:   -3(18) 22p 18b 16f 2t 72%
+	 *   level(peak)  probes busy fp tp  fp-rate%%  (integer). */
 	n += snprintf(buf + n, cap > n ? cap - n : 0,
-		      "auto:%s offset:%d peak:%d (base %u, 4 sym) probe:%us",
-		      _cad_auto ? "on" : "off", (int)_cad_offset, peak,
-		      base, (unsigned)_cad_probe_interval_s);
+		      "a:%s o:%d pk:%d(b%u/4s) iv:%us",
+		      _cad_auto ? "on" : "off", (int)_cad_offset,
+		      (int)base + _cad_offset, base,
+		      (unsigned)_cad_probe_interval_s);
 
 	for (int i = 0; i < CAD_NUM_LEVELS; i++) {
 		CadLevelStats &s = _cad_stats[i];
@@ -1156,14 +1161,14 @@ int LoRaRadioBase::formatCadStatus(char *buf, int cap)
 		if (s.probes == 0) {
 			continue;
 		}
-		/* FP rate in tenths of a percent */
-		uint32_t fp_pm = ((uint32_t)s.fp * 1000U) / s.probes;
+		/* Integer FP rate, rounded to nearest percent. */
+		unsigned fp_pct = (unsigned)(((uint32_t)s.fp * 100U + s.probes / 2)
+					     / s.probes);
 
 		n += snprintf(buf + n, cap > n ? cap - n : 0,
-			      "\nlvl %+d (peak %d): %u probes, %u busy, %u fp, %u tp (fp %u.%u%%)",
+			      "\n%+d(%d) %up %ub %uf %ut %u%%",
 			      i + CAD_LEVEL_MIN, (int)base + i + CAD_LEVEL_MIN,
-			      s.probes, s.busy, s.fp, s.tp,
-			      (unsigned)(fp_pm / 10), (unsigned)(fp_pm % 10));
+			      s.probes, s.busy, s.fp, s.tp, fp_pct);
 	}
 
 	return n;

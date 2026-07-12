@@ -24,6 +24,18 @@
 #define LOOP_DETECT_MODERATE  2
 #define LOOP_DETECT_STRICT    3
 
+/* Adaptive-CAD operating detPeak offset range (levels from the family base).
+ * Wide on purpose: a dense hilltop can need a much higher detPeak than a quiet
+ * valley node.  The per-family absolute clamp inside the driver (SX126x 15-40,
+ * LR11xx/LR20xx 48-90) is a firmware guardrail, NOT a chip limit — cadDetPeak
+ * is a full uint8_t (0-255).  It just keeps the staircase from wandering into
+ * "CAD never fires" (too high) or "CAD always busy" (too low) territory.  This
+ * offset range limits how far the staircase / manual offset may roam; MUST
+ * match CAD_LEVEL_MIN/MAX in adapters/radio/radio_common.h (they index the
+ * per-level stats array). */
+#define CAD_OFFSET_MIN  (-8)
+#define CAD_OFFSET_MAX  12
+
 struct NodePrefs {
 	/* ---- Common fields (both roles) ---- */
 	float airtime_factor;
@@ -139,9 +151,9 @@ static inline void initNodePrefs(NodePrefs* prefs) {
 	prefs->rx_duty_cycle = 0;         // Default OFF — continuous RX for best reliability
 	prefs->apc_enabled = 0;           // Default OFF — fixed TX power
 	prefs->apc_margin = 16;           // Default 16 dB target link margin
-	prefs->cad_auto = 0;              // Default OFF — dry-run: probes + counters only
-	prefs->cad_offset = 0;            // Family base detPeak (SF+13 on SX126x)
-	prefs->cad_probe_interval = 60;   // One CAD probe per minute
+	prefs->cad_auto = 1;              // Default ON — adaptive staircase acts on probe stats
+	prefs->cad_offset = 0;            // Start at family base detPeak (SF+13 on SX126x)
+	prefs->cad_probe_interval = 15;   // 15 s → staircase responds to change in ~1-2 h
 	prefs->wake_on_msg = 1;           // Default ON — wake display when message arrives
 	prefs->v_contact_enabled = 1;     // Default ON — v-contact loopback admin chat (companion)
 	prefs->v_battery_alert_mv = 0xFFFF; // Sentinel: derive from board auto-shutdown threshold

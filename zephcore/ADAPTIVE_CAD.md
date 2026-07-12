@@ -26,7 +26,7 @@ feature measures CAD behaviour directly instead of deriving it from RSSI.
 
 ## How it works
 
-Every `cad.probe.interval` seconds (default 60), when the radio is idle
+Every `cad.probe.interval` seconds (default 15), when the radio is idle
 in receive mode, the firmware runs one **calibration CAD probe** and
 immediately re-arms RX. A probe takes one CAD duration — about 4 ms at
 SF7/250 kHz, up to ~130 ms at SF12/125 kHz — so the added radio deaf time
@@ -61,9 +61,10 @@ Statistics decay (halve) every 6 hours so the picture stays fresh, and
 reset completely whenever the radio parameters change (frequency, SF, BW
 — the data is only valid for one configuration).
 
-### Auto mode (staircase)
+### Auto mode (staircase) — ON by default
 
-With `cad.auto on`, a one-sided staircase controller acts on the stats:
+`cad.auto` ships **on**, on repeaters and companions alike. A one-sided
+staircase controller acts on the probe stats:
 
 - Probes concentrate on the **frontier** — one level more sensitive than
   the current operating point (3 of every 4 probes), with the remainder
@@ -73,86 +74,98 @@ With `cad.auto on`, a one-sided staircase controller acts on the stats:
 - **Step up** (less sensitive) quickly when the operating level itself
   shows a false-positive rate above 2% over ≥50 samples — false positives
   at the operating point cost real transmissions.
-- The offset is clamped to −4…+4 around the family base and persisted to
-  flash whenever it steps (steps are hours apart).
+- The offset is persisted to flash whenever it steps.
 
-Quiet sites converge *below* the standard value — more sensitive LBT than
-any fixed-config firmware, meaning fewer TX-over-RX stomps. Noisy sites
+At the default 15-second probe interval a step decision lands roughly
+every **1–2 hours**, so the node tracks a changing RF environment within
+that window without thrashing.
+
+The offset is clamped to **−8…+12** levels around the family base — wide
+enough that a dense hilltop can settle much less sensitive and a quiet
+valley node much more sensitive. The driver additionally clamps the
+absolute detPeak (SX126x 15–40, LR11xx/LR20xx 48–90). That absolute clamp
+is a *firmware guardrail*, not a chip limit — `cadDetPeak` is a full
+8-bit register (0–255) — it simply stops the staircase from wandering
+into "CAD never fires" (detPeak too high → LBT effectively off) or "CAD
+always busy" (too low → node can't transmit) territory. Quiet sites
+converge *below* the standard value — more sensitive LBT than any
+fixed-config firmware, meaning fewer TX-over-RX stomps. Noisy sites
 ratchet up until false positives vanish.
 
-## Recommended workflow (dry-run first)
+To watch or hand-tune instead of letting it self-adjust, set
+`cad.auto off` (see below).
 
-Everything ships **observing but not acting**: probes run and counters
-accumulate from first boot, but the operating detPeak stays at the
-family default until you enable auto mode or set an offset by hand.
+## Reading the status
 
-1. **Let it observe.** Optionally speed up data collection during the
-   observation window:
+Out of the box the node calibrates itself — you don't have to do
+anything. To see what it's doing:
 
-   ```
-   set cad.probe.interval 15
-   ```
+```
+get cad
+```
 
-2. **Read the curve.** After some hours:
+Compact output (kept short so it survives a truncated LoRa reply):
 
-   ```
-   get cad
-   ```
+```
+> a:on o:-1 pk:20(b21/4s) iv:15s
+-2(19) 241p 9b 7f 2t 3%
+-1(20) 900p 5b 3f 2t 0%
++0(21) 300p 2b 0f 2t 0%
+```
 
-   Example output:
+Header: `a` auto on/off · `o` operating offset · `pk` operating detPeak ·
+`b` family base · `4s` 4 symbols · `iv` probe interval.
+Per level: `level(peak) probes busy fp tp fp%%` — `fp` = suspected false
+positives, `tp` = busy verdicts confirmed by a real packet, `fp%%` =
+integer false-positive rate. Only levels that have been probed print, so
+in auto mode you'll usually see the operating level and its frontier.
 
-   ```
-   > auto:off offset:0 peak:21 (base 21, 4 sym) probe:15s
-   lvl -3 (peak 18): 240 probes, 31 busy, 28 fp, 3 tp (fp 11.6%)
-   lvl -2 (peak 19): 241 probes, 9 busy, 7 fp, 2 tp (fp 2.9%)
-   lvl -1 (peak 20): 240 probes, 3 busy, 1 fp, 2 tp (fp 0.4%)
-   lvl +0 (peak 21): 241 probes, 2 busy, 0 fp, 2 tp (fp 0.0%)
-   lvl +1 (peak 22): 240 probes, 2 busy, 0 fp, 2 tp (fp 0.0%)
-   lvl +2 (peak 23): 240 probes, 1 busy, 0 fp, 1 tp (fp 0.0%)
-   ```
+Here the staircase has already stepped to offset −1 (peak 20): the −1
+level is clean (0%) over 900 probes while −2 shows a 3% jump, so −1 is
+this site's knee.
 
-   Read it bottom-up: the false-positive rate jumps somewhere (here
-   between −1 and −2). The lowest clean level (−1) is your site's knee.
-   In dry-run mode the sweep covers levels −3…+2 evenly.
+### Dry-run / manual tuning
 
-   How long to wait (at the default 60 s interval; divide by 4 at 15 s):
+Prefer to observe or pin the value yourself? Turn the staircase off:
 
-   | After | You get |
-   |---|---|
-   | 12–24 h | Knee location, coarsely — enough for a manual offset |
-   | 2–3 days | Per-level rates at ~1% resolution, incl. day/night variation |
-   | 1 week | Solid, weekday/weekend-proof picture |
+```
+set cad.auto off
+```
 
-3. **Act.** Either pin it manually:
+Probing continues (stats keep updating) but the operating offset no
+longer moves. In dry-run the probe sweep covers levels −4…+4 evenly, so
+`get cad` shows the whole false-positive-vs-detPeak curve. Read it
+bottom-up: the level where `fp%%` jumps from ~0 is the knee; sit one step
+above it. Then pin it:
 
-   ```
-   set cad.offset -1
-   ```
+```
+set cad.offset -1
+```
 
-   or let the staircase manage it from here on:
+Negative offset = more sensitive LBT (catches weaker signals, risks false
+busy); positive = less sensitive. Range −8…+12. Re-enable the staircase
+any time with `set cad.auto on`. Offset changes (manual or automatic)
+appear in the log as `cad: step down/up -> offset N`.
 
-   ```
-   set cad.auto on
-   set cad.probe.interval 60
-   ```
-
-   With auto on, `get cad` keeps showing the live state; offset changes
-   appear in the log as `cad: step down/up -> offset N` and are saved to
-   flash automatically.
+To collect dry-run data faster, drop the interval (probing is temporary
+then): `set cad.probe.interval 10`. At the default 15 s, allow ~a day for
+a knee to resolve clearly, longer to capture day/night variation.
 
 ## Command reference
 
 | Command | Default | Description |
 |---|---|---|
 | `get cad` | | Status + per-level statistics (see above). |
-| `set cad.auto <on\|off>` | off | Staircase controller acts on the stats. |
-| `set cad.offset <n>` | 0 | Operating offset, −4…4. Negative = more sensitive. Applied live. |
-| `set cad.probe.interval <sec>` | 60 | Probe cadence; 0 disables probing (and freezes auto), 10–255 otherwise. |
+| `set cad.auto <on\|off>` | **on** | Staircase controller acts on the stats. Off = observe/hand-tune. |
+| `set cad.offset <n>` | 0 | Operating offset, −8…12. Negative = more sensitive. Applied live. |
+| `set cad.probe.interval <sec>` | 15 | Probe cadence; 0 disables probing (and freezes auto), 10–255 otherwise. |
 | `set cad.reset` | | Clear accumulated statistics (RAM only). |
 
 All settings persist in prefs and apply to every role — repeater, room
 server, and companion (companions reach the CLI via the v-contact admin
-chat or USB serial).
+chat or USB serial). Command keywords are case-insensitive (`Get cad`
+works); command *values* like passwords and node names are not, so `on`
+/`off` must be lowercase.
 
 ## Notes and limits
 

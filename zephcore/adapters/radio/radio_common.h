@@ -26,11 +26,17 @@
  * false-positive rate stays under target.  Levels are signed offsets from
  * the chip family's per-SF base detPeak (SX126x: SF+13; LR11xx/LR20xx:
  * 56-68 table) so the C++ layer stays scale-independent. */
-#define CAD_LEVEL_MIN            (-4)  /* most sensitive probe level */
-#define CAD_LEVEL_MAX            4     /* least sensitive probe level */
+/* Operating-offset range (levels from the per-SF family base detPeak).  Wide
+ * on purpose — a dense hilltop may need a much higher detPeak than a quiet
+ * valley node; the per-family absolute clamp in the driver (SX126x 15-40,
+ * LR 48-90) is a firmware guardrail against "CAD never/always fires", NOT a
+ * chip limit (cadDetPeak is a full uint8_t).
+ * MUST match CAD_OFFSET_MIN/MAX in helpers/NodePrefs.h. */
+#define CAD_LEVEL_MIN            (-8)  /* most sensitive probe level */
+#define CAD_LEVEL_MAX            12    /* least sensitive probe level */
 #define CAD_NUM_LEVELS           (CAD_LEVEL_MAX - CAD_LEVEL_MIN + 1)
-#define CAD_SWEEP_MIN            (-3)  /* dry-run sweep window */
-#define CAD_SWEEP_MAX            2
+#define CAD_SWEEP_MIN            (-4)  /* dry-run sweep window (get cad with auto off) */
+#define CAD_SWEEP_MAX            4
 #define CAD_FP_TARGET_PERMILLE   10    /* step-down needs FP rate <= 1% */
 #define CAD_STEP_DOWN_MIN_PROBES 300   /* samples before a down-step call */
 #define CAD_STEP_UP_MIN_PROBES   50    /* samples before an up-step call */
