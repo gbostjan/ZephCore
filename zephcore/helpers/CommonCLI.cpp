@@ -427,7 +427,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             strcpy(reply, "ERR: bad pubkey");
         }
     } else if (memcmp(command, "tempradio ", 10) == 0) {
-        snprintf(tmp, sizeof(tmp), "%s", &command[10]);
+        snprintf(tmp, sizeof(tmp), "%.*s", (int)(sizeof(tmp) - 1), &command[10]);
         const char* parts[5];
         int num = mesh::Utils::parseTextParts(tmp, parts, 5);
         float freq = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -763,7 +763,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 strcpy(reply, "Error: must be on or off");
             }
         } else if (memcmp(config, "radio ", 6) == 0) {
-            snprintf(tmp, sizeof(tmp), "%s", &config[6]);
+            snprintf(tmp, sizeof(tmp), "%.*s", (int)(sizeof(tmp) - 1), &config[6]);
             const char* parts[4];
             int num = mesh::Utils::parseTextParts(tmp, parts, 4);
             float freq = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -1081,7 +1081,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 strcpy(reply, "Error: must be on or off");
             }
         } else {
-            snprintf(reply, CLI_REPLY_SIZE, "unknown config: %s", config);
+            snprintf(reply, CLI_REPLY_SIZE, "unknown config: %.230s", config);
         }
     } else if (sender_timestamp == 0 && strcmp(command, "erase") == 0) {
         bool s = _callbacks->formatFileSystem();
@@ -1107,7 +1107,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             strcpy(reply, "null");
         }
     } else if (memcmp(command, "sensor set ", 11) == 0) {
-        snprintf(tmp, sizeof(tmp), "%s", &command[11]);
+        snprintf(tmp, sizeof(tmp), "%.*s", (int)(sizeof(tmp) - 1), &command[11]);
         const char* parts[2];
         int num = mesh::Utils::parseTextParts(tmp, parts, 2, ' ');
         const char* key = (num > 0) ? parts[0] : "";
