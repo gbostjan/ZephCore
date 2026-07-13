@@ -111,7 +111,7 @@ public:
 
 	/* Adaptive CAD (LBT detPeak calibration) */
 	void setCadParams(bool auto_enabled, int8_t offset,
-			  uint16_t probe_interval_s) override;
+			  uint16_t probe_interval_s, uint8_t busycap_pct) override;
 	void cadMaintenance() override;
 	int8_t getCadOffset() const override { return _cad_offset; }
 	void resetCadStats() override;
@@ -211,6 +211,7 @@ protected:
 	bool _cad_auto;                 /* staircase acts on the stats */
 	int8_t _cad_offset;             /* operating detPeak offset (levels) */
 	uint16_t _cad_probe_interval_s; /* 0 = probing disabled */
+	uint8_t _cad_busycap_pct;       /* airtime cap: max % TX deferred (0 = off) */
 	int64_t _cad_last_probe_ms;
 	int64_t _cad_last_decay_ms;
 	uint8_t _cad_probe_rr;          /* round-robin index (sweep) / frontier mix counter */

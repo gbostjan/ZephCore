@@ -719,7 +719,8 @@ public:
 	void applyCadPrefs() override {
 		lora_radio.setCadParams(companion_mesh.prefs.cad_auto != 0,
 					companion_mesh.prefs.cad_offset,
-					companion_mesh.prefs.cad_probe_interval);
+					companion_mesh.prefs.cad_probe_interval,
+					companion_mesh.prefs.cad_busycap);
 	}
 	void resetCadStats() override {
 		lora_radio.resetCadStats();
@@ -1567,7 +1568,8 @@ int main(void)
 	lora_radio.enableRxDutyCycle(companion_mesh.prefs.rx_duty_cycle != 0);
 	lora_radio.setCadParams(companion_mesh.prefs.cad_auto != 0,
 				companion_mesh.prefs.cad_offset,
-				companion_mesh.prefs.cad_probe_interval);
+				companion_mesh.prefs.cad_probe_interval,
+				companion_mesh.prefs.cad_busycap);
 #ifdef CONFIG_ZEPHCORE_APC
 	ui_set_radio_runtime(
 		lora_radio.getEffectiveTxPower(),

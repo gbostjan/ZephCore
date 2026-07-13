@@ -740,6 +740,15 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 			prefs.cad_probe_interval = 10;
 		}
 	}
+
+	/* Offset 158: cad_busycap (ZephCore extension, percent; 0 = off).
+	 * Absent in pre-existing files → keep the in-RAM default (25). */
+	if (off < len) {
+		prefs.cad_busycap = buf[off++];
+		if (prefs.cad_busycap > 90) {
+			prefs.cad_busycap = 90;
+		}
+	}
 }
 
 void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
@@ -827,7 +836,9 @@ void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
 	buf[off++] = (uint8_t)prefs.cad_offset;
 	/* Offset 157: cad_probe_interval (ZephCore extension, seconds) */
 	buf[off++] = prefs.cad_probe_interval;
-	/* Total: 158 bytes */
+	/* Offset 158: cad_busycap (ZephCore extension, percent) */
+	buf[off++] = prefs.cad_busycap;
+	/* Total: 159 bytes */
 
 	bool ok = atomicReplaceFile(PREFS_FILE, buf, off);
 	LOG_DBG("savePrefs: wrote %s, ok=%d (%d bytes), name='%.16s'",

@@ -208,6 +208,8 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
     fs_read(&file, &prefs.cad_auto, sizeof(prefs.cad_auto));
     fs_read(&file, &prefs.cad_offset, sizeof(prefs.cad_offset));
     fs_read(&file, &prefs.cad_probe_interval, sizeof(prefs.cad_probe_interval));
+    /* cad_busycap absent in <301-byte files; EOF read keeps default 25 */
+    fs_read(&file, &prefs.cad_busycap, sizeof(prefs.cad_busycap));
 
     fs_close(&file);
 
@@ -242,6 +244,7 @@ bool RepeaterDataStore::loadPrefs(NodePrefs& prefs) {
     if (prefs.cad_auto > 1) prefs.cad_auto = 0;
     if (prefs.cad_offset < CAD_OFFSET_MIN || prefs.cad_offset > CAD_OFFSET_MAX) prefs.cad_offset = 0;
     if (prefs.cad_probe_interval != 0 && prefs.cad_probe_interval < 10) prefs.cad_probe_interval = 10;
+    if (prefs.cad_busycap > 90) prefs.cad_busycap = 90;
 
     /* One-time format upgrade: old files (< 294 bytes) never saved the ZephCore
      * extension fields, and stored path_hash_mode/loop_detect as zero padding.
@@ -341,10 +344,11 @@ bool RepeaterDataStore::savePrefs(const NodePrefs& prefs) {
     fs_write(&file, &prefs.flood_max_advert, sizeof(prefs.flood_max_advert));
     /* Mesh time sync on/off (offset 296) */
     fs_write(&file, &prefs.meshtimesync, sizeof(prefs.meshtimesync));
-    /* Adaptive CAD (offsets 297-299) */
+    /* Adaptive CAD (offsets 297-300) */
     fs_write(&file, &prefs.cad_auto, sizeof(prefs.cad_auto));
     fs_write(&file, &prefs.cad_offset, sizeof(prefs.cad_offset));
     fs_write(&file, &prefs.cad_probe_interval, sizeof(prefs.cad_probe_interval));
+    fs_write(&file, &prefs.cad_busycap, sizeof(prefs.cad_busycap));
 
     ret = fs_sync(&file);
     fs_close(&file);

@@ -124,6 +124,7 @@ void CommonCLI::loadPrefs(const char* path) {
     ok = ok && prefs_read(&file, &_prefs->cad_auto, sizeof(_prefs->cad_auto));                 // 297
     ok = ok && prefs_read(&file, &_prefs->cad_offset, sizeof(_prefs->cad_offset));             // 298
     ok = ok && prefs_read(&file, &_prefs->cad_probe_interval, sizeof(_prefs->cad_probe_interval)); // 299
+    ok = ok && prefs_read(&file, &_prefs->cad_busycap, sizeof(_prefs->cad_busycap));            // 300
 
     if (!ok) {
         LOG_WRN("Prefs file %s truncated, some fields use defaults", path);
@@ -175,6 +176,7 @@ void CommonCLI::loadPrefs(const char* path) {
     if (_prefs->cad_probe_interval != 0 && _prefs->cad_probe_interval < 10) {
         _prefs->cad_probe_interval = 10;
     }
+    _prefs->cad_busycap = constrain(_prefs->cad_busycap, (uint8_t)0, (uint8_t)90);
 
     LOG_INF("Loaded prefs from %s", path);
 }
@@ -246,6 +248,7 @@ void CommonCLI::savePrefs(const char* path) {
     fs_write(&file, &_prefs->cad_auto, sizeof(_prefs->cad_auto));
     fs_write(&file, &_prefs->cad_offset, sizeof(_prefs->cad_offset));
     fs_write(&file, &_prefs->cad_probe_interval, sizeof(_prefs->cad_probe_interval));
+    fs_write(&file, &_prefs->cad_busycap, sizeof(_prefs->cad_busycap));
 
     fs_close(&file);
     LOG_INF("Saved prefs to %s", path);
@@ -678,6 +681,16 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 strcpy(reply, "Error: interval is 0 (off) or 10-255 seconds");
             } else {
                 _prefs->cad_probe_interval = (uint8_t)val;
+                _callbacks->applyCadPrefs();
+                savePrefs();
+                strcpy(reply, "OK");
+            }
+        } else if (memcmp(config, "cad.busycap ", 12) == 0) {
+            int val = atoi(&config[12]);
+            if (val != 0 && (val < 10 || val > 90)) {
+                strcpy(reply, "Error: busycap is 0 (off) or 10-90 percent");
+            } else {
+                _prefs->cad_busycap = (uint8_t)val;
                 _callbacks->applyCadPrefs();
                 savePrefs();
                 strcpy(reply, "OK");

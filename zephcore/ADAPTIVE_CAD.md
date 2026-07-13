@@ -73,6 +73,14 @@ FP has already bottomed out. Probes sample the operating level and **both
 neighbours** (op−1 more sensitive, op+1 less sensitive; op weighted half, each
 neighbour a quarter) so the staircase can read the local curve *slope*:
 
+- **Airtime protection** (highest priority): step up when the operating
+  level's *total* busy rate — real traffic plus false positives — exceeds
+  the busy cap (`set cad.busycap`, percent; default **25%**, 0 = off). The
+  knee logic only minimises *false* busy, but on a congested hilltop most
+  busy verdicts are real distant traffic we'd win on capture anyway;
+  deferring for all of it starves the node's own airtime. Self-targeting —
+  a quiet node's busy rate never reaches the cap, so only a genuinely busy
+  backbone backs off. Shown as `bc:` in `get cad`.
 - **Step up** (less sensitive) when the level above is markedly cleaner —
   FP drops ≥5%/level (`CAD_KNEE_SLOPE_PERMILLE`). That means we're on the
   steep part below the knee; climb toward it.

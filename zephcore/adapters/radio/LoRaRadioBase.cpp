@@ -48,6 +48,7 @@ LoRaRadioBase::LoRaRadioBase(const struct device *lora_dev, MainBoard &board,
 	  _rx_head(0), _rx_tail(0),
 	  _noise_floor(DEFAULT_NOISE_FLOOR), _calibration_threshold(0), _ema_unguarded(0),
 	  _cad_auto(false), _cad_offset(0), _cad_probe_interval_s(0),
+	  _cad_busycap_pct(0),
 	  _cad_last_probe_ms(0), _cad_last_decay_ms(0), _cad_probe_rr(0),
 	  _rx_duty_cycle_enabled(IS_ENABLED(CONFIG_ZEPHCORE_LORA_RX_DUTY_CYCLE)),
 	  _rx_boost_enabled(true),
@@ -948,7 +949,7 @@ bool LoRaRadioBase::isChannelActive(int threshold)
 /* ── Adaptive CAD (LBT detPeak calibration) ───────────────────────────── */
 
 void LoRaRadioBase::setCadParams(bool auto_enabled, int8_t offset,
-				 uint16_t probe_interval_s)
+				 uint16_t probe_interval_s, uint8_t busycap_pct)
 {
 	if (offset < CAD_LEVEL_MIN) offset = CAD_LEVEL_MIN;
 	if (offset > CAD_LEVEL_MAX) offset = CAD_LEVEL_MAX;
@@ -956,10 +957,12 @@ void LoRaRadioBase::setCadParams(bool auto_enabled, int8_t offset,
 	_cad_auto = auto_enabled;
 	_cad_offset = offset;
 	_cad_probe_interval_s = probe_interval_s;
+	_cad_busycap_pct = busycap_pct;
 	hwCadSetPeakOffset(_cad_offset);
 
-	LOG_INF("cad: auto=%d offset=%d probe_interval=%us",
-		(int)auto_enabled, (int)offset, (unsigned)probe_interval_s);
+	LOG_INF("cad: auto=%d offset=%d probe_interval=%us busycap=%u%%",
+		(int)auto_enabled, (int)offset, (unsigned)probe_interval_s,
+		(unsigned)busycap_pct);
 }
 
 void LoRaRadioBase::resetCadStats()
@@ -1014,24 +1017,49 @@ void LoRaRadioBase::cadStaircaseStep()
 	 * bottomed out), using slopes so the decision is site-floor-independent. */
 	int oi = _cad_offset - CAD_LEVEL_MIN;
 
-	/* Per-level FP rate in permille, or -1 when too few samples to trust. */
-	auto rate = [&](int idx) -> int {
-		if (idx < 0 || idx >= CAD_NUM_LEVELS) {
+	auto warm = [&](int idx) -> bool {
+		return idx >= 0 && idx < CAD_NUM_LEVELS &&
+		       _cad_stats[idx].probes >= CAD_STEP_MIN_PROBES;
+	};
+	/* Per-level FALSE-positive rate in permille, or -1 when too few samples. */
+	auto fp_rate = [&](int idx) -> int {
+		if (!warm(idx)) {
 			return -1;
 		}
-		CadLevelStats &s = _cad_stats[idx];
-		if (s.probes < CAD_STEP_MIN_PROBES) {
+		return (int)(((uint32_t)_cad_stats[idx].fp * 1000U)
+			     / _cad_stats[idx].probes);
+	};
+	/* Per-level TOTAL busy (defer) rate in permille — false + real traffic. */
+	auto busy_rate = [&](int idx) -> int {
+		if (!warm(idx)) {
 			return -1;
 		}
-		return (int)(((uint32_t)s.fp * 1000U) / s.probes);
+		return (int)(((uint32_t)_cad_stats[idx].busy * 1000U)
+			     / _cad_stats[idx].probes);
 	};
 
-	int r_op = rate(oi);
+	int r_op = fp_rate(oi);
 	if (r_op < 0) {
 		return;  /* operating level not warm yet — no basis to step */
 	}
-	int r_up = rate(oi + 1);  /* one step less sensitive */
-	int r_dn = rate(oi - 1);  /* frontier, one step more sensitive */
+	int b_op = busy_rate(oi);
+	int r_up = fp_rate(oi + 1);  /* one step less sensitive */
+	int r_dn = fp_rate(oi - 1);  /* frontier, one step more sensitive */
+
+	/* Airtime protection (highest priority): if the operating level defers
+	 * too large a fraction of TX attempts — real traffic included — back off
+	 * to a less sensitive detPeak.  On a congested hilltop most of that busy
+	 * is distant traffic we'd win on capture anyway; deferring for all of it
+	 * just starves our own airtime.  Cap is `set cad.busycap` percent (0 =
+	 * off); only binds on genuinely busy channels. */
+	int cap_permille = (int)_cad_busycap_pct * 10;
+	if (cap_permille && _cad_offset < CAD_LEVEL_MAX && b_op > cap_permille) {
+		_cad_offset++;
+		hwCadSetPeakOffset(_cad_offset);
+		LOG_INF("cad: step up -> offset %d (airtime, busy %d cap %d)",
+			(int)_cad_offset, b_op, cap_permille);
+		return;
+	}
 
 	/* Step UP (less sensitive) when the level above is markedly cleaner —
 	 * we're on the steep part of the curve, below the knee. */
@@ -1047,15 +1075,19 @@ void LoRaRadioBase::cadStaircaseStep()
 	/* Step DOWN (more sensitive) only on a flat plateau that is already
 	 * clean: the frontier is no worse than operating (nothing to lose) AND
 	 * FP here is low enough that reclaiming sensitivity is cheap.  The clean
-	 * guard is what keeps a flat-but-noisy curve from descending to the
-	 * sensitive rail — there, holding position is the least-bad move. */
+	 * guard keeps a flat-but-noisy curve from descending to the sensitive
+	 * rail; the busy-hysteresis guard keeps us from descending into the
+	 * airtime cap and bouncing straight back up. */
+	int b_dn = busy_rate(oi - 1);
+	bool busy_ok = (cap_permille == 0) ||
+		       (b_dn <= cap_permille - CAD_BUSY_DEFER_HYST_PERMILLE);
 	if (_cad_offset > CAD_LEVEL_MIN && r_dn >= 0 &&
 	    r_dn - r_op < CAD_KNEE_SLOPE_PERMILLE &&
-	    r_op <= CAD_PLATEAU_CLEAN_PERMILLE) {
+	    r_op <= CAD_PLATEAU_CLEAN_PERMILLE && busy_ok) {
 		_cad_offset--;
 		hwCadSetPeakOffset(_cad_offset);
-		LOG_INF("cad: step down -> offset %d (op %d dn %d)",
-			(int)_cad_offset, r_op, r_dn);
+		LOG_INF("cad: step down -> offset %d (op %d dn %d busy %d)",
+			(int)_cad_offset, r_op, r_dn, b_dn);
 		return;
 	}
 
@@ -1199,16 +1231,17 @@ int LoRaRadioBase::formatCadStatus(char *buf, int cap)
 	}
 
 	/* Terse on purpose — remote replies are capped at ~160 B over LoRa.
-	 * Header:  a:on o:1 pk:22(b21/4s) iv:15s
+	 * Header:  a:on o:1 pk:22(b21/4s) iv:15s bc:25%
 	 *   a  auto on/off   o  offset   pk operating peak
-	 *   b  family base   4s symbols   iv probe interval
+	 *   b  family base   4s symbols   iv probe interval  bc busy cap
 	 * Level:  *+1(22) 22p 18b 16f 2t 72%
 	 *   '*' = operating rung   level(peak)  probes busy fp tp  fp-rate%%. */
 	n += snprintf(buf + n, cap > n ? cap - n : 0,
-		      "a:%s o:%d pk:%d(b%u/4s) iv:%us",
+		      "a:%s o:%d pk:%d(b%u/4s) iv:%us bc:%u%%",
 		      _cad_auto ? "on" : "off", (int)_cad_offset,
 		      (int)base + _cad_offset, base,
-		      (unsigned)_cad_probe_interval_s);
+		      (unsigned)_cad_probe_interval_s,
+		      (unsigned)_cad_busycap_pct);
 
 	/* Only the 3 rungs around the operating offset — the far rungs are mildly
 	 * irrelevant; what matters is where we sit on the ladder. The window is

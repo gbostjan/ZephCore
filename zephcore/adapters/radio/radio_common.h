@@ -54,6 +54,17 @@
 #define CAD_KNEE_SLOPE_PERMILLE     50    /* >=5%/level FP change = steep */
 #define CAD_PLATEAU_CLEAN_PERMILLE  50    /* <=5% FP = clean enough to descend */
 #define CAD_STEP_MIN_PROBES         120   /* per-level samples before a step call */
+/* Airtime-protection cap on the TOTAL busy (defer) rate — false positives AND
+ * real traffic.  The knee controller only minimises *false* busy, but on a
+ * congested hilltop most busy verdicts are real distant traffic we'd never
+ * actually collide with (capture effect), and deferring for all of it starves
+ * the node's own airtime.  When the operating level's busy rate exceeds the
+ * cap, step UP (less sensitive) regardless of FP — self-targeting, since a
+ * quiet node's busy rate never reaches it.  HYST keeps a descend from bouncing
+ * straight back into the cap.  The cap itself is a per-node pref
+ * (`cad_busycap`, percent, `set cad.busycap`; default 25, 0 = off) since it is
+ * a policy call (airtime vs. collision/capture), not a physical constant. */
+#define CAD_BUSY_DEFER_HYST_PERMILLE 100  /* descend only if frontier busy <= cap-10% */
 #define CAD_PROBE_RSSI_GUARD     7     /* dB above floor = channel visibly busy, skip probe */
 #define CAD_STATS_DECAY_MS       (6UL * 3600UL * 1000UL)  /* halve counters every 6 h */
 

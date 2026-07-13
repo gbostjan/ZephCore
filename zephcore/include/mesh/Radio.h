@@ -44,8 +44,9 @@ public:
 	/* Adaptive CAD (LBT detPeak calibration).  Default no-ops for radios
 	 * without hardware CAD (SX127x). */
 	virtual void setCadParams(bool auto_enabled, int8_t offset,
-				  uint16_t probe_interval_s) {
+				  uint16_t probe_interval_s, uint8_t busycap_pct) {
 		(void)auto_enabled; (void)offset; (void)probe_interval_s;
+		(void)busycap_pct;
 	}
 	/* One housekeeping tick of the CAD calibrator: maybe run a probe,
 	 * update stats, maybe step the staircase (auto mode). */
