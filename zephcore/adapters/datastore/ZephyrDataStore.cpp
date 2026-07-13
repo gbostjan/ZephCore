@@ -481,6 +481,28 @@ bool ZephyrDataStore::saveMainIdentity(const mesh::LocalIdentity &identity)
 	return atomicReplaceFile(MAIN_ID_FILE, buf, n);
 }
 
+/* ── Shutdown-reason breadcrumb ────────────────────────────────────── */
+
+void ZephyrDataStore::saveShutdownReason(uint8_t code)
+{
+	/* Best-effort: called at a software power-off, possibly at low battery. */
+	(void)atomicReplaceFile(SHUTDOWN_FILE, &code, 1);
+}
+
+uint8_t ZephyrDataStore::takeShutdownReason()
+{
+	uint8_t code = 0;
+	size_t len = 0;
+
+	if (openRead(SHUTDOWN_FILE, &code, sizeof(code), len) && len >= 1) {
+		removeFile(SHUTDOWN_FILE);
+		return code;
+	}
+	/* Stray/empty file — clear it so it can't linger. */
+	removeFile(SHUTDOWN_FILE);
+	return 0;
+}
+
 /* ── Preferences ───────────────────────────────────────────────────── */
 
 void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
@@ -506,8 +528,11 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 		LOG_ERR("loadPrefs: read failed");
 		return;
 	}
-	if (len < 88) {
-		LOG_ERR("loadPrefs: file too small (%d bytes, need 88)", (int)len);
+	if (len < 90) {
+		/* gps_interval occupies bytes 86-89, so a shorter blob would read
+		 * its top bytes from uninitialized stack — reject rather than load a
+		 * garbage interval. */
+		LOG_ERR("loadPrefs: file too small (%d bytes, need 90)", (int)len);
 		return;
 	}
 	LOG_DBG("loadPrefs: loaded %d bytes from %s", (int)len, PREFS_FILE);
@@ -671,6 +696,59 @@ void ZephyrDataStore::loadPrefs(NodePrefs &prefs)
 			prefs.meshtimesync = 0;
 		}
 	}
+
+	/* Offset 152: v_contact_enabled (ZephCore extension, default 1 = on) */
+	if (off < len) {
+		prefs.v_contact_enabled = buf[off++];
+		if (prefs.v_contact_enabled > 1) {
+			prefs.v_contact_enabled = 1;
+		}
+	} else {
+		prefs.v_contact_enabled = 1;
+	}
+
+	/* Offset 153: v_battery_alert_mv (ZephCore extension, 2 bytes LE).
+	 * 0xFFFF sentinel = derive from board auto-shutdown threshold; 0 = off. */
+	if (off + 2 <= len) {
+		prefs.v_battery_alert_mv = (uint16_t)buf[off] | ((uint16_t)buf[off + 1] << 8);
+		off += 2;
+	} else {
+		prefs.v_battery_alert_mv = 0xFFFF;
+	}
+
+	/* Offset 155: cad_auto (ZephCore extension, default 0 = dry-run) */
+	if (off < len) {
+		prefs.cad_auto = buf[off++];
+		if (prefs.cad_auto > 1) {
+			prefs.cad_auto = 0;
+		}
+	}
+
+	/* Offset 156: cad_offset (ZephCore extension, signed, default 0) */
+	if (off < len) {
+		prefs.cad_offset = (int8_t)buf[off++];
+		if (prefs.cad_offset < CAD_OFFSET_MIN || prefs.cad_offset > CAD_OFFSET_MAX) {
+			prefs.cad_offset = 0;
+		}
+	}
+
+	/* Offset 157: cad_probe_interval (ZephCore extension, seconds; 0 = off).
+	 * Absent in pre-existing files → keep the in-RAM default (60). */
+	if (off < len) {
+		prefs.cad_probe_interval = buf[off++];
+		if (prefs.cad_probe_interval != 0 && prefs.cad_probe_interval < 10) {
+			prefs.cad_probe_interval = 10;
+		}
+	}
+
+	/* Offset 158: cad_busycap (ZephCore extension, percent; 0 = off).
+	 * Absent in pre-existing files → keep the in-RAM default (25). */
+	if (off < len) {
+		prefs.cad_busycap = buf[off++];
+		if (prefs.cad_busycap > 90) {
+			prefs.cad_busycap = 90;
+		}
+	}
 }
 
 void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
@@ -747,7 +825,20 @@ void ZephyrDataStore::savePrefs(const NodePrefs &prefs)
 	buf[off++] = prefs.rx_duty_cycle;
 	/* Offset 151: meshtimesync (ZephCore extension) */
 	buf[off++] = prefs.meshtimesync;
-	/* Total: 152 bytes */
+	/* Offset 152: v_contact_enabled (ZephCore extension) */
+	buf[off++] = prefs.v_contact_enabled;
+	/* Offset 153: v_battery_alert_mv (ZephCore extension, 2 bytes LE) */
+	buf[off++] = prefs.v_battery_alert_mv & 0xFF;
+	buf[off++] = (prefs.v_battery_alert_mv >> 8) & 0xFF;
+	/* Offset 155: cad_auto (ZephCore extension) */
+	buf[off++] = prefs.cad_auto;
+	/* Offset 156: cad_offset (ZephCore extension, signed) */
+	buf[off++] = (uint8_t)prefs.cad_offset;
+	/* Offset 157: cad_probe_interval (ZephCore extension, seconds) */
+	buf[off++] = prefs.cad_probe_interval;
+	/* Offset 158: cad_busycap (ZephCore extension, percent) */
+	buf[off++] = prefs.cad_busycap;
+	/* Total: 159 bytes */
 
 	bool ok = atomicReplaceFile(PREFS_FILE, buf, off);
 	LOG_DBG("savePrefs: wrote %s, ok=%d (%d bytes), name='%.16s'",

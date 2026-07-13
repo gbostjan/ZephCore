@@ -345,7 +345,7 @@ ZephCore-only divergence from Arduino MeshCore (like the Adaptive Contention Win
 | Room server | forward-only | post timestamps feed client `sync_since` ordering |
 | Companion | forward-only | own clock stamps outgoing DMs; peers hold per-sender replay high-water marks |
 
-**Step application**: the shared policy (GPS gate, forward-only skip, uint32-overflow guard, set clock, one `zephcore_rtc_save` per step — never per evaluation) lives in `MeshTimeSync::runTick()`; when it returns true, the role shifts its wall-clock-anchored bookkeeping by `lastStepDelta()` — repeater: neighbor `heard_timestamp`s, ACL `last_activity`, login/anon/discover rate-limiter resets; room server: ACL + login limiter.
+**Step application**: the shared policy (suppression/pedigree checks inside `evaluateNow`, forward-only skip, uint32-overflow guard, set clock, one `zephcore_rtc_save` per step — never per evaluation) lives in `MeshTimeSync::runTick()`; when it returns true, the role shifts its wall-clock-anchored bookkeeping by `lastStepDelta()` — repeater: neighbor `heard_timestamp`s, ACL `last_activity`, login/anon/discover rate-limiter resets; room server: ACL + login limiter.
 
 All policy timers (6 h rate limit, 7-day suppression, tenure, sample age) anchor on **uptime, never wall clock** — otherwise the very steps they govern would distort them.
 
@@ -425,6 +425,26 @@ Algorithm in `triggerNoiseFloorCalibrate()`:
 - Periodic bypass: every 16th tick accepts unconditionally
 - EMA: `floor += round_nearest((sample - floor) / 8)`, clamped to [-120, -50] dBm
 
+### 5.3.1 Adaptive CAD (LBT detPeak calibration)
+
+`cadDetPeak` is a correlation peak-to-noise threshold in the despreader (not
+dBm), so the right LBT sensitivity is site-dependent (chirp-like interference
+varies) and cannot be derived from the RSSI floor. `LoRaRadioBase::cadMaintenance()`
+(housekeeping tick) runs one calibration CAD probe per `cad.probe.interval`
+(default 60 s) at a signed **level** relative to the family's per-SF base
+detPeak, restarts RX, and classifies busy verdicts via a ground-truth filter
+(pre-probe RSSI near floor; post-busy ~8-symbol wait for real RX activity →
+`tp`, else suspected `fp`). Per-level counters decay 6-hourly and reset on any
+RF param change. With `cad.auto on`, a one-sided staircase steps the operating
+offset down when the frontier level shows FP ≤ 1% over ≥300 probes, up quickly
+when the operating level exceeds 2× target over ≥50 probes; offset clamped
+−4…+4, persisted via `Dispatcher::onCadOffsetChanged()`. Probe + offset plumbing
+is per-driver extension API (`*_cad_probe`, `*_cad_set_peak_offset`,
+`*_cad_base_peak`); LBT CAD runs 4 symbols (set in `buildModemConfig`), and the
+drivers scale their blocking-CAD timeout to `nSym·Tsym + margin`. CLI: `get cad`,
+`set cad.auto/offset/probe.interval/reset`. SX127x: unsupported (no HW CAD).
+User doc: `ADAPTIVE_CAD.md`.
+
 ### 5.4 LR1110 Driver Errata Workarounds
 
 The custom `lr11xx_lora.c` driver handles several LR1110 firmware bugs:
@@ -475,6 +495,75 @@ Handles the binary BLE protocol with ~50 command opcodes. Key features:
 - **Protocol versioning**: V2/V3 frame format negotiation with phone app
 - **Ed25519 signing**: 3-phase flow (start→data→finish) for signing up to 8KB
 - **Flood scope**: Transport key filtering for region-scoped sends
+
+### 6.2.1 V-Contact (Loopback Admin Contact)
+
+ZephCore-only feature (no Arduino equivalent). The companion synthesizes a CHAT
+contact named `v<node_name>` that exists only toward the connected BLE/USB app.
+Chatting with it runs the same text CLI as the USB serial sideband; the reply
+comes back as normal chat messages. The firmware also uses it to emit
+unsolicited notices: a one-shot low-battery alert and a restart-reason message
+(all causes: PIN/SOFTWARE/BROWNOUT/POR/WATCHDOG/LOCKUP — offline-queue only,
+so routine power-on "noise" costs nothing over the air).
+
+**Identity**: pubkey = `SHA256("zc-vcontact" || self_pubkey)` — stable per
+node, unique per device, and deliberately **not a real keypair**: no private
+key exists anywhere.
+
+**No-RF invariants** (all enforced in `CompanionMesh`):
+1. `vcontactHandleFrame()` intercepts `CMD_SEND_TXT_MSG` (and the handful of
+   other opcodes that must succeed) *before* any contact lookup — the CLI runs
+   and the reply is written straight into the offline queue. **No packet
+   object is ever created**, so nothing can reach the dispatcher or radio.
+2. The v-contact never enters the real contacts table (`CMD_ADD_UPDATE_CONTACT`
+   for its key is intercepted to a no-op OK), so it is never in the RF RX
+   matching path. Every other pubkey-addressed opcode (login, telemetry,
+   binary req, path discovery…) misses `lookupContactByPubKey()` and fails
+   `ERR_NOT_FOUND` before a packet exists.
+3. Even a hand-crafted over-the-air packet addressed to the derived pubkey is
+   inert: unknown dest, undecryptable by everyone including this node.
+
+**App plumbing**: appears as a virtual tail entry in the `CMD_GET_CONTACTS`
+iteration (and `+1` in the CONTACT_START total); pushed as `NEW_ADVERT` on
+runtime enable and rename, `CONTACT_DELETED` on disable. App-side contact
+delete (`CMD_REMOVE_CONTACT`) turns the feature off. Send/ack choreography is
+synthesized (SENT + immediate SEND_CONFIRMED, trip time 0). CLI replies are
+chunked at ≤150 chars on line breaks (offline-queue frames cap at 172 bytes).
+
+**Clock gating (no 1970 timestamps)**: while the RTC has never been synced
+(time < firmware build epoch) the v-contact is *deferred* — withheld from
+contact sync and adverts, and notices are buffered in a small RAM slot
+(`_vcontact_pending`) instead of queued with an epoch-0 timestamp.
+`vcontactClockSynced()` activates it and flushes the buffer; hooked at
+`CMD_APP_START` (covers hardware-RTC boards, already valid), successful
+`CMD_SET_DEVICE_TIME` (typical app connect flow), and GPS time sync.
+
+**Resend dedupe**: app retry attempts reuse the message timestamp (only the
+attempt byte changes); `_vcontact_last_ts` suppresses re-execution — a dupe
+gets the full ack choreography but the CLI does not run twice. Side effect:
+sending the identical command twice within the same wall-clock second only
+executes once (same app-side timestamp). Synthesized `est_timeout` is 3 s so
+the app's retry timer doesn't race the loopback confirmation.
+
+**Stats**: `CompanionCLICallbacks` overrides
+`formatStatsReply`/`formatRadioStatsReply`/`formatPacketStatsReply` with the
+repeater's `StatsFormatHelper` JSON, so `stats-core`/`stats-radio`/
+`stats-packets` return real data over USB and the v-contact.
+
+**Notices ride the offline queue** — emitted while nothing is connected, they
+are delivered on the first app connect/sync. RAM-backed: lost on reboot (the
+restart-reason message partially compensates) and bounded by
+`CONFIG_ZEPHCORE_OFFLINE_QUEUE_SIZE`.
+
+**Settings** (companion `v.*` CLI namespace, prefs offsets 152–154):
+- `set/get v.contact on|off` — default on.
+- `set/get v.batteryalert <mV>|0|default` — default = board auto-shutdown
+  threshold + 200 mV (so the alert wins the race against the 90 s shutdown
+  confirm window), 3500 mV on boards without auto-shutdown. Alert latches
+  once per discharge cycle; re-arms on external power, recovery above
+  threshold + 150 mV, or threshold change. Sampling mirrors
+  `ui_auto_shutdown_check()` (30 s gate, 3-strike confirm) but lives in
+  `main_companion.cpp` so headless builds alert too.
 
 ### 6.3 RepeaterMesh
 
@@ -620,6 +709,37 @@ Color TFT panels (T114, T096, Wireless Tracker) are wrapped as 1bpp displays for
 **Companion** (up to 12 pages): Messages, Recent, Radio, Bluetooth, Advert, GPS, Buzzer (if buzzer present), LEDs, Sensors, Offgrid, DFU, Shutdown
 
 **Repeater** (3 pages): Status, Radio, Shutdown
+
+### 8.2.1 Renderer Split (mono / color)
+
+Pages whose color layout genuinely diverges from the mono layout are split into
+dedicated renderers behind a compile-time seam, instead of branching on
+capability inline (and never into per-board renderer files):
+
+```
+render_<page>_mono()             — mono / tiny / e-ink layout (always compiled)
+render_<page>_color()            — RGB565 layout, wrapped in
+                                   #if MC_DISPLAY_COLOR_PANEL
+render_<page>()                  — thin dispatcher:
+                                     #if MC_DISPLAY_COLOR_PANEL
+                                     if (mc_display_has_color()) { _color(); return; }
+                                     #endif
+                                     _mono();
+```
+
+`MC_DISPLAY_COLOR_PANEL` is defined (in `display.h`) only when a `tft` node
+exists in devicetree. On a mono/e-ink board the color bodies — and every
+color-only helper they reference (`draw_activity_graph`, `use_compact_color_home`,
+the `activity_*` buffers, …) — are dropped at compile time, so color rendering
+costs zero flash/RAM there. Adding a new color board reuses `_color`; it must
+never fork a board-specific renderer.
+
+Pages with a **shared** flow that only tints per-row (Recent, GPS, Sensors,
+Status) stay as single functions with inline `if (mc_display_has_color())` —
+that already is the "one layout, colored" ideal, and the color branch
+dead-code-eliminates on mono via the constant-false `mc_display_has_color()`.
+Split pages: Messages, Radio, Traffic, Bluetooth, Advert, LEDs, Offgrid, DFU,
+Shutdown.
 
 ### 8.3 Multi-Tap Input
 

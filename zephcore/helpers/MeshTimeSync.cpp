@@ -55,10 +55,10 @@ bool MeshTimeSync::slotTenured(const Slot &s, uint32_t uptime_secs) const
 	       s.count >= TENURE_MIN_ADVERTS;
 }
 
-bool MeshTimeSync::slotEligible(const Slot &s, uint32_t uptime_secs) const
+bool MeshTimeSync::slotEligible(const Slot &s, uint32_t uptime_secs, bool bootstrap) const
 {
-	return s.used && slotTenured(s, uptime_secs) &&
-	       (uptime_secs - s.arrival_uptime) <= MAX_SAMPLE_AGE_SECS;
+	return s.used && (uptime_secs - s.arrival_uptime) <= MAX_SAMPLE_AGE_SECS &&
+	       (bootstrap || slotTenured(s, uptime_secs));
 }
 
 int64_t MeshTimeSync::slotSkew(const Slot &s, uint32_t local_time, uint32_t uptime_secs) const
@@ -159,9 +159,7 @@ MeshTimeSync::Consensus MeshTimeSync::computeConsensus(uint32_t local_time,
 	int n = 0, m = 0;
 	for (int i = 0; i < MESHTIMESYNC_TABLE_SIZE; i++) {
 		const Slot &s = _slots[i];
-		if (!s.used) continue;
-		if ((uptime_secs - s.arrival_uptime) > MAX_SAMPLE_AGE_SECS) continue;
-		if (!bootstrap && !slotTenured(s, uptime_secs)) continue;
+		if (!slotEligible(s, uptime_secs, bootstrap)) continue;
 		int64_t skew = slotSkew(s, local_time, uptime_secs);
 		int32_t r = RADIUS_BASE_SECS + RADIUS_PER_HOP_SECS * s.hops;
 		val[m] = skew - r; typ[m] = 1;  m++;
@@ -475,22 +473,52 @@ int MeshTimeSync::formatStatus(char *out, size_t cap, uint32_t local_time,
 	                (unsigned long)_evals, (unsigned long)_abstains);
 	if (pos < 0 || (size_t)pos >= cap) goto full;
 
-	/* Evidence table: one entry per used slot, as many as fit. */
-	for (int i = 0; i < MESHTIMESYNC_TABLE_SIZE; i++) {
-		const Slot &s = _slots[i];
-		if (!s.used) continue;
-		int w = snprintf(out + pos, cap - pos, "\r\n %02x%02x h%u n%u %+lds%s",
-		                 s.prefix[0], s.prefix[1], (unsigned)s.hops,
-		                 (unsigned)(s.count > 99 ? 99 : s.count),
-		                 clampl(slotSkew(s, local_time, uptime_secs)),
-		                 slotEligible(s, uptime_secs) ? " E" : "");
-		if (w < 0 || (size_t)(pos + w) >= cap) {
-			out[pos] = 0;  /* drop the partial entry */
-			return pos;
+	{
+		/* Evidence table: entries that actually count toward this verdict
+		 * print first, then the rest — on a size-capped reply (161 B over
+		 * remote admin), the buffer must not run out on still-building-tenure
+		 * entries while hiding the ones that explain the verdict.
+		 * (Braced so these locals go out of scope before the `full` label
+		 * below — a goto may not jump over a variable's initialization.) */
+		int total_used = 0;
+		for (int i = 0; i < MESHTIMESYNC_TABLE_SIZE; i++) {
+			if (_slots[i].used) total_used++;
 		}
-		pos += w;
+
+		int printed = 0;
+		for (int pass = 0; pass < 2 && printed < total_used; pass++) {
+			for (int i = 0; i < MESHTIMESYNC_TABLE_SIZE; i++) {
+				const Slot &s = _slots[i];
+				if (!s.used) continue;
+				bool participates = slotEligible(s, uptime_secs, v.bootstrap);
+				if (participates != (pass == 0)) continue;
+
+				int w = snprintf(out + pos, cap - pos, "\r\n %02x%02x h%u n%u %+lds%s",
+				                 s.prefix[0], s.prefix[1], (unsigned)s.hops,
+				                 (unsigned)(s.count > 99 ? 99 : s.count),
+				                 clampl(slotSkew(s, local_time, uptime_secs)),
+				                 participates ? " E" : "");
+				if (w < 0 || (size_t)(pos + w) >= cap) {
+					out[pos] = 0;  /* drop the partial entry */
+					goto truncated;
+				}
+				pos += w;
+				printed++;
+			}
+		}
+		return pos;
+
+	truncated:
+		if (printed < total_used) {
+			char tail[24];
+			int tw = snprintf(tail, sizeof(tail), "\r\n +%d more", total_used - printed);
+			if (tw > 0 && (size_t)tw < cap - (size_t)pos) {
+				memcpy(out + pos, tail, (size_t)tw + 1);
+				pos += tw;
+			}
+		}
+		return pos;
 	}
-	return pos;
 
 full:
 	out[cap - 1] = 0;

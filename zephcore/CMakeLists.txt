@@ -405,6 +405,27 @@ if(ZEPHCORE_BOARD_OVERLAY AND EXISTS ${ZEPHCORE_BOARD_OVERLAY})
     endif()
 endif()
 
+# Flash partition layout lives in a separate boards/<...>/<board>/partitions.overlay
+# so the SAME file can be fed to the MCUboot image too (see sysbuild/CMakeLists.txt).
+# The app and MCUboot MUST share one flash map — otherwise MCUboot stages/looks for
+# the OTA image at a different address than the app writes it to, and OTA silently
+# reverts on reboot. Keeping it in its own file is what makes that sharing possible.
+set(ZEPHCORE_BOARD_PARTITIONS "")
+file(GLOB_RECURSE BOARD_PARTITIONS_CANDIDATES "${CMAKE_CURRENT_SOURCE_DIR}/boards/*/${BOARD_BASE}/partitions.overlay")
+if(BOARD_PARTITIONS_CANDIDATES)
+    list(GET BOARD_PARTITIONS_CANDIDATES 0 ZEPHCORE_BOARD_PARTITIONS)
+endif()
+if(NOT ZEPHCORE_BOARD_PARTITIONS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/partitions.overlay")
+    set(ZEPHCORE_BOARD_PARTITIONS "${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_BASE}/partitions.overlay")
+endif()
+if(ZEPHCORE_BOARD_PARTITIONS AND EXISTS ${ZEPHCORE_BOARD_PARTITIONS})
+    if(EXTRA_DTC_OVERLAY_FILE)
+        set(EXTRA_DTC_OVERLAY_FILE "${EXTRA_DTC_OVERLAY_FILE};${ZEPHCORE_BOARD_PARTITIONS}" CACHE STRING "" FORCE)
+    else()
+        set(EXTRA_DTC_OVERLAY_FILE "${ZEPHCORE_BOARD_PARTITIONS}" CACHE STRING "" FORCE)
+    endif()
+endif()
+
 
 # Debug: Show what configs are being used
 message(STATUS "ZephCore config hierarchy:")
@@ -438,7 +459,7 @@ add_definitions(-DFIRMWARE_BUILD_EPOCH=${ZEPHCORE_BUILD_EPOCH}u)
 # value; the per-app `#ifndef FIRMWARE_VERSION` fallbacks only apply to builds that
 # bypass this injection. NOTE: the BLE DIS value in boards/common/zephcore_common.conf
 # (CONFIG_BT_DIS_FW_REV_STR) is Kconfig, not C, so it must be bumped here AND there.
-set(ZEPHCORE_FIRMWARE_VERSION "v1.16.4-zephyr")
+set(ZEPHCORE_FIRMWARE_VERSION "v1.16.5-zephyr")
 add_definitions(-DFIRMWARE_VERSION="${ZEPHCORE_FIRMWARE_VERSION}")
 
 add_subdirectory(lib/monocypher)
@@ -666,6 +687,11 @@ else()
     helpers/TransportKeyStore.cpp
     helpers/ui/ui_mesh_actions.cpp
     app/CompanionMesh.cpp
+    # CommonCLI backs the v-contact loopback admin chat (companion_cli_exec in
+    # main_companion.cpp), which is NOT gated on the wired-USB stack — so it
+    # must be compiled unconditionally. Builds without CONFIG_LOG/COMPANION_USB/
+    # COMPANION_SERIAL (e.g. plain ESP32/S3 companions) failed to link otherwise.
+    helpers/CommonCLI.cpp
   )
   # Companion transport: TCP socket on native Linux, serial (UART) on boards
   # with no Bluetooth controller (e.g. STM32WL), BLE NUS everywhere else.
@@ -703,7 +729,6 @@ else()
   if(CONFIG_LOG OR CONFIG_ZEPHCORE_COMPANION_USB OR CONFIG_ZEPHCORE_COMPANION_SERIAL)
     target_sources(app PRIVATE
       adapters/usb/ZephyrCompanionUSB.cpp
-      helpers/CommonCLI.cpp  # backs the wired text CLI dispatch
     )
     if(NOT CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT AND (CONFIG_USB_CDC_ACM OR CONFIG_USBD_CDC_ACM_CLASS))
       target_sources(app PRIVATE

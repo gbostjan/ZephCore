@@ -121,6 +121,10 @@ void CommonCLI::loadPrefs(const char* path) {
     ok = ok && prefs_read(&file, &_prefs->flood_max_unscoped, sizeof(_prefs->flood_max_unscoped)); // 294
     ok = ok && prefs_read(&file, &_prefs->flood_max_advert, sizeof(_prefs->flood_max_advert)); // 295
     ok = ok && prefs_read(&file, &_prefs->meshtimesync, sizeof(_prefs->meshtimesync));         // 296
+    ok = ok && prefs_read(&file, &_prefs->cad_auto, sizeof(_prefs->cad_auto));                 // 297
+    ok = ok && prefs_read(&file, &_prefs->cad_offset, sizeof(_prefs->cad_offset));             // 298
+    ok = ok && prefs_read(&file, &_prefs->cad_probe_interval, sizeof(_prefs->cad_probe_interval)); // 299
+    ok = ok && prefs_read(&file, &_prefs->cad_busycap, sizeof(_prefs->cad_busycap));            // 300
 
     if (!ok) {
         LOG_WRN("Prefs file %s truncated, some fields use defaults", path);
@@ -167,6 +171,12 @@ void CommonCLI::loadPrefs(const char* path) {
     _prefs->flood_max_unscoped = constrain(_prefs->flood_max_unscoped, (uint8_t)0, (uint8_t)64);
     _prefs->flood_max_advert = constrain(_prefs->flood_max_advert, (uint8_t)0, (uint8_t)64);
     _prefs->meshtimesync = constrain(_prefs->meshtimesync, (uint8_t)0, (uint8_t)1);
+    _prefs->cad_auto = constrain(_prefs->cad_auto, (uint8_t)0, (uint8_t)1);
+    _prefs->cad_offset = constrain(_prefs->cad_offset, (int8_t)CAD_OFFSET_MIN, (int8_t)CAD_OFFSET_MAX);
+    if (_prefs->cad_probe_interval != 0 && _prefs->cad_probe_interval < 10) {
+        _prefs->cad_probe_interval = 10;
+    }
+    _prefs->cad_busycap = constrain(_prefs->cad_busycap, (uint8_t)0, (uint8_t)90);
 
     LOG_INF("Loaded prefs from %s", path);
 }
@@ -235,6 +245,10 @@ void CommonCLI::savePrefs(const char* path) {
     fs_write(&file, &_prefs->flood_max_unscoped, sizeof(_prefs->flood_max_unscoped));
     fs_write(&file, &_prefs->flood_max_advert, sizeof(_prefs->flood_max_advert));
     fs_write(&file, &_prefs->meshtimesync, sizeof(_prefs->meshtimesync));
+    fs_write(&file, &_prefs->cad_auto, sizeof(_prefs->cad_auto));
+    fs_write(&file, &_prefs->cad_offset, sizeof(_prefs->cad_offset));
+    fs_write(&file, &_prefs->cad_probe_interval, sizeof(_prefs->cad_probe_interval));
+    fs_write(&file, &_prefs->cad_busycap, sizeof(_prefs->cad_busycap));
 
     fs_close(&file);
     LOG_INF("Saved prefs to %s", path);
@@ -293,6 +307,32 @@ void CommonCLI::scheduleReboot(uint8_t type)
 }
 
 void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, char* reply) {
+    /* Case-insensitive command keywords.  Lowercase only the first two
+     * whitespace-delimited tokens (the verb and the config key) — the value
+     * (3rd token onward) is preserved verbatim, so case-sensitive arguments
+     * like passwords, node names, owner info, and keys are never mangled.
+     * Fixes e.g. "Get cad" / "SET Cad.Auto on" not being recognized. */
+    char norm[CLI_REPLY_SIZE];
+    {
+        int tok = 0;          /* completed tokens so far */
+        bool in_tok = false;
+        size_t j = 0;
+        for (size_t i = 0; command[i] != '\0' && j < sizeof(norm) - 1; i++) {
+            char c = command[i];
+            if (c == ' ' || c == '\t') {
+                if (in_tok) { in_tok = false; tok++; }
+            } else {
+                in_tok = true;
+                if (tok < 2 && c >= 'A' && c <= 'Z') {
+                    c = (char)(c - 'A' + 'a');
+                }
+            }
+            norm[j++] = c;
+        }
+        norm[j] = '\0';
+        command = norm;
+    }
+
     if (strcmp(command, "start dfu") == 0) {
         /* Reboot into UF2 bootloader for firmware update */
         strcpy(reply, "OK - rebooting to UF2 DFU");
@@ -390,7 +430,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             strcpy(reply, "ERR: bad pubkey");
         }
     } else if (memcmp(command, "tempradio ", 10) == 0) {
-        snprintf(tmp, sizeof(tmp), "%s", &command[10]);
+        snprintf(tmp, sizeof(tmp), "%.*s", (int)(sizeof(tmp) - 1), &command[10]);
         const char* parts[5];
         int num = mesh::Utils::parseTextParts(tmp, parts, 5);
         float freq = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -560,6 +600,15 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
         } else if (memcmp(config, "dc.restarts", 11) == 0) {
             snprintf(reply, CLI_REPLY_SIZE, "> %u",
                      (uint32_t)_callbacks->getDutyCycleTimeoutRestarts());
+        } else if (memcmp(config, "cad", 3) == 0) {
+            /* Runtime state + per-level probe stats live in the radio.
+             * Remote replies get the truncated buffer like meshtimesync. */
+            size_t cap = (sender_timestamp == 0) ? CLI_REPLY_SIZE
+                                                 : CLI_REMOTE_REPLY_SIZE;
+            int n = snprintf(reply, cap, "> ");
+            if (_callbacks->formatCadStatus(reply + n, (int)cap - n) == 0) {
+                strcpy(reply, "not available");
+            }
         } else if (memcmp(config, "meshtimesync", 12) == 0) {
             MeshTimeSync* ts = _callbacks->getMeshTimeSync();
             if (ts == nullptr) {
@@ -606,6 +655,49 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             _prefs->agc_reset_interval = atoi(&config[19]) / 4;
             savePrefs();
             snprintf(reply, CLI_REPLY_SIZE, "OK - interval rounded to %u", ((uint32_t)_prefs->agc_reset_interval) * 4);
+        } else if (memcmp(config, "cad.auto ", 9) == 0) {
+            if (memcmp(&config[9], "on", 2) == 0 || memcmp(&config[9], "off", 3) == 0) {
+                _prefs->cad_auto = (config[9] == 'o' && config[10] == 'n') ? 1 : 0;
+                _callbacks->applyCadPrefs();
+                savePrefs();
+                strcpy(reply, "OK");
+            } else {
+                strcpy(reply, "Error: must be on or off");
+            }
+        } else if (memcmp(config, "cad.offset ", 11) == 0) {
+            int val = atoi(&config[11]);
+            if (val < CAD_OFFSET_MIN || val > CAD_OFFSET_MAX) {
+                snprintf(reply, CLI_REPLY_SIZE, "Error: offset range is %d..%d",
+                         CAD_OFFSET_MIN, CAD_OFFSET_MAX);
+            } else {
+                _prefs->cad_offset = (int8_t)val;
+                _callbacks->applyCadPrefs();
+                savePrefs();
+                strcpy(reply, "OK");
+            }
+        } else if (memcmp(config, "cad.probe.interval ", 19) == 0) {
+            int val = atoi(&config[19]);
+            if (val != 0 && (val < 10 || val > 255)) {
+                strcpy(reply, "Error: interval is 0 (off) or 10-255 seconds");
+            } else {
+                _prefs->cad_probe_interval = (uint8_t)val;
+                _callbacks->applyCadPrefs();
+                savePrefs();
+                strcpy(reply, "OK");
+            }
+        } else if (memcmp(config, "cad.busycap ", 12) == 0) {
+            int val = atoi(&config[12]);
+            if (val != 0 && (val < 10 || val > 90)) {
+                strcpy(reply, "Error: busycap is 0 (off) or 10-90 percent");
+            } else {
+                _prefs->cad_busycap = (uint8_t)val;
+                _callbacks->applyCadPrefs();
+                savePrefs();
+                strcpy(reply, "OK");
+            }
+        } else if (memcmp(config, "cad.reset", 9) == 0) {
+            _callbacks->resetCadStats();
+            strcpy(reply, "OK - CAD probe stats cleared");
         } else if (memcmp(config, "multi.acks ", 11) == 0) {
             int val = atoi(&config[11]);
             if (val == 0 || val == 1) {
@@ -684,7 +776,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 strcpy(reply, "Error: must be on or off");
             }
         } else if (memcmp(config, "radio ", 6) == 0) {
-            snprintf(tmp, sizeof(tmp), "%s", &config[6]);
+            snprintf(tmp, sizeof(tmp), "%.*s", (int)(sizeof(tmp) - 1), &config[6]);
             const char* parts[4];
             int num = mesh::Utils::parseTextParts(tmp, parts, 4);
             float freq = num > 0 ? strtof(parts[0], nullptr) : 0.0f;
@@ -1002,7 +1094,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 strcpy(reply, "Error: must be on or off");
             }
         } else {
-            snprintf(reply, CLI_REPLY_SIZE, "unknown config: %s", config);
+            snprintf(reply, CLI_REPLY_SIZE, "unknown config: %.230s", config);
         }
     } else if (sender_timestamp == 0 && strcmp(command, "erase") == 0) {
         bool s = _callbacks->formatFileSystem();
@@ -1028,7 +1120,7 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
             strcpy(reply, "null");
         }
     } else if (memcmp(command, "sensor set ", 11) == 0) {
-        snprintf(tmp, sizeof(tmp), "%s", &command[11]);
+        snprintf(tmp, sizeof(tmp), "%.*s", (int)(sizeof(tmp) - 1), &command[11]);
         const char* parts[2];
         int num = mesh::Utils::parseTextParts(tmp, parts, 2, ' ');
         const char* key = (num > 0) ? parts[0] : "";

@@ -160,7 +160,12 @@ private:
 
 	Slot *findSlot(const uint8_t *prefix);
 	bool slotTenured(const Slot &s, uint32_t uptime_secs) const;
-	bool slotEligible(const Slot &s, uint32_t uptime_secs) const;
+	/* Whether this slot counts toward the current evaluation — bootstrap
+	 * relaxes tenure, so this takes the mode explicitly rather than
+	 * hardcoding normal-mode rules. Single source of truth shared by
+	 * computeConsensus (who votes) and formatStatus (who gets the "E"
+	 * marker) — they must never diverge on what "counted" means. */
+	bool slotEligible(const Slot &s, uint32_t uptime_secs, bool bootstrap) const;
 	int64_t slotSkew(const Slot &s, uint32_t local_time, uint32_t uptime_secs) const;
 
 	Consensus computeConsensus(uint32_t local_time, uint32_t uptime_secs,
