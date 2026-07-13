@@ -24,6 +24,70 @@ threshold inside the radio's despreader — **not** a dBm level. The RSSI
 noise floor cannot be converted into a detPeak value, which is why this
 feature measures CAD behaviour directly instead of deriving it from RSSI.
 
+## The mental model: strong signals vs. faint ones
+
+This is the picture that makes every knob below make sense. Skip it and
+the numbers look arbitrary; read it and "SmartCAD" is one idea seen from
+three angles.
+
+**detPeak gates on correlation strength, which tracks link budget — and it
+is blind to distance.** The despreader's correlation peak is essentially
+the signal's SNR after processing gain, so a strong arrival produces a big
+peak and a weak one a small peak, *regardless of how far it travelled*. A
+90 km line-of-sight repeater that arrives strong and a 1 km neighbour
+arriving strong both trip CAD; a faint straggler at the edge of
+decodability, a multipath echo, or a distant node buried in noise all
+produce small peaks. **Raising detPeak raises the bar to "strong only";
+lowering it means "hear even the faint stuff."** There is no knob that
+separates *near* from *far* — only *strong* from *faint* — because the
+radio only ever knew signal strength, never distance.
+
+**Semtech's recommended values (AN1200.48: 21–29 across all SF/BW for the
+SX126x; our base is `SF+13`, which is 21 at SF8) are tuned for a
+receiver** that wants to hear everything down to its sensitivity limit —
+i.e. to *catch the faint*. Listen-before-talk on a busy backbone often
+wants the opposite: deliberately sit *above* that band so it ignores faint
+contention it would win on capture anyway. So "operating above 29" is not
+a misconfiguration here; it is the point.
+
+**Scale sanity, because the register is deceptive.** `cadDetPeak` is a
+full 8-bit field (0–255), but the *useful* range is only ~18–32. The
+driver's 40 ceiling is ~11 above the highest value Semtech recommends
+anywhere — a near-blind guardrail, not an operating point. And the
+LR11xx/LR2021 family's 56–68 numbers are a **different chip's correlation
+scale**; porting them onto an SX126x makes CAD deaf. If a value feels like
+it should be "mid-scale," that instinct is the trap: this scale is
+compressed, not linear over 0–255.
+
+**Why the probes only ever measure the faint side.** A calibration probe
+is *skipped* whenever RSSI is more than 7 dB above the noise floor (a
+strong signal is present — see the prefilter below). So every probe that
+runs does so in a quiet moment, and the only thing CAD can trip on there
+is a **sub-floor, faint, correlation-only-detectable** signal. That makes
+the entire adaptive loop a **faint-rejection tuner**: the `busy%` you read
+in `get cad` is "how often a quiet moment still held a faint signal", not
+total channel occupancy. Strong signals never enter the statistics — they
+were filtered out before the probe, and in real LBT they trip on their own
+merits.
+
+**So the busy cap is really a faint-tolerance dial.** `set cad.busycap`
+says "keep raising detPeak until fewer than *N*% of quiet moments trip on
+faint signals." A **lower** cap rejects faint traffic more aggressively
+(ignore echoes and stragglers); a higher cap tolerates more of it. On a
+saturated hilltop that should react only to strong contention, set the cap
+low (e.g. `10`); the default `25` is a moderate setting suited to mixed
+and leaf nodes. This is the same mechanism as "airtime protection" below —
+two names for one lever, because the airtime a busy node wastes *is* the
+airtime spent deferring for faint traffic.
+
+**The one thing you cannot see locally.** Because strong signals are
+prefiltered out of the measurement, a node can never confirm from its own
+stats that it *still catches strong* — the numbers only cover the faint
+side it is rejecting. The only check is behavioural: does the node still
+defer for its known strong peers? If it climbs so high that even they stop
+tripping, back the cap up. (This is the same "miss side is invisible"
+caveat noted at the end, viewed through the strong/faint lens.)
+
 ## How it works
 
 Every `cad.probe.interval` seconds (default 15), when the radio is idle
@@ -50,11 +114,20 @@ below-noise-floor packet (detecting those is CAD's whole purpose):
 
 1. Probes are skipped entirely when the channel is visibly busy (RSSI
    more than 7 dB above the learned noise floor) or a packet is being
-   received — those teach nothing about false positives.
-2. After a busy verdict, RX is restarted and the firmware waits ~8 symbol
-   times: a real transmitter is still on the air and trips the receive
-   path. If nothing shows up, the verdict counts as a suspected false
-   positive. Residual contamination by real traffic biases the estimate
+   received — those teach nothing about false positives. (This is also the
+   prefilter that limits probing to the faint regime; see the mental model
+   above.)
+2. After a busy verdict, RX is restarted and the firmware watches a
+   ~12-symbol window for either signal of a real transmitter: (a) the
+   restarted RX syncs on it, **or** (b) instantaneous RSSI climbs above the
+   noise floor. If neither appears, the verdict counts as a suspected false
+   positive. Path (b) matters: tearing RX down to run the probe routinely
+   eats a real packet's preamble, so RX often fails to re-sync on a signal
+   that is genuinely there — an earlier `isReceiving()`-only check booked
+   those as false positives, a detPeak-independent floor that flattened the
+   FP curve and drove the staircase into the ceiling. Channel energy does
+   not depend on winning the preamble race, so it recovers them. Residual
+   contamination by real below-floor traffic biases the estimate
    *conservative* (higher detPeak), which is the safe direction.
 
 Statistics decay (halve) every 6 hours so the picture stays fresh, and
@@ -131,22 +204,25 @@ get cad
 Compact output (kept short so it survives a truncated LoRa reply):
 
 ```
-> a:on o:-1 pk:20(b21/4s) iv:15s
--2(19) 241p 9b 7f 2t 3%
--1(20) 900p 5b 3f 2t 0%
-+0(21) 300p 2b 0f 2t 0%
+> a:on o:-1 pk:20(b21/4s) iv:15s bc:25%
+ -2(19) 241p 9b 7f 2t 3%
+*-1(20) 900p 5b 3f 2t 0%
+ +0(21) 300p 2b 0f 2t 0%
 ```
 
 Header: `a` auto on/off · `o` operating offset · `pk` operating detPeak ·
-`b` family base · `4s` 4 symbols · `iv` probe interval.
-Per level: `level(peak) probes busy fp tp fp%%` — `fp` = suspected false
-positives, `tp` = busy verdicts confirmed by a real packet, `fp%%` =
-integer false-positive rate. Only levels that have been probed print, so
-in auto mode you'll usually see the operating level and its frontier.
+`b` family base · `4s` 4 symbols · `iv` probe interval · `bc` busy cap.
+Then a **three-rung window** centred on the operating offset (`*` marks
+it): the frontier (one step more sensitive), the operating level, and one
+step less sensitive — exactly the three rungs the staircase reads to judge
+the local slope. Per level: `level(peak) probes busy fp tp fp%%` — `fp` =
+suspected false positives, `tp` = busy verdicts confirmed by a real
+signal, `fp%%` = integer false-positive rate.
 
 Here the staircase has already stepped to offset −1 (peak 20): the −1
 level is clean (0%) over 900 probes while −2 shows a 3% jump, so −1 is
-this site's knee.
+this site's knee. Remember (mental model above) these numbers describe the
+*faint* regime only — strong signals were prefiltered out before probing.
 
 ### Dry-run / manual tuning
 
@@ -183,6 +259,7 @@ a knee to resolve clearly, longer to capture day/night variation.
 | `set cad.auto <on\|off>` | **on** | Staircase controller acts on the stats. Off = observe/hand-tune. |
 | `set cad.offset <n>` | 0 | Operating offset, −8…12. Negative = more sensitive. Applied live. |
 | `set cad.probe.interval <sec>` | 15 | Probe cadence; 0 disables probing (and freezes auto), 10–255 otherwise. |
+| `set cad.busycap <pct>` | 25 | Faint-tolerance / airtime cap: raise detPeak once more than this % of (quiet-moment) probes trip on faint signals. Lower = reject faint/echo harder (busy backbones); 0 = off. 10–90 otherwise. |
 | `set cad.reset` | | Clear accumulated statistics (RAM only). |
 
 All settings persist in prefs and apply to every role — repeater, room

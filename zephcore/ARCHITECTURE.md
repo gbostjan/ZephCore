@@ -428,22 +428,39 @@ Algorithm in `triggerNoiseFloorCalibrate()`:
 ### 5.3.1 Adaptive CAD (LBT detPeak calibration)
 
 `cadDetPeak` is a correlation peak-to-noise threshold in the despreader (not
-dBm), so the right LBT sensitivity is site-dependent (chirp-like interference
-varies) and cannot be derived from the RSSI floor. `LoRaRadioBase::cadMaintenance()`
-(housekeeping tick) runs one calibration CAD probe per `cad.probe.interval`
-(default 60 s) at a signed **level** relative to the family's per-SF base
-detPeak, restarts RX, and classifies busy verdicts via a ground-truth filter
-(pre-probe RSSI near floor; post-busy ~8-symbol wait for real RX activity →
-`tp`, else suspected `fp`). Per-level counters decay 6-hourly and reset on any
-RF param change. With `cad.auto on`, a one-sided staircase steps the operating
-offset down when the frontier level shows FP ≤ 1% over ≥300 probes, up quickly
-when the operating level exceeds 2× target over ≥50 probes; offset clamped
-−4…+4, persisted via `Dispatcher::onCadOffsetChanged()`. Probe + offset plumbing
-is per-driver extension API (`*_cad_probe`, `*_cad_set_peak_offset`,
-`*_cad_base_peak`); LBT CAD runs 4 symbols (set in `buildModemConfig`), and the
-drivers scale their blocking-CAD timeout to `nSym·Tsym + margin`. CLI: `get cad`,
-`set cad.auto/offset/probe.interval/reset`. SX127x: unsupported (no HW CAD).
-User doc: `ADAPTIVE_CAD.md`.
+dBm): it gates on signal *strength* ≈ link budget, blind to distance, so
+raising it means "react to strong signals only, ignore faint/echo". The right
+LBT sensitivity is site-dependent and cannot be derived from the RSSI floor.
+`LoRaRadioBase::cadMaintenance()` (housekeeping tick) runs one calibration CAD
+probe per `cad.probe.interval` (default **15 s**) at a signed **level** relative
+to the family's per-SF base detPeak, restarts RX, and classifies busy verdicts
+with a ground-truth filter. **Key property:** the probe is *skipped* when RSSI >
+floor+7 dB, so probes only ever sample the quiet/faint regime — the whole loop
+is a faint-rejection tuner and `busy%` is faint-regime, not total occupancy.
+Post-busy classification watches a ~12-symbol window for RX re-sync **or** an
+RSSI climb above floor+guard (the energy path recovers real packets whose
+preamble the probe's RX-restart ate — the fix for the FP over-count that used to
+drive the staircase to the ceiling) → `tp`, else `fp`. Counters decay 6-hourly,
+reset on any RF param change.
+
+With `cad.auto on` the staircase is **knee-seeking**: probes sample op / op−1 /
+op+1 (½/¼/¼); it steps **up** when the level above is ≥`CAD_KNEE_SLOPE_PERMILLE`
+(5%) cleaner (steep side, below knee), **down** only on a clean flat plateau
+(`≤CAD_PLATEAU_CLEAN_PERMILLE`), else holds — slope-based so convergence is
+independent of a site's FP floor. Highest-priority override: **airtime / faint
+cap** — step up when the operating busy rate exceeds `cad_busycap` (percent,
+`set cad.busycap`, default 25, 0=off); self-targeting since only busy nodes
+reach it, and effectively a faint-tolerance dial (lower = reject faint harder).
+Each step needs ≥`CAD_STEP_MIN_PROBES` (120); offset clamped **−8…+12**,
+persisted via `Dispatcher::onCadOffsetChanged()`. Driver absolute clamp (SX126x
+15–40, LR 48–90) is a guardrail; AN1200.48 recommends 21–29 for SX126x (base
+`SF+13`), tuned to catch faint — LBT may deliberately sit above it. Probe +
+offset plumbing is per-driver extension API (`*_cad_probe`,
+`*_cad_set_peak_offset`, `*_cad_base_peak`); LBT CAD runs 4 symbols (set in
+`buildModemConfig`), drivers scale their blocking-CAD timeout to
+`nSym·Tsym + margin`. CLI: `get cad` (3-rung window, `*`=operating, `bc:`=cap),
+`set cad.auto/offset/probe.interval/busycap/reset`. SX127x: unsupported (no HW
+CAD). Full mental model + tuning: `ADAPTIVE_CAD.md`.
 
 ### 5.4 LR1110 Driver Errata Workarounds
 
