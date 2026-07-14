@@ -228,10 +228,7 @@ void CompanionMesh::begin()
 	/* Derive the v-contact pubkey from our identity: stable per node, unique
 	 * per device. Deliberately NOT a real keypair — no private key exists
 	 * anywhere, so nothing addressed to this key is decryptable by anyone. */
-	static const char vc_salt[] = "zc-vcontact";
-	mesh::Utils::sha256(_vcontact_pubkey, PUB_KEY_SIZE,
-		(const uint8_t *)vc_salt, sizeof(vc_salt) - 1,
-		self_id.pub_key, PUB_KEY_SIZE);
+	deriveVContactKey();
 	/* Stamp lastmod only if a time source already ran (hardware RTC restore
 	 * happens before begin()). Otherwise stay deferred (lastmod = 0) until
 	 * vcontactClockSynced() — an advert stamped now would show as 1970. */
@@ -978,6 +975,17 @@ void CompanionMesh::vcontactNotify(const char *text)
 	vcontactQueueText(text);
 }
 
+void CompanionMesh::deriveVContactKey()
+{
+	/* v-contact pubkey = SHA256("zc-vcontact" || self pubkey). Re-run whenever
+	 * the identity changes (boot, CMD_IMPORT_PRIVATE_KEY) so the key always
+	 * tracks the current identity. */
+	static const char vc_salt[] = "zc-vcontact";
+	mesh::Utils::sha256(_vcontact_pubkey, PUB_KEY_SIZE,
+		(const uint8_t *)vc_salt, sizeof(vc_salt) - 1,
+		self_id.pub_key, PUB_KEY_SIZE);
+}
+
 void CompanionMesh::vcontactPushAdvert()
 {
 	if (!isVContactEnabled()) return;
@@ -1092,6 +1100,27 @@ bool CompanionMesh::vcontactHandleFrame(const uint8_t *data, size_t len)
 			uint8_t rsp[CONTACT_FRAME_SIZE];
 			size_t n = serializeContact(rsp, vc, PACKET_CONTACT);
 			writeFrame(rsp, n);
+			return true;
+		}
+		return false;
+
+	case CMD_GET_ADVERT_PATH:
+		/* The v-contact appears in the app's contact list, so the app queries
+		 * its advert path (at connect, and around a config/identity import). The
+		 * v-contact has no over-the-air advert, so the real handler's
+		 * findAdvertPath() misses and returns ERR_NOT_FOUND — which the app
+		 * surfaces as a fatal "not found" that aborts the whole operation. The
+		 * v-contact IS this node (loopback), so its path is direct (zero hops):
+		 * answer that here, before the real handler runs. Frame layout matches
+		 * the real handler: [cmd][reserved][7-byte pubkey prefix]. */
+		if (len >= 2 + 7 && isVContactKey(&data[2], 7)) {
+			uint8_t rsp[6];
+			size_t i = 0;
+			rsp[i++] = PACKET_ADVERT_PATH;
+			put_le32(&rsp[i], _vcontact_lastmod ? _vcontact_lastmod
+				: (uint32_t)getRTCClock()->getCurrentTime()); i += 4;
+			rsp[i++] = 0;  // path_len = 0 → direct (zero hop)
+			writeFrame(rsp, i);
 			return true;
 		}
 		return false;
@@ -2858,7 +2887,18 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 				mesh::LocalIdentity new_identity;
 				new_identity.readFrom(&data[1], PRV_KEY_SIZE);
 				if (_store->saveMainIdentity(new_identity)) {
+					/* The v-contact key is derived from our identity, so it
+					 * changes with the new key. Tell the connected app to drop
+					 * the old v-contact (old key), re-derive, then re-advertise
+					 * the new one — otherwise the app's cached loopback contact
+					 * points at a key we no longer recognise (messaging + its
+					 * advert-path query break until a reboot re-syncs). Order
+					 * matters: delete uses the CURRENT (old) key. */
+					bool vc_was_enabled = isVContactEnabled();
+					if (vc_was_enabled) vcontactPushDeleted();
 					self_id = new_identity;
+					deriveVContactKey();
+					if (vc_was_enabled) vcontactPushAdvert();
 					/* Reload contacts to invalidate ECDH shared secrets */
 					resetContacts();
 					_store->loadContacts(this);

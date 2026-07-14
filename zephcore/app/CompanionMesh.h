@@ -523,6 +523,9 @@ private:
 	bool vcontactReady() { return isVContactEnabled() && _vcontact_lastmod != 0; }
 	void buildVContact(ContactInfo &c) const;
 	bool isVContactKey(const uint8_t *key, int prefix_len) const;
+	/** (Re)derive _vcontact_pubkey from the current identity. Call on boot and
+	 *  whenever the identity changes (CMD_IMPORT_PRIVATE_KEY). */
+	void deriveVContactKey();
 	/** Intercept protocol frames addressed to the v-contact. Returns true when
 	 *  the frame was fully handled (response already written). */
 	bool vcontactHandleFrame(const uint8_t *data, size_t len);

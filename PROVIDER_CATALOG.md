@@ -65,6 +65,20 @@ Notes on the mapping:
   boards without dedicated art fall back to a neutral LoRa icon. Swap in ZephCore-branded
   art by pointing `img` at your own absolute HTTPS URLs.
 
+> [!WARNING]
+> **The configurator's "Erase Flash" is not ZephCore-aware — do not use it on a ZephCore node.**
+> `erase` is a MeshCore device-level field, not a provider field, so a folded nRF52 device
+> inherits the *base* device's formatter (e.g. Wio Tracker L1 → `WioTrackerL1_QSPIFlash_Format`).
+> That formatter targets MeshCore/Ripple's flash layout, which does not match ZephCore's
+> LittleFS — so it performs a partial, inconsistent wipe (observed: nukes `channels`, leaves
+> identity/prefs/contacts) and can leave the filesystem half-corrupted. New tiles inherit no
+> `erase` at all, so Erase Flash is a no-op there.
+>
+> To factory-reset a ZephCore node, use ZephCore's own mechanism, which formats **all** of
+> `/lfs` + `/ext` (and the NVS bond partition) and reboots: the `erase` command over the USB
+> serial CLI, the companion app's factory reset, or simply reflash (ZephCore auto-formats on
+> first boot when it detects an incompatible/blank FS).
+
 ## Local test
 
 ```
