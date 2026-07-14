@@ -216,6 +216,7 @@ CompanionMesh::CompanionMesh(mesh::Radio &radio, mesh::MillisecondClock &ms, mes
 	_vcontact_recent_head = 0;
 	memset(_vcontact_pending, 0, sizeof(_vcontact_pending));
 	_vcontact_pending_count = 0;
+	_vcontact_hold_msgwait = false;
 	memset(&prefs, 0, sizeof(prefs));
 	prefs.node_lat = 0;
 	prefs.node_lon = 0;
@@ -949,7 +950,15 @@ void CompanionMesh::vcontactQueueText(const char *text)
 		p += adv;
 		remaining -= adv;
 	}
-	sendPush(PUSH_CODE_MSG_WAITING);
+	/* Suppress the "you have messages" prompt during the app's initial sync
+	 * (CMD_APP_START until the first PACKET_NO_MORE_MSGS). Sent mid-sync it
+	 * makes the app interleave message-sync into the contact stream and
+	 * truncate it. The message is already safe in the offline queue and the
+	 * app's own initial message-sync drains it — so no prompt is needed inside
+	 * the window. Outside it, the prompt goes out immediately. */
+	if (!_vcontact_hold_msgwait) {
+		sendPush(PUSH_CODE_MSG_WAITING);
+	}
 }
 
 void CompanionMesh::vcontactNotify(const char *text)
@@ -2038,6 +2047,10 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 		cancelSyncPending();
 		cleanupSignState();
 
+		/* New session: suppress v-contact notice MSG_WAITING until the initial
+		 * sync (contacts + messages) completes at PACKET_NO_MORE_MSGS. */
+		_vcontact_hold_msgwait = true;
+
 		/* If a time source already ran (hardware RTC, GPS), activate the
 		 * deferred v-contact and flush buffered notices for this session. */
 		vcontactClockSynced();
@@ -2513,6 +2526,15 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 			 * connection parameters now without disrupting
 			 * channel/contact/message throughput. */
 			zephcore_ble_conn_params_ready();
+
+			/* Full initial sync (contacts + messages) complete: stop
+			 * suppressing v-contact notice prompts. Any notice queued during
+			 * the window was just drained by this message-sync; if one raced in
+			 * after the last peek, prompt for it now. */
+			_vcontact_hold_msgwait = false;
+			if (_offline_queue_count > 0) {
+				sendPush(PUSH_CODE_MSG_WAITING);
+			}
 		}
 		return true;
 	}
@@ -2898,6 +2920,12 @@ bool CompanionMesh::handleProtocolFrame(const uint8_t *data, size_t len)
 					if (vc_was_enabled) vcontactPushDeleted();
 					self_id = new_identity;
 					deriveVContactKey();
+					/* New identity → old advert timestamp is meaningless. Clear
+					 * it so vcontactPushAdvert() re-activates cleanly: with a
+					 * valid clock it stamps + emits now; without one it defers
+					 * and vcontactClockSynced() (the lastmod==0 path) emits at the
+					 * next time-sync instead of only after a reboot. */
+					_vcontact_lastmod = 0;
 					if (vc_was_enabled) vcontactPushAdvert();
 					/* Reload contacts to invalidate ECDH shared secrets */
 					resetContacts();

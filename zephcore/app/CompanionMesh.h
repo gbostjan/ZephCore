@@ -519,6 +519,13 @@ private:
 	uint8_t _vcontact_recent_head;
 	char _vcontact_pending[2][64];   /* notices buffered while the clock is invalid */
 	uint8_t _vcontact_pending_count;
+	/* Suppress a v-contact notice's MSG_WAITING push during the app's initial
+	 * sync. Sent before/mid sync (e.g. the reboot-cause notice flushed at
+	 * CMD_SET_DEVICE_TIME) it makes the app interleave message-sync into the
+	 * contact stream, which trips the "reset iterator on any other command"
+	 * guard and truncates the sync. Held from CMD_APP_START until the first
+	 * PACKET_NO_MORE_MSGS (end of the contacts+messages initial sync). */
+	bool _vcontact_hold_msgwait;
 	bool vcontactClockValid();
 	bool vcontactReady() { return isVContactEnabled() && _vcontact_lastmod != 0; }
 	void buildVContact(ContactInfo &c) const;
