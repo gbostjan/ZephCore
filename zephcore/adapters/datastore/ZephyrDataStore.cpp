@@ -102,8 +102,28 @@ bool ZephyrDataStore::mount()
 		ext_lfs_mounted = true;
 		LOG_INF("External QSPI LittleFS at %s (automounted, 100 blobs)", extMountPoint());
 	} else {
+#if DT_NODE_EXISTS(DT_NODELABEL(qspi_lfs))
+		/* Boot-time automount can miss the QSPI on the first boot after a
+		 * factory-erase (blank flash) or an early-boot timing race with QSPI
+		 * init.  Retry the mount explicitly (fs_mount auto-formats blank flash,
+		 * and mounts valid data without touching it) so contacts/channels land
+		 * on /ext.  Without this the store silently falls back to internal /lfs,
+		 * and the next boot that does mount /ext runs a needless contact
+		 * migration — the "Migrating contacts to external storage" churn. */
+		FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(qspi_lfs));
+		int rc = fs_mount(&FS_FSTAB_ENTRY(DT_NODELABEL(qspi_lfs)));
+		if (is_mounted(extMountPoint())) {
+			ext_lfs_mounted = true;
+			LOG_INF("External QSPI LittleFS at %s (mounted on retry, rc=%d)",
+				extMountPoint(), rc);
+		} else {
+			ext_lfs_mounted = false;
+			LOG_WRN("External QSPI mount retry failed (rc=%d) - using internal only (20 blobs)", rc);
+		}
+#else
 		ext_lfs_mounted = false;
 		LOG_INF("External QSPI NOT mounted at %s - using internal only (20 blobs)", extMountPoint());
+#endif
 	}
 
 	return true;
@@ -370,6 +390,28 @@ bool ZephyrDataStore::formatFileSystem()
 	if (mounted) {
 		lfs_mounted = true;
 	}
+
+#if DT_NODE_EXISTS(DT_NODELABEL(qspi_lfs))
+	/* Remount external QSPI too.  We unmounted it above and flattened its
+	 * partition, so it must be re-mounted here — otherwise a runtime format
+	 * (factory reset, or the first-boot "no prefs" auto-format) leaves /ext
+	 * unmounted for the rest of the session.  begin() then reads
+	 * ext_lfs_mounted=false and the store falls back to internal /lfs, so
+	 * contacts/channels save to /lfs and get needlessly migrated back to /ext
+	 * on the next boot ("Migrating contacts to external storage" churn). */
+	{
+		FS_FSTAB_DECLARE_ENTRY(DT_NODELABEL(qspi_lfs));
+		int ext_rc = fs_mount(&FS_FSTAB_ENTRY(DT_NODELABEL(qspi_lfs)));
+		if (is_mounted(extMountPoint())) {
+			ext_lfs_mounted = true;
+			LOG_INF("formatFileSystem: /ext remounted (rc=%d)", ext_rc);
+		} else {
+			ext_lfs_mounted = false;
+			LOG_ERR("formatFileSystem: /ext remount failed (rc=%d)", ext_rc);
+		}
+	}
+#endif
+
 	LOG_INF("formatFileSystem: mount() returned %d", mounted ? 1 : 0);
 	return mounted;
 }
@@ -378,6 +420,12 @@ void ZephyrDataStore::factoryReset()
 {
 	LOG_INF("=== FACTORY RESET STARTING ===");
 	if (formatFileSystem()) {
+		/* Mark the freshly-formatted FS as ZephCore-initialised so the
+		 * post-reboot first-boot check (no prefs → format) doesn't format it a
+		 * SECOND time. That redundant format re-ran formatFileSystem() without
+		 * a following mount(), which is what used to leave /ext unmounted and
+		 * push contacts/channels onto internal flash. */
+		writeInitMarker();
 		LOG_INF("=== FACTORY RESET COMPLETE - REBOOT REQUIRED ===");
 	} else {
 		LOG_ERR("=== FACTORY RESET FAILED ===");

@@ -65,6 +65,22 @@ Notes on the mapping:
   boards without dedicated art fall back to a neutral LoRa icon. Swap in ZephCore-branded
   art by pointing `img` at your own absolute HTTPS URLs.
 
+- **Erase / "wipe settings" (nRF52) uses ZephCore's own formatter.** MeshCore's official erase
+  targets a different flash layout and only *partially* wipes a ZephCore node (observed on a Wio
+  Tracker L1: nuked `channels`, left identity/prefs/contacts, LittleFS half-corrupted). Since spec
+  §4a we override it: each nRF52 firmware option carries an `erase` pointing at ZephCore's
+  formatter. The formatter is **SoftDevice-specific** (v6 and v7 have different partition maps), so
+  `SOFTDEVICE` in the generator maps every nRF52 board to `SoftDevice_v6_formatter.zip` or
+  `SoftDevice_v7_formatter.zip`; `build.sh` publishes both from `formatter/` under stable, un-hashed
+  names so the erase URLs never change. The `.zip` drives the automated DFU erase flow; the `.uf2`
+  is published too as the manual drag-and-drop fallback.
+  - `erase` goes on the **firmware option**, never the device object — a device-level `erase` is an
+    official-only field that providers get silently ignored + warned for (§4a).
+  - ESP32 has no `erase` (the field is nRF52-only); `flash-wipe` already reinstalls cleanly.
+  - Users can still factory-reset on-device without the flasher: the `erase` command over the USB
+    serial CLI, the app's factory reset, or a reflash (ZephCore auto-formats on first boot when it
+    detects an incompatible/blank FS). All format `/lfs` + `/ext` + the NVS bond partition.
+
 ## Local test
 
 ```

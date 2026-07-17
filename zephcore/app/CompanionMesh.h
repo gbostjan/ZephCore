@@ -215,16 +215,16 @@ public:
 	bool continueContactIteration();
 
 	/**
-	 * Reset contact iterator (call when new command received).
-	 * Sends PACKET_CONTACT_END if iteration was in progress.
-	 */
-	void resetContactIterator();
-
-	/**
 	 * Cancel contact iteration silently (no frame sent).
 	 * Call on BLE disconnect — there's nobody to send CONTACT_END to.
 	 */
 	void cancelContactIterator() { _contact_iter_active = false; }
+
+	/** True while a contact dump is in progress (drives the stall watchdog). */
+	bool isContactIterActive() const { return _contact_iter_active; }
+
+	/** Dump progress cursor — the watchdog re-kicks only if this stops moving. */
+	int getContactIterIdx() const { return _contact_iter_idx; }
 
 	/**
 	 * Cancel pending message sync. Un-ACKed message stays in queue.
@@ -384,6 +384,12 @@ private:
 	/* Contact iteration state */
 	bool _contact_iter_active;
 	int _contact_iter_idx;
+	/* Table bound and v-contact inclusion are snapshotted at PACKET_CONTACT_START
+	 * so the dump can never stream more entries than the total it promised: the
+	 * table grows from inbound adverts mid-dump, and vcontactReady() flips false
+	 * ->true the moment a cold-booted clock goes valid (CMD_SET_DEVICE_TIME). */
+	int _contact_iter_num;
+	bool _contact_iter_vc;
 	uint32_t _contact_iter_lastmod;
 	uint32_t _contact_iter_since;  /* Filter: only send contacts with lastmod > this */
 
@@ -510,13 +516,29 @@ private:
 	VContactCLICallback _vcontact_cli_cb;
 	uint8_t _vcontact_pubkey[PUB_KEY_SIZE];
 	uint32_t _vcontact_lastmod;
-	uint32_t _vcontact_last_ts;      /* dedupe: app resends carry the same msg timestamp */
+	/* Dedupe app resends: a retry reuses the message timestamp (only the
+	 * attempt byte changes). The retry lands several seconds later, after other
+	 * messages, so a single last-seen slot misses it — track a ring of recent
+	 * timestamps instead. */
+	static const uint8_t VCONTACT_DEDUP_SLOTS = 16;
+	uint32_t _vcontact_recent_ts[VCONTACT_DEDUP_SLOTS];
+	uint8_t _vcontact_recent_head;
 	char _vcontact_pending[2][64];   /* notices buffered while the clock is invalid */
 	uint8_t _vcontact_pending_count;
+	/* Suppress a v-contact notice's MSG_WAITING push during the app's initial
+	 * sync. Sent before/mid sync (e.g. the reboot-cause notice flushed at
+	 * CMD_SET_DEVICE_TIME) it makes the app interleave message-sync into the
+	 * contact stream, which trips the "reset iterator on any other command"
+	 * guard and truncates the sync. Held from CMD_APP_START until the first
+	 * PACKET_NO_MORE_MSGS (end of the contacts+messages initial sync). */
+	bool _vcontact_hold_msgwait;
 	bool vcontactClockValid();
 	bool vcontactReady() { return isVContactEnabled() && _vcontact_lastmod != 0; }
 	void buildVContact(ContactInfo &c) const;
 	bool isVContactKey(const uint8_t *key, int prefix_len) const;
+	/** (Re)derive _vcontact_pubkey from the current identity. Call on boot and
+	 *  whenever the identity changes (CMD_IMPORT_PRIVATE_KEY). */
+	void deriveVContactKey();
 	/** Intercept protocol frames addressed to the v-contact. Returns true when
 	 *  the frame was fully handled (response already written). */
 	bool vcontactHandleFrame(const uint8_t *data, size_t len);

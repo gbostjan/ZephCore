@@ -944,7 +944,11 @@ void CommonCLI::handleCommand(uint32_t sender_timestamp, const char* command, ch
                 float old_freq = _prefs->freq;
                 _prefs->freq = f;
                 savePrefs();
-                _prefs->freq = old_freq;
+                /* Keep _prefs->freq = f in RAM so a later savePrefs() (from any
+                 * other "set" command before reboot) can't rewrite the old freq
+                 * back; freeze the running radio on the old freq until reboot,
+                 * mirroring the "set radio" handler above. */
+                _callbacks->freezeRadioParams(old_freq, _prefs->bw, _prefs->sf, _prefs->cr);
                 strcpy(reply, "OK - reboot to apply");
             } else {
                 strcpy(reply, "Error: range 150-2500 MHz");

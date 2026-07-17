@@ -278,11 +278,14 @@ config ZEPHCORE_BLE_PASSKEY
 
 config ZEPHCORE_BLE_QUEUE_SIZE
 	int "BLE TX/RX message queue depth"
-	default 12
+	default 24
 	range 4 64
 	help
 	  Number of frames that can be queued for BLE TX/RX.
 	  Larger = better buffering for bursty traffic, more RAM.
+	  24 absorbs the app's bursty CMD_GET_CHANNEL pipelining during
+	  channel sync (it fires up to MAX_CHANNELS requests back-to-back);
+	  at 12 the recv queue overran and dropped requests, stalling sync.
 
 config ZEPHCORE_BLE_CONN_MIN_INTERVAL
 	int "BLE minimum connection interval (units: 1.25ms)"
