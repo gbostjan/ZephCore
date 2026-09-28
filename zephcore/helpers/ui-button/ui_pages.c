@@ -17,9 +17,11 @@
 #include "ui_pages.h"
 #include "ui_task.h"
 #include "display.h"
+#include <helpers/buzzer_gate.h>
 
 #include <time_sync.h>
-#include <ZephyrSensorManager.h>
+#include <ZephyrGPSManager.h>
+#include <ZephyrEnvSensors.h>
 
 #include <zephyr/kernel.h>
 #include <stdio.h>
@@ -45,6 +47,15 @@ LOG_MODULE_REGISTER(ui_pages, CONFIG_ZEPHCORE_BOARD_LOG_LEVEL);
  *   DOTS_Y..SEP_Y:    Page indicator dots + separator line
  *   CONTENT_Y..end:    Page-specific content
  */
+/* Full-scale end of the radio page's TX power bar.  The board's configured
+ * ceiling when it has one (same symbol CommonCLI clamps "set tx" against),
+ * else the common SX126x/LR11xx maximum. */
+#ifdef CONFIG_ZEPHCORE_MAX_TX_POWER_DBM
+#define TX_POWER_BAR_MAX_DBM  CONFIG_ZEPHCORE_MAX_TX_POWER_DBM
+#else
+#define TX_POWER_BAR_MAX_DBM  22
+#endif
+
 #define FONT_W       mc_display_font_width()
 #define FONT_H       mc_display_font_height()
 #define DISP_W       mc_display_width()
@@ -83,20 +94,26 @@ static inline int ui_content_y(void)
  * mc_display_has_color(); monochrome displays keep the existing CFB path. */
 #define UI_COLOR_BG         MC_COLOR_BLACK
 #define UI_COLOR_HEADER_BG  0x2104  /* dark neutral panel */
-#define UI_COLOR_TITLE      0xffde  /* warm white */
+#define UI_COLOR_TITLE      MC_COLOR_LIGHT_GRAY  /* soft white, slightly recessed vs values */
 #define UI_COLOR_LABEL      MC_COLOR_WHITE  /* small-TFT gamma renders mid-gray near-black */
 #define UI_COLOR_VALUE      MC_COLOR_WHITE
-#define UI_COLOR_OK         0x07e0
+#define UI_COLOR_OK         MC_COLOR_GREEN
 #define UI_COLOR_ACTIVE     UI_COLOR_OK
 #define UI_COLOR_WARN       0xffa0
 #define UI_COLOR_ERROR      MC_COLOR_RED
-#define UI_COLOR_DIM        0x4208
-#define UI_COLOR_DISABLED   UI_COLOR_DIM  /* off/disabled states stay as faint as possible */
+#define UI_COLOR_DIM        MC_COLOR_LIGHT_GRAY  /* small-TFT gamma (T114) crushes anything
+						  * darker toward black — in person this reads
+						  * as a proper gray, not white (PR #62) */
+#define UI_COLOR_DISABLED   UI_COLOR_DIM  /* off/disabled states dimmer than values */
+#define UI_COLOR_FAINT      0x4208  /* dark structural fills (badge bg, separators, bar tracks) —
+				     * decoration, must stay subtle so content pops against it */
 #define UI_COLOR_TX         MC_COLOR_ORANGE
 #define UI_COLOR_RX         UI_COLOR_OK
 
-#define COLOR_FONT_W 6
-#define COLOR_FONT_H 8
+/* Glyph cell of the color renderer (display.c upscales the 6x8 font under
+ * LARGE_FONT) — NOT the CFB font metrics, which can differ (10x16 vs 9x12). */
+#define COLOR_FONT_W  mc_display_color_font_width()
+#define COLOR_FONT_H  mc_display_color_font_height()
 #define ACTIVITY_GRAPH_SAMPLES 16
 
 /* Vertically center `total` rows of text within the content area and
@@ -177,17 +194,29 @@ static const enum ui_page active_pages[] = {
 /* Current index into active_pages[] */
 static int current_page_idx;
 
-/* ========== Helper: Battery Percentage from mV ========== */
-
-static uint8_t calc_battery_pct(uint16_t mv)
+/* ========== Helper: local wall clock ==========
+ *
+ * state.rtc_epoch is ALWAYS UTC.  The timezone offset is applied here, at
+ * format time, and nowhere else: shifting the clock itself would read as a
+ * backward jump to every timestamp consumer on the node (advert timestamps,
+ * the repeater ACL's monotonic gate, MeshTimeSync), and a backward clock is a
+ * silent mesh-wide mute.  Never write these values back into state. */
+static uint32_t local_epoch(void)
 {
-	if (mv >= 4200) {
-		return 100;
+	return state.rtc_epoch + (int32_t)state.tz_offset * 3600;
+}
+
+/* The zone the displayed digits are actually in: "UTC", "UTC+2", "UTC-11".
+ * Static buffer -- every caller is on the UI thread inside ui_pages_render(). */
+static const char *tz_label(void)
+{
+	static char label[8];
+
+	if (state.tz_offset == 0) {
+		return "UTC";
 	}
-	if (mv <= 3000) {
-		return 0;
-	}
-	return (uint8_t)((mv - 3000) * 100 / 1200);
+	snprintf(label, sizeof(label), "UTC%+d", (int)state.tz_offset);
+	return label;
 }
 
 /* ========== Helper: Top Bar (Node Name + Battery) ========== */
@@ -223,7 +252,7 @@ static void render_top_bar(void)
 	 * Before sync, getCurrentTime() returns bare uptime (~seconds),
 	 * so check for a sane epoch (after Jan 1 2025 = 1735689600). */
 	if (state.rtc_epoch > 1735689600) {
-		uint32_t day_sec = state.rtc_epoch % 86400;
+		uint32_t day_sec = local_epoch() % 86400;
 		uint8_t hh = day_sec / 3600;
 		uint8_t mm = (day_sec % 3600) / 60;
 
@@ -237,9 +266,6 @@ static void render_top_bar(void)
 	if (state.battery_mv > 0) {
 		uint8_t pct = state.battery_pct;
 
-		if (pct == 0) {
-			pct = calc_battery_pct(state.battery_mv);
-		}
 		snprintf(right + pos, sizeof(right) - pos, "%u%%", pct);
 	}
 
@@ -251,9 +277,6 @@ static void render_top_bar(void)
 		if (state.battery_mv > 0) {
 			uint8_t pct = state.battery_pct;
 
-			if (pct == 0) {
-				pct = calc_battery_pct(state.battery_mv);
-			}
 			batt_color = (pct <= 15) ? UI_COLOR_ERROR :
 				     (pct <= 30) ? UI_COLOR_WARN : UI_COLOR_OK;
 		}
@@ -330,7 +353,7 @@ static void render_page_indicator(void)
 
 	/* Separator line below dots */
 	if (color) {
-		mc_display_color_fill_rect(0, SEP_Y, DISP_W, 1, UI_COLOR_DIM);
+		mc_display_color_fill_rect(0, SEP_Y, DISP_W, 1, UI_COLOR_FAINT);
 	} else {
 		mc_display_hline(0, SEP_Y, DISP_W);
 	}
@@ -364,7 +387,7 @@ static void draw_color_segments_at(int x, int y, const char *label,
 				   const char *value, uint16_t value_color)
 {
 	mc_display_color_text(x, y, label, UI_COLOR_LABEL);
-	x += (int)strlen(label) * 6;
+	x += (int)strlen(label) * COLOR_FONT_W;
 	mc_display_color_text(x, y, value, value_color);
 }
 
@@ -383,7 +406,7 @@ static void draw_badge(int x, int y, const char *text, uint16_t color)
 {
 	int w = color_text_width(text) + 4;
 
-	mc_display_color_fill_rect(x, y - 1, w, COLOR_FONT_H + 2, UI_COLOR_DIM);
+	mc_display_color_fill_rect(x, y - 1, w, COLOR_FONT_H + 2, UI_COLOR_FAINT);
 	mc_display_color_text(x + 2, y, text, color);
 }
 
@@ -405,7 +428,7 @@ static void draw_metric_bar(int x, int y, int w, int h, int value,
 
 	int filled = (w * value) / max_value;
 
-	mc_display_color_fill_rect(x, y, w, h, UI_COLOR_DIM);
+	mc_display_color_fill_rect(x, y, w, h, UI_COLOR_FAINT);
 	if (filled > 0) {
 		mc_display_color_fill_rect(x, y, filled, h, color);
 	}
@@ -494,7 +517,7 @@ static void draw_activity_graph(int x, int y, int w, int h)
 	sample_activity_graph();
 
 	mc_display_color_fill_rect(x, y, w, h, UI_COLOR_BG);
-	mc_display_color_fill_rect(x, mid, w, 1, UI_COLOR_DIM);
+	mc_display_color_fill_rect(x, mid, w, 1, UI_COLOR_FAINT);
 
 	for (int i = 0; i < ACTIVITY_GRAPH_SAMPLES; i++) {
 		uint8_t idx = (uint8_t)((activity_head + 1U + i) %
@@ -570,8 +593,7 @@ static void render_tiny_title(void)
 
 	if (state.battery_mv > 0) {
 		char buf[8];
-		uint8_t pct = state.battery_pct ? state.battery_pct
-					        : calc_battery_pct(state.battery_mv);
+		uint8_t pct = state.battery_pct;
 
 		snprintf(buf, sizeof(buf), "%u%%", pct);
 		draw_centered(centered_row(1, rows), buf);
@@ -789,14 +811,11 @@ static void render_radio_mono(void)
 	const char *rx_mode = state.lora_rx_duty_cycle ? "DC" : "CONT";
 
 	if (ui_tiny()) {
-		int tx = state.lora_effective_tx_power > 0
-			 ? state.lora_effective_tx_power : state.lora_tx_power;
-
 		snprintf(buf, sizeof(buf), "%u.%uM", freq_mhz, freq_frac / 100);
 		draw_centered(centered_row(0, 3), buf);
 		snprintf(buf, sizeof(buf), "SF%u BW%u", state.lora_sf, bw_int);
 		draw_centered(centered_row(1, 3), buf);
-		snprintf(buf, sizeof(buf), "P%d %s", tx, rx_mode);
+		snprintf(buf, sizeof(buf), "P%d %s", state.lora_tx_power, rx_mode);
 		draw_centered(centered_row(2, 3), buf);
 		return;
 	}
@@ -817,20 +836,8 @@ static void render_radio_mono(void)
 	mc_display_text(0, y, buf, false);
 	y += LINE_H;
 
-	if (state.lora_apc_enabled) {
-		snprintf(buf, sizeof(buf), "TX:%d/%ddBm APC:on",
-			 state.lora_effective_tx_power, state.lora_tx_power);
-	} else {
-		snprintf(buf, sizeof(buf), "TX:%ddBm APC:off", state.lora_tx_power);
-	}
-	mc_display_text(0, y, buf, false);
-	y += LINE_H;
-
-	snprintf(buf, sizeof(buf), "R%d M%d.%d T%u %s/%s",
-		 state.lora_apc_reduction,
-		 state.lora_apc_margin_x10 / 10,
-		 abs(state.lora_apc_margin_x10 % 10),
-		 state.lora_apc_target_margin, packet_state, rx_mode);
+	snprintf(buf, sizeof(buf), "TX:%ddBm %s/%s",
+		 state.lora_tx_power, packet_state, rx_mode);
 	mc_display_text(0, y, buf, false);
 	y += LINE_H;
 
@@ -853,20 +860,18 @@ static void render_radio_color(void)
 	uint16_t bw_frac = state.lora_bw_khz_x10 % 10;
 	const char *packet_state = radio_state_label();
 	const char *rx_mode = state.lora_rx_duty_cycle ? "DC" : "CONT";
-	uint16_t warn_color = (state.lora_apc_enabled && state.lora_apc_reduction > 0)
-			      ? UI_COLOR_WARN : UI_COLOR_OK;
 
 	{
 		uint16_t state_color = state.lora_tx_active ? UI_COLOR_WARN :
 				       state.lora_in_rx ? UI_COLOR_ACTIVE :
 				       state.lora_radio_ready ? UI_COLOR_OK
 							      : UI_COLOR_DISABLED;
-		uint16_t tx_color = (state.lora_apc_enabled &&
-				     state.lora_apc_reduction > 0)
-				    ? UI_COLOR_WARN : UI_COLOR_OK;
-		int max_tx = state.lora_tx_power > 0 ? state.lora_tx_power : 22;
-		int eff_tx = state.lora_effective_tx_power > 0
-			     ? state.lora_effective_tx_power : state.lora_tx_power;
+		uint16_t tx_color = UI_COLOR_OK;
+		/* Scale the TX bar against the board's hardware ceiling, not
+		 * against the current setting — the old max came from APC
+		 * (effective vs. configured power) and with APC gone both ends
+		 * would be lora_tx_power, pinning the bar permanently full. */
+		int max_tx = TX_POWER_BAR_MAX_DBM;
 		int badge_x;
 
 		mc_display_color_fill_rect(0, y - 1, DISP_W, COLOR_FONT_H + 2,
@@ -895,25 +900,10 @@ static void render_radio_color(void)
 		draw_color_segments(y, "LoRa ", buf, UI_COLOR_VALUE);
 		y += LINE_H;
 
-		if (state.lora_apc_enabled) {
-			snprintf(buf, sizeof(buf), "%d/%ddBm",
-				 state.lora_effective_tx_power, state.lora_tx_power);
-		} else {
-			snprintf(buf, sizeof(buf), "%ddBm", state.lora_tx_power);
-		}
+		snprintf(buf, sizeof(buf), "%ddBm", state.lora_tx_power);
 		draw_color_segments(y, "TX ", buf, tx_color);
-		draw_metric_bar(DISP_W - 50, y + 2, 48, 5, eff_tx, max_tx, tx_color);
-		y += LINE_H;
-
-		snprintf(buf, sizeof(buf), "red %d M%d.%d T%u",
-			 state.lora_apc_reduction,
-			 state.lora_apc_margin_x10 / 10,
-			 abs(state.lora_apc_margin_x10 % 10),
-			 state.lora_apc_target_margin);
-		draw_color_segments(y, "APC ", buf, warn_color);
-		draw_badge(DISP_W - color_text_width("APC") - 4, y, "APC",
-			   !state.lora_apc_enabled ? UI_COLOR_DISABLED :
-			   state.lora_apc_reduction > 0 ? UI_COLOR_WARN : UI_COLOR_OK);
+		draw_metric_bar(DISP_W - 50, y + 2, 48, 5, state.lora_tx_power,
+				max_tx, tx_color);
 		y += LINE_H;
 
 		char rx_count[6];
@@ -1053,7 +1043,7 @@ static void render_bluetooth_color(void)
 			      !state.ble_enabled ? "disabled" :
 			      state.ble_connected ? "connected" : "advertising",
 			      color);
-	y += LINE_H + 4;
+	y += LINE_H + (FONT_H / 4);
 	draw_centered_color(y,
 			    state.ble_enabled ? "Press to disable"
 					      : "Press to enable",
@@ -1104,7 +1094,7 @@ static void render_advert_color(void)
 
 	draw_badge(0, y, "ADV", just_sent ? UI_COLOR_OK : UI_COLOR_ACTIVE);
 	mc_display_color_text(32, y, "Zero-hop advert", UI_COLOR_VALUE);
-	y += LINE_H + 2;
+	y += LINE_H + (FONT_H / 2);
 
 	if (just_sent) {
 		draw_centered_color(y,
@@ -1283,13 +1273,15 @@ static void render_buzzer(void)
 	char buf[24];
 	int y = CONTENT_Y;
 
-	snprintf(buf, sizeof(buf), "Buzzer: %s",
-		 state.buzzer_quiet ? "off" : "on");
+	uint8_t next = zephcore_buzzer_next_mode(state.buzzer_mode);
+
+	snprintf(buf, sizeof(buf), "Alert: %s",
+		 zephcore_buzzer_mode_name(state.buzzer_mode));
 	mc_display_text(0, y, buf, false);
 	y += LINE_H;
 
-	draw_centered(y + 8,
-			  state.buzzer_quiet ? "Press to Enable" : "Press to Disable");
+	snprintf(buf, sizeof(buf), "Press for %s", zephcore_buzzer_mode_name(next));
+	draw_centered(y + 8, buf);
 }
 
 static void render_leds_mono(void)
@@ -1385,12 +1377,10 @@ static void render_sensors(void)
 
 	/* Battery at bottom */
 	snprintf(buf, sizeof(buf), "Batt: %u%% (%umV)",
-		 state.battery_pct > 0 ? state.battery_pct
-					   : calc_battery_pct(state.battery_mv),
+		 state.battery_pct,
 		 state.battery_mv);
 	if (color) {
-		uint8_t pct = state.battery_pct > 0 ? state.battery_pct
-						    : calc_battery_pct(state.battery_mv);
+		uint8_t pct = state.battery_pct;
 		uint16_t batt_color = (pct <= 15) ? UI_COLOR_ERROR :
 				      (pct <= 30) ? UI_COLOR_WARN : UI_COLOR_OK;
 
@@ -1568,18 +1558,18 @@ static void render_status(void)
 		draw_centered(centered_row(0, 3), buf);
 
 		if (state.rtc_epoch > 1735689600) {
-			uint32_t ds = state.rtc_epoch % 86400;
+			uint32_t ds = local_epoch() % 86400;
 
-			snprintf(buf, sizeof(buf), "%02u:%02u UTC",
-				 (unsigned)(ds / 3600), (unsigned)((ds % 3600) / 60));
+			snprintf(buf, sizeof(buf), "%02u:%02u %s",
+				 (unsigned)(ds / 3600), (unsigned)((ds % 3600) / 60),
+				 tz_label());
 		} else {
 			snprintf(buf, sizeof(buf), "no time");
 		}
 		draw_centered(centered_row(1, 3), buf);
 
 		if (state.battery_mv > 0) {
-			uint8_t pct = state.battery_pct ? state.battery_pct
-						        : calc_battery_pct(state.battery_mv);
+			uint8_t pct = state.battery_pct;
 
 			snprintf(buf, sizeof(buf), "Batt %u%%", pct);
 			draw_centered(centered_row(2, 3), buf);
@@ -1612,12 +1602,16 @@ static void render_status(void)
 
 	/* Clock — only if RTC has been synced (after Jan 1 2025) */
 	if (state.rtc_epoch > 1735689600) {
-		uint32_t day_sec = state.rtc_epoch % 86400;
+		uint32_t day_sec = local_epoch() % 86400;
 		uint8_t hh = day_sec / 3600;
 		uint8_t mm = (day_sec % 3600) / 60;
 		uint8_t ss = day_sec % 60;
 
-		snprintf(buf, sizeof(buf), "Time: %02u:%02u:%02u UTC", hh, mm, ss);
+		/* "T:" rather than "Time:" so a two-digit zone still fits the
+		 * 20-column budget of the 200x200 e-paper boards, which pair
+		 * CONFIG_ZEPHCORE_DISPLAY_LARGE_FONT (10x16) with this page. */
+		snprintf(buf, sizeof(buf), "T: %02u:%02u:%02u %s", hh, mm, ss,
+			 tz_label());
 		if (color) {
 			draw_color_segments(y, "CLK ", buf, UI_COLOR_OK);
 		} else {
@@ -1627,7 +1621,7 @@ static void render_status(void)
 		if (color) {
 			draw_color_segments(y, "CLK ", "not synced", UI_COLOR_WARN);
 		} else {
-			mc_display_text(0, y, "Time: not synced", false);
+			mc_display_text(0, y, "T: not synced", false);
 		}
 	}
 	y += LINE_H;
@@ -1636,9 +1630,6 @@ static void render_status(void)
 	if (state.battery_mv > 0) {
 		uint8_t pct = state.battery_pct;
 
-		if (pct == 0) {
-			pct = calc_battery_pct(state.battery_mv);
-		}
 		snprintf(buf, sizeof(buf), "Batt: %u%% (%umV)", pct, state.battery_mv);
 		if (color) {
 			uint16_t batt_color = (pct <= 15) ? UI_COLOR_ERROR :

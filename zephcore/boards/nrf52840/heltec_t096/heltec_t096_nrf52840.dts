@@ -71,10 +71,27 @@
 		long-delay-ms = <1000>;
 	};
 
+	/*
+	 * Input filter: user button multi-tap detection.
+	 *
+	 * Page navigation is the most frequent action on a multi-page screen, so
+	 * previous-page takes the 2-tap slot here (as on the Wireless Tracker)
+	 * and the toggles shift down one.  The stock 3-tap buzzer slot is not
+	 * carried over: T096 has no buzzer, and CONFIG_ZEPHCORE_UI_BUZZER=n
+	 * compiles action_buzzer_toggle() down to an empty body, so that gesture
+	 * was dead.  Screenless boards keep the stock order — page-prev would be
+	 * a no-op there and would only push the LED toggle further out.
+	 *
+	 *   1 tap  (400ms wait) → KEY_1    = page next
+	 *   2 taps (400ms wait) → KEY_LEFT = page previous
+	 *   3 taps (400ms wait) → KEY_B    = LED heartbeat toggle
+	 *   4 taps (400ms wait) → KEY_C    = GPS on/off
+	 *   5 taps (immediate)  → KEY_E    = flood advert
+	 */
 	user_btn_multitap {
 		compatible = "zephcore,input-multi-tap";
 		input-codes = <INPUT_KEY_A>;
-		tap-codes = <INPUT_KEY_1 INPUT_KEY_B INPUT_KEY_D INPUT_KEY_C INPUT_KEY_E>;
+		tap-codes = <INPUT_KEY_1 INPUT_KEY_LEFT INPUT_KEY_B INPUT_KEY_C INPUT_KEY_E>;
 		tap-delay-ms = <400>;
 	};
 
@@ -87,6 +104,13 @@
 		regulator-name = "gps-power";
 		enable-gpios = <&gpio0 6 GPIO_ACTIVE_LOW>;
 		regulator-boot-on;
+		/* The module's requirement. It runs at boot (Zephyr 3b4821f1ba6,
+		 * pinned from 1.17.5; it was skipped before), but nothing here
+		 * depends on it: gnss-nmea-generic never
+		 * probes the receiver — it attaches a UART and parses whatever
+		 * arrives, so an unpowered module means no sentences yet, not a
+		 * failed init. ZephyrGPSManager owns the rail at runtime via
+		 * chosen { zephcore,gps-power }. */
 		startup-delay-us = <10000>;
 	};
 
@@ -105,6 +129,10 @@
 		regulator-name = "vfem-enable";
 		enable-gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;
 		regulator-boot-on;
+		/* The FEM's requirement. It runs at boot (Zephyr 3b4821f1ba6,
+		 * pinned from 1.17.5; it was skipped before), but nothing depends
+		 * on it: the FEM is a passive gain block with no bus to probe —
+		 * nothing addresses it at init. */
 		startup-delay-us = <1000>;
 	};
 
@@ -124,6 +152,11 @@
 		regulator-name = "tft-pwr-enable";
 		enable-gpios = <&gpio0 26 GPIO_ACTIVE_HIGH>;
 		regulator-boot-on;
+		/* The panel's requirement. It runs at boot (Zephyr 3b4821f1ba6,
+		 * pinned from 1.17.5; it was skipped before), but do not rely on
+		 * it alone: the real settle time comes from the ST7735R
+		 * driver's own mipi_dbi_reset() + exit-sleep delay, at
+		 * DISPLAY_INIT_PRIORITY 85 against this rail's 75. */
 		startup-delay-us = <10000>;
 	};
 
@@ -173,7 +206,9 @@
 			reg = <0>;
 			width = <160>;
 			height = <80>;
-			inversion-on;
+			/* No inversion-on: the mono_tft wrapper writes 0xFFFF for a lit
+			 * pixel and 0x0000 for background, so INV_ON paints a light
+			 * background with dark text.  The UI is drawn light-on-dark. */
 			x-offset = <0>;
 			y-offset = <24>;
 			madctl = <0xa8>;
@@ -295,15 +330,17 @@
 
 		/*
 		 * KCT8103L PA/FEM control:
-		 * - PA_CSD P0.12 -> CSD, active-HIGH FEM enable.
-		 * - PA_CTX P1.09 -> CTX, HIGH for TX in the existing ZephCore
-		 *   SX1262 tx-enable model. MeshCore uses the same net for
-		 *   TX/LNA-bypass control.
+		 * - PA_CSD P0.12 -> CSD, active-HIGH FEM enable, low only in sleep.
+		 * - PA_CTX P1.09 -> CTX, the receive-path select: LOW routes RX
+		 *   through the LNA, HIGH bypasses it.  Held HIGH in TX, where
+		 *   the receive branch is inert.  This is lna-bypass-gpios, not
+		 *   tx-enable-gpios — it enables nothing.
 		 * - PA_CPS is not an MCU GPIO on T096; it is the SX1262 DIO2
-		 *   net into the KCT8103L CPS pin, so use dio2-tx-enable.
+		 *   net into the KCT8103L CPS pin, so use dio2-tx-enable.  That
+		 *   is what does the TX/RX switching and leaves CTX free.
 		 */
 		antenna-enable-gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>; /* PA_CSD */
-		tx-enable-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;       /* PA_CTX */
+		lna-bypass-gpios = <&gpio1 9 GPIO_ACTIVE_HIGH>;      /* PA_CTX */
 		dio2-tx-enable;                                      /* PA_CPS */
 
 		dio3-tcxo-voltage = <SX126X_DIO3_TCXO_1V8>;

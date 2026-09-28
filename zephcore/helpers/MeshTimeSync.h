@@ -20,24 +20,24 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <mesh/RTC.h>
+#include <mesh/MeshCore.h>
 
 #ifdef CONFIG_ZEPHCORE_TIMESYNC_TABLE_SIZE
-  #define MESHTIMESYNC_TABLE_SIZE  CONFIG_ZEPHCORE_TIMESYNC_TABLE_SIZE
+	#define MESHTIMESYNC_TABLE_SIZE  CONFIG_ZEPHCORE_TIMESYNC_TABLE_SIZE
 #else
-  #define MESHTIMESYNC_TABLE_SIZE  32
+	#define MESHTIMESYNC_TABLE_SIZE  32
 #endif
 
 #ifdef CONFIG_ZEPHCORE_TIMESYNC_QUORUM
-  #define MESHTIMESYNC_QUORUM  CONFIG_ZEPHCORE_TIMESYNC_QUORUM
+	#define MESHTIMESYNC_QUORUM  CONFIG_ZEPHCORE_TIMESYNC_QUORUM
 #else
-  #define MESHTIMESYNC_QUORUM  6
+	#define MESHTIMESYNC_QUORUM  6
 #endif
 
 #ifndef FIRMWARE_BUILD_EPOCH
-  /* Injected by CMakeLists.txt (build-time UNIX epoch, the "provably dead
-   * clock" floor). 0 disables bootstrap mode entirely. */
-  #define FIRMWARE_BUILD_EPOCH 0u
+	/* Injected by CMakeLists.txt (build-time UNIX epoch, the "provably dead
+	 * clock" floor). 0 disables bootstrap mode entirely. */
+	#define FIRMWARE_BUILD_EPOCH 0u
 #endif
 
 class MeshTimeSync {
@@ -134,6 +134,18 @@ public:
 	 * its wall-clock-anchored bookkeeping by lastStepDelta(). The caller
 	 * gates on its own enable pref. */
 	bool runTick(mesh::RTCClock &rtc);
+
+	/* Milliseconds until runTick() would next actually evaluate (it no-ops
+	 * in between).  Lets a deadline-driven event loop size its sleep instead
+	 * of calling this on a fixed cadence.  Callers still gate on their own
+	 * enable pref — a disabled time sync has no deadline at all. */
+	uint32_t msUntilNextEval(uint32_t uptime_secs) const
+	{
+		if (_next_eval_uptime == 0 || uptime_secs >= _next_eval_uptime) {
+			return 0;
+		}
+		return (_next_eval_uptime - uptime_secs) * 1000U;
+	}
 
 	/* Manual clock set (CLI time/clock sync, app time set, SNTP): arms the
 	 * 7-day suppression window AND drift-envelope pedigree. Suppression

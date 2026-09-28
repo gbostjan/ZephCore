@@ -12,21 +12,20 @@
 #include <mesh/Dispatcher.h>
 #include <mesh/StaticPoolPacketManager.h>
 #include <mesh/Identity.h>
-#include <mesh/RNG.h>
-#include <mesh/RTC.h>
+#include <mesh/MeshCore.h>
 #include <helpers/MeshTimeSync.h>
 #include <helpers/NodePrefs.h>
 #include "RepeaterDataStore.h"
 #include "observer_creds.h"
 
 #ifndef FIRMWARE_VERSION
-  // Real version injected by CMakeLists.txt (-DFIRMWARE_VERSION); this fallback
-  // only applies to builds that bypass that injection and should never surface.
-  #define FIRMWARE_VERSION   "v0.0.0-dev"
+	// Real version injected by CMakeLists.txt (-DFIRMWARE_VERSION); this fallback
+	// only applies to builds that bypass that injection and should never surface.
+	#define FIRMWARE_VERSION   "v0.0.0-dev"
 #endif
 
 #ifndef FIRMWARE_BUILD_DATE
-  #define FIRMWARE_BUILD_DATE   __DATE__
+	#define FIRMWARE_BUILD_DATE   __DATE__
 #endif
 
 namespace mesh {
@@ -45,7 +44,6 @@ class ObserverMesh : public Dispatcher {
 	NodePrefs         _prefs;
 	RepeaterDataStore *_store;
 	struct ObserverCreds *_creds;
-	RNG               *_rng;
 	RTCClock          *_rtc;
 
 	/* Pre-built MQTT topic strings (set in begin()) */
@@ -69,11 +67,12 @@ protected:
 	void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
 	/* Capture score (called between logRxRaw and onRecvPacket) */
 	void logRx(Packet *packet, int len, float score) override;
+	void logTx(Packet *packet, int len) override;
 	/* Build JSON and enqueue to MQTT publisher */
 	DispatcherAction onRecvPacket(Packet *pkt) override;
 
 public:
-	ObserverMesh(Radio &radio, MillisecondClock &ms, RNG &rng, RTCClock &rtc);
+	ObserverMesh(Radio &radio, MillisecondClock &ms, RTCClock &rtc);
 
 	/* Initialize: load/generate identity, load/init prefs, start radio RX. */
 	void begin(RepeaterDataStore *store, struct ObserverCreds *creds);

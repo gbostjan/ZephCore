@@ -7,8 +7,8 @@
 #include "observer_creds.h"
 
 #include <mesh/Utils.h>
-#include <mesh/LoRaConfig.h>
-#include <adapters/radio/LoRaRadioBase.h>
+#include <adapters/radio/LoRaRadio.h>
+#include <adapters/rng/ZephyrRNG.h>   /* generateFirstBootIdentity (hardened keygen) */
 #include <helpers/MeshcoreJson.h>
 
 #include <zephyr/logging/log.h>
@@ -20,6 +20,7 @@ LOG_MODULE_REGISTER(zephcore_observer, CONFIG_ZEPHCORE_OBSERVER_LOG_LEVEL);
 #include <time.h>
 
 #include <ZephyrMQTTPublisher.h>
+#include <helpers/PacketLog.h>
 
 /* Forward declaration — implemented in ZephyrWiFiStation.c */
 extern "C" {
@@ -32,10 +33,10 @@ namespace mesh {
 
 /* ========== Construction ========== */
 
-ObserverMesh::ObserverMesh(Radio &radio, MillisecondClock &ms, RNG &rng, RTCClock &rtc)
+ObserverMesh::ObserverMesh(Radio &radio, MillisecondClock &ms, RTCClock &rtc)
 	: Dispatcher(radio, ms, _pkt_mgr),
 	  _last_rssi(0.0f), _last_score(0.0f), _last_raw_len(0),
-	  _store(nullptr), _creds(nullptr), _rng(&rng), _rtc(&rtc), _start_uptime_secs(0)
+	  _store(nullptr), _creds(nullptr), _rtc(&rtc), _start_uptime_secs(0)
 {
 	memset(_pubkey_hex, 0, sizeof(_pubkey_hex));
 	memset(_packets_topic, 0, sizeof(_packets_topic));
@@ -52,25 +53,27 @@ void ObserverMesh::begin(RepeaterDataStore *store, struct ObserverCreds *creds)
 
 	/* Initialize prefs with observer-specific defaults */
 	initNodePrefs(&_prefs);
-	_prefs.cr           = 5;   /* CR 4/5 */
+	_prefs.cr           = 5;   /* CR 4/5 (same as initNodePrefs; kept explicit) */
 	_prefs.tx_power_dbm = 0;   /* observer never TXes anyway */
-	/* freq=869.618, bw=62.5, sf=8 already set by initNodePrefs */
+	/* freq=869.618, bw=62.5, sf=7 already set by initNodePrefs */
 
-	/* Load persisted prefs (overrides defaults with saved values) */
-	if (!_store->loadPrefs(_prefs)) {
-		/* First boot — save observer defaults */
-		_store->savePrefs(_prefs);
-	}
+	/* Persisted prefs override the defaults above; on a fresh unit the store
+	 * saves these defaults as they are. */
+	_store->loadPrefs(_prefs);
 
-	/* Load or generate node identity */
+	/* Load or generate node identity.
+	 *
+	 * Use ZephyrRNG::generateFirstBootIdentity — the SAME hardened path the
+	 * companion and repeater use (bootloader_random-seeded HWRNG + two-clock
+	 * beat, conditioned via AES-256-CTR) — NOT LocalIdentity(_rng). The old
+	 * form drew straight from ZephyrRNG::random() / sys_csrand_get, which on
+	 * an ESP32 observer is unseeded (BLE never comes up to seed WDEV_RANDOM),
+	 * so it derived a permanent key from a weak PRNG. generateFirstBootIdentity
+	 * also owns the reserved-prefix retry (100 attempts + panic backstop),
+	 * replacing the weaker 10-try loop that silently kept a reserved prefix. */
 	if (!_store->loadIdentity(_self_id)) {
 		LOG_INF("No identity found — generating new keypair");
-		int attempts = 0;
-		do {
-			_self_id = LocalIdentity(_rng);
-			attempts++;
-		} while (attempts < 10 &&
-			 (_self_id.pub_key[0] == 0x00 || _self_id.pub_key[0] == 0xFF));
+		mesh::ZephyrRNG::generateFirstBootIdentity(_self_id);
 		_store->saveIdentity(_self_id);
 		LOG_INF("New observer identity saved");
 	}
@@ -121,10 +124,11 @@ void ObserverMesh::buildStatusJson(const char *status, char *out, size_t out_siz
 		uptime_secs,
 		0u,                                              /* debug_flags */
 		0u,                                              /* queue_len */
-		((LoRaRadioBase *)_radio)->getNoiseFloor(),
+		((LoRaRadio *)_radio)->getNoiseFloor(),
 		0u,                                              /* tx_air_secs */
 		0u,                                              /* rx_air_secs */
-		((LoRaRadioBase *)_radio)->getPacketsRecvErrors(),
+		((LoRaRadio *)_radio)->getPacketsRecvErrors(),
+		false,                                           /* repeat: observer never forwards */
 	};
 	meshcore_build_status_json(out, out_size, &sj);
 }
@@ -166,8 +170,14 @@ void ObserverMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len)
 
 void ObserverMesh::logRx(Packet *packet, int len, float score)
 {
-	(void)packet; (void)len;
+	packet_log_rx(getLogDateTime(), packet, _radio->getLastRSSI(), score, _radio->getEstAirtimeFor(len));
 	_last_score = score;
+}
+
+void ObserverMesh::logTx(Packet *packet, int len)
+{
+	(void)len;
+	packet_log_tx(getLogDateTime(), packet);
 }
 
 void ObserverMesh::enqueuePacket(Packet *pkt)
@@ -405,14 +415,18 @@ bool ObserverMesh::handleCLI(const char *command, char *reply, int reply_size)
 			float f = (float)atof(val);
 			/* Accept Hz (e.g. 869618000) or MHz (e.g. 869.618) */
 			if (f > 1000000.0f) f /= 1000000.0f;
-			if (f >= 150.0f && f <= 2500.0f) {
+			/* 300..1000 MHz is not the radio's limit — it is what
+			 * RepeaterDataStore::loadPrefs() accepts on the way back in.
+			 * Anything outside it saves fine and is then silently reset to
+			 * defaults on the next boot, taking bw/sf/cr/tx_power with it, so
+			 * refuse it here rather than hand back a value that won't survive. */
+			if (f >= 300.0f && f <= 1000.0f) {
 				_prefs.freq = f;
 				_store->savePrefs(_prefs);
-				((LoRaRadioBase *)_radio)->reconfigureWithParams(
-					_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+				((LoRaRadio *)_radio)->reconfigure();
 				snprintf(reply, reply_size, "freq=%.3f MHz", (double)_prefs.freq);
 			} else {
-				snprintf(reply, reply_size, "ERR freq out of range");
+				snprintf(reply, reply_size, "ERR freq must be 300-1000 MHz");
 			}
 
 		} else if ((val = find_val(rest, "sf")) != nullptr) {
@@ -420,8 +434,7 @@ bool ObserverMesh::handleCLI(const char *command, char *reply, int reply_size)
 			if (sf >= 7 && sf <= 12) {
 				_prefs.sf = (uint8_t)sf;
 				_store->savePrefs(_prefs);
-				((LoRaRadioBase *)_radio)->reconfigureWithParams(
-					_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+				((LoRaRadio *)_radio)->reconfigure();
 				snprintf(reply, reply_size, "sf=%u", _prefs.sf);
 			} else {
 				snprintf(reply, reply_size, "ERR sf must be 7-12");
@@ -438,14 +451,17 @@ bool ObserverMesh::handleCLI(const char *command, char *reply, int reply_size)
 			} else {
 				bw = (float)atof(val);
 			}
-			if (bw > 0.0f) {
+			/* Bounds mirror loadPrefs()'s validator — see the freq
+			 * case above for why the CLI must not accept what it will reject.
+			 * Shared definition in NodePrefs.h; the upper bound is 1000 on
+			 * LR2021 builds, which are the only ones with the wide set. */
+			if (bw >= ZC_RADIO_BW_MIN_KHZ && bw <= ZC_RADIO_BW_MAX_KHZ) {
 				_prefs.bw = bw;
 				_store->savePrefs(_prefs);
-				((LoRaRadioBase *)_radio)->reconfigureWithParams(
-					_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+				((LoRaRadio *)_radio)->reconfigure();
 				snprintf(reply, reply_size, "bw=%.2f kHz", (double)_prefs.bw);
 			} else {
-				snprintf(reply, reply_size, "ERR invalid bw");
+				snprintf(reply, reply_size, "ERR bw must be 7-500 kHz (or index 0-5)");
 			}
 
 		} else if ((val = find_val(rest, "cr")) != nullptr) {
@@ -453,8 +469,7 @@ bool ObserverMesh::handleCLI(const char *command, char *reply, int reply_size)
 			if (cr >= 5 && cr <= 8) {
 				_prefs.cr = (uint8_t)cr;
 				_store->savePrefs(_prefs);
-				((LoRaRadioBase *)_radio)->reconfigureWithParams(
-					_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+				((LoRaRadio *)_radio)->reconfigure();
 				snprintf(reply, reply_size, "cr=%u", _prefs.cr);
 			} else {
 				snprintf(reply, reply_size, "ERR cr must be 5-8");

@@ -1,0 +1,66 @@
+# https://editorconfig.org
+
+root = true
+
+# Defaults: LF everywhere, tabs for indentation. `.gitattributes` mirrors the
+# LF default as Git's normalization fallback.
+#
+# Tab width is 8, the Zephyr convention: existing "tab indent + space
+# alignment" continuation lines in the tree only line up at width 8.
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = tab
+indent_size = tab
+tab_width = 8
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Markdown: trailing double-space is a hard line break.
+[*.md]
+trim_trailing_whitespace = false
+
+# Patches: context lines and blank-line markers carry significant whitespace.
+[*.{patch,diff}]
+trim_trailing_whitespace = false
+insert_final_newline = unset
+indent_style = unset
+indent_size = unset
+
+# YAML cannot be indented with tabs.
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+# Python, shell and PowerShell: 4 spaces, matching their tree-wide use.
+[*.{py,sh,ps1}]
+indent_style = space
+indent_size = 4
+
+# CMake: spaces. Width is left to the file (the main CMakeLists.txt nests in
+# 2s, the tool apps in 4s).
+[{CMakeLists.txt,*.cmake}]
+indent_style = space
+indent_size = unset
+
+# Files ported from Arduino MeshCore ("Shared" class, devdocs/HLD.md §9) keep
+# upstream's text verbatim, so a diff against upstream shows only our intentional
+# changes, each fenced `// ZEPHCORE:`. Upstream mixes 2-space and tab indentation
+# and has trailing whitespace, so none of it is enforced here. Add a file to this
+# list when it is converted to upstream shape.
+[{zephcore/src/Mesh.cpp,zephcore/src/Dispatcher.cpp,zephcore/src/Packet.cpp,zephcore/src/StaticPoolPacketManager.cpp,zephcore/include/mesh/MeshCore.h,zephcore/include/mesh/Dispatcher.h,zephcore/include/mesh/Mesh.h,zephcore/include/mesh/Packet.h,zephcore/include/mesh/Identity.h,zephcore/include/mesh/Utils.h,zephcore/include/mesh/SimpleMeshTables.h,zephcore/include/mesh/StaticPoolPacketManager.h,zephcore/helpers/BaseChatMesh.cpp,zephcore/helpers/BaseChatMesh.h,zephcore/helpers/ContactInfo.h,zephcore/helpers/ChannelDetails.h,zephcore/helpers/ClientACL.cpp,zephcore/helpers/ClientACL.h,zephcore/helpers/RegionMap.cpp,zephcore/helpers/RegionMap.h,zephcore/helpers/TransportKeyStore.cpp,zephcore/helpers/TransportKeyStore.h,zephcore/helpers/BaseSerialInterface.h,zephcore/helpers/MultiSerialInterface.h,zephcore/helpers/ConfigSerializer.cpp,zephcore/helpers/ConfigSerializer.h,zephcore/helpers/SensorManager.h,zephcore/helpers/sensors/LPPDataHelpers.h}]
+indent_style = unset
+indent_size = unset
+tab_width = unset
+trim_trailing_whitespace = false
+
+# Third-party license texts are kept verbatim.
+[{LICENSE,*LICENSE*.txt,*_license.txt}]
+indent_style = unset
+indent_size = unset
+trim_trailing_whitespace = unset
+insert_final_newline = unset
+
+# Windows batch and command scripts: the one CRLF exception to the LF default.
+[*.{bat,cmd}]
+end_of_line = crlf

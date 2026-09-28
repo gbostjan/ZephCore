@@ -17,7 +17,9 @@
 #include <string.h>
 #include <math.h>
 
-#include "lr11xx_lora.h"
+#include <zephyr/drivers/lora/lr11xx_lora.h>
+#include <zephyr/drivers/lora/zc_lora_timing.h>
+#include "lr11xx_cad_peak.h"
 #include "lr11xx_hal_zephyr.h"
 #include "lr11xx_radio.h"
 #include "lr11xx_radio_types.h"
@@ -31,6 +33,26 @@ LOG_MODULE_REGISTER(lr11xx_lora, CONFIG_LORA_LOG_LEVEL);
  * system work queue so USB/BLE/timer work items cannot delay packet RX. */
 #define LR11XX_DIO1_WQ_STACK_SIZE 2560
 K_THREAD_STACK_DEFINE(lr11xx_dio1_wq_stack, LR11XX_DIO1_WQ_STACK_SIZE);
+
+/* Wedge-recovery watchdog — its own low-priority queue so the confirm poll
+ * (a BUSY-high dwell of up to LR11XX_WEDGE_CONFIRM_MS) never blocks DIO1 RX
+ * processing. */
+#define LR11XX_WEDGE_WQ_STACK_SIZE 1024
+K_THREAD_STACK_DEFINE(lr11xx_wedge_wq_stack, LR11XX_WEDGE_WQ_STACK_SIZE);
+
+#define LR11XX_WEDGE_CHECK_MS   3000  /* base cadence between health checks     */
+#define LR11XX_WEDGE_IDLE_MS   12000  /* only probe after this much DIO1 silence */
+#define LR11XX_WEDGE_CONFIRM_MS  250  /* continuous BUSY-high past this = wedged */
+
+/* GetVersion "use case" byte — which member of the family answered. */
+#define LR11XX_TYPE_LR1110  0x01
+#define LR11XX_TYPE_LR1120  0x02
+#define LR11XX_TYPE_LR1121  0x03
+
+/* Below 0x0303 SetLoRaSyncWord is ignored and the radio is deaf to the mesh.
+ * Logged, not refused (upstream refuses): a diagnosable radio beats an absent
+ * one, and the firmware seen in the field (0x0307, 0x0401) clears it. */
+#define LR11XX_MIN_FW_SYNC_WORD  0x0303
 
 /* ── Driver data structures ─────────────────────────────────────────── */
 
@@ -85,20 +107,31 @@ struct lr11xx_data {
 
 	/* Stored duty-cycle timing from recv_duty_cycle() — the re-arm paths
 	 * (start_rx / restart_rx) reuse these exact values, never recompute:
-	 * window sizing is owned by the adapter layer (LoRaRadioBase). */
+	 * window sizing is owned by the adapter layer (LoRaRadio). */
 	uint32_t dc_rx_ms;
 	uint32_t dc_sleep_ms;
+
+	/* Duty-cycle false-preamble re-arms (UM §7.2.6: the 2*Rx+Sleep window
+	 * expired with no packet). `get dc.restarts`. */
+	atomic_t dc_timeout_restarts;
 
 	/* CAD state */
 	lora_cad_cb cad_cb;
 	void *cad_user_data;
 	struct k_sem cad_sem;
 	int cad_result;
-	bool cad_active;
+	/* No cad_active flag (the SX126x needs one; this driver does not): the DIO1
+	 * handler and every CAD entry point hold spi_mutex, so they cannot
+	 * interleave, and lr11xx_do_cad() clears any TIMEOUT latched before it. */
 	/* Adaptive-CAD: signed offset applied to the per-SF base detPeak on
 	 * every LBT CAD; cad_probe_peak overrides for one calibration probe. */
 	int8_t cad_peak_offset;
 	uint8_t cad_probe_peak;
+	/* CAD_RX probe bookkeeping: cad_exit_rx marks the CAD in flight as a probe
+	 * whose positive verdict continues into Rx; cad_rx_state records which
+	 * terminal interrupt (packet or timeout) resolved it. */
+	bool cad_exit_rx;
+	atomic_t cad_rx_state;
 
 	/* Deferred hardware init — heavy SPI/radio work runs on first config() */
 	bool hw_initialized;
@@ -108,23 +141,56 @@ struct lr11xx_data {
 	 * the LR1110 is hung — trigger a hardware reset. */
 	int dio1_stuck_count;
 
-	/* Timestamp (k_uptime_get_32(), ms) of the first sighting of a
-	 * latched PREAMBLE_DETECTED by lr11xx_is_receiving() in the current
-	 * RX cycle; 0 = none tracked.  Ported from the SX126x preamble-grace
-	 * logic: PREAMBLE_DETECTED is not DIO1-routed but latches in the IRQ
-	 * status register, and the chip never auto-clears it on a foreign
-	 * sync word — without a software bound a foreign/noise preamble pins
-	 * the TX gate until the next DIO1 bulk-clear or the dispatcher's 4 s
-	 * CAD-fail recovery.  Real packets latch SYNC_WORD_HEADER_VALID
-	 * within the grace window; after grace expires with no header, the
-	 * bit is cleared and TX released.  All accesses under spi_mutex. */
+	/* First sighting of a latched PREAMBLE_DETECTED by the poll (ms, 0 = none).
+	 * Not DIO1-routed and never auto-cleared on a foreign sync word, so it is
+	 * released after the SF-aware grace. Under spi_mutex. */
 	uint32_t preamble_seen_at_ms;
+
+	/* When SYNC_WORD_HEADER_VALID was seen (ms, 0 = no payload phase). Stamped
+	 * by the DIO1 handler (the only RX-busy signal with a duty cycle armed) and
+	 * by the poll; released after lr11xx_max_payload_ms(), because continuous
+	 * RX has no timer to end a packet that never completes. Writes under
+	 * spi_mutex. */
+	uint32_t header_seen_at_ms;
+
+	/* Last DIO1 proof of life, for the wedge watchdog (BUSY stuck high, DIO1
+	 * silent: a command that raced the DC sleep phase). */
+	uint32_t last_dio1_ms;
+	struct k_work_delayable wedge_work;
+	struct k_work_q wedge_wq;
 
 	/* RX data buffer — filled in DIO1 handler, passed to callback */
 	uint8_t rx_buf[256];
 };
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
+
+/* Reset all software state that says "we are currently receiving": the
+ * preamble-grace timestamp and the payload-phase deadline.  Paired write so
+ * the two never drift out of sync — same shape as the SX126x driver's
+ * sx126x_reset_rx_busy_signals().  Called from every RX (re)start site and
+ * before TX / CAD entry. */
+/* cad_rx_state values -- see the field comment in the data struct. */
+#define LR11XX_CAD_RX_IDLE   0
+#define LR11XX_CAD_RX_ARMED  1
+#define LR11XX_CAD_RX_PACKET 2
+#define LR11XX_CAD_RX_TMOUT  3
+
+/* Resolve an in-flight CAD_RX with the terminal event that just arrived.
+ * A no-op unless one is armed, so the packet path pays one atomic compare.
+ * Returns true when this call is the one that resolved it, which is also how
+ * the caller tells "the probe's own cad_timeout" apart from an unrelated
+ * timeout that happens to raise the same IRQ. */
+static inline bool lr11xx_cad_rx_resolve(struct lr11xx_data *data, int outcome)
+{
+	return atomic_cas(&data->cad_rx_state, LR11XX_CAD_RX_ARMED, outcome);
+}
+
+static inline void lr11xx_reset_rx_busy_signals(struct lr11xx_data *data)
+{
+	data->preamble_seen_at_ms = 0;
+	data->header_seen_at_ms = 0;
+}
 
 static lr11xx_radio_lora_bw_t bw_enum_to_lr11xx(enum lora_signal_bandwidth bw)
 {
@@ -167,19 +233,7 @@ static lr11xx_system_tcxo_supply_voltage_t get_tcxo_voltage(uint16_t mv)
 /* Get kHz value from Zephyr BW enum — needed for duty cycle timing */
 static float bw_enum_to_khz(enum lora_signal_bandwidth bw)
 {
-	switch (bw) {
-	case BW_7_KHZ:   return 7.81f;
-	case BW_10_KHZ:  return 10.42f;
-	case BW_15_KHZ:  return 15.63f;
-	case BW_20_KHZ:  return 20.83f;
-	case BW_31_KHZ:  return 31.25f;
-	case BW_41_KHZ:  return 41.67f;
-	case BW_62_KHZ:  return 62.5f;
-	case BW_125_KHZ: return 125.0f;
-	case BW_250_KHZ: return 250.0f;
-	case BW_500_KHZ: return 500.0f;
-	default:         return 125.0f;
-	}
+	return lr11xx_radio_get_lora_bw_in_hz(bw_enum_to_lr11xx(bw)) / 1000.0f;
 }
 
 /* ── Hardware reset (BUSY stuck recovery) ───────────────────────────── */
@@ -236,6 +290,14 @@ static void lr11xx_hardware_reset(struct lr11xx_data *data,
 
 /* ── Apply modem configuration ──────────────────────────────────────── */
 
+/* Share the LDRO decision between the hardware and its airtime estimate. */
+static uint8_t lr11xx_ldro(const struct lora_modem_config *mc)
+{
+	uint32_t bw_hz = lr11xx_radio_get_lora_bw_in_hz(bw_enum_to_lr11xx(mc->bandwidth));
+	uint32_t symbol_time_us = ((1U << (uint8_t)mc->datarate) * 1000000U) / bw_hz;
+	return symbol_time_us > 16380;
+}
+
 static void lr11xx_apply_modem_config(struct lr11xx_data *data,
 				      const struct lr11xx_config *cfg,
 				      bool tx_mode)
@@ -245,16 +307,11 @@ static void lr11xx_apply_modem_config(struct lr11xx_data *data,
 
 	lr11xx_radio_set_rf_freq(ctx, mc->frequency);
 
-	/* LDRO must be enabled when symbol time > 16.38ms (SF11+/BW125 etc) */
-	uint32_t bw_hz = (uint32_t)(bw_enum_to_khz(mc->bandwidth) * 1000.0f);
-	uint32_t symbol_time_us = ((1U << (uint8_t)mc->datarate) * 1000000U) / bw_hz;
-	uint8_t ldro = (symbol_time_us > 16380) ? 1 : 0;
-
 	lr11xx_radio_mod_params_lora_t mod = {
 		.sf   = (lr11xx_radio_lora_sf_t)mc->datarate,
 		.bw   = bw_enum_to_lr11xx(mc->bandwidth),
 		.cr   = cr_enum_to_lr11xx(mc->coding_rate),
-		.ldro = ldro,
+		.ldro = lr11xx_ldro(mc),
 	};
 	lr11xx_radio_set_lora_mod_params(ctx, &mod);
 
@@ -293,22 +350,22 @@ static void lr11xx_apply_modem_config(struct lr11xx_data *data,
 		LR11XX_SYSTEM_IRQ_RX_DONE | LR11XX_SYSTEM_IRQ_TX_DONE |
 		LR11XX_SYSTEM_IRQ_TIMEOUT | LR11XX_SYSTEM_IRQ_CRC_ERROR |
 		LR11XX_SYSTEM_IRQ_HEADER_ERROR |
-		/* CAD_DONE/CAD_DETECTED MUST be redirected to DIO1 or the blocking
-		 * LBT CAD (run before every TX, cad.mode=LBT) never completes — its
-		 * semaphore is signaled from the DIO1 handler, so without this the
-		 * CAD times out (~200ms) every TX and LBT is dead. The SDK redirects
-		 * no IRQ to DIO by default; the SX126x driver keeps these in its mask
-		 * too. CAD_DONE only sets during a CAD op, so it's inert during RX. */
+		/* HEADER_VALID on DIO1: the only thing that can stamp header_seen_at_ms
+		 * while a duty cycle forbids the poll any bus access. Safe to route (at
+		 * most once per real packet, after sync word + header CRC), unlike
+		 * PREAMBLE_DETECTED; same split as the SX126x. */
+		LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID |
+		/* CAD_DONE/DETECTED on DIO1, or the blocking LBT CAD never completes (its
+		 * semaphore is given by the DIO1 handler). Inert outside a CAD. */
 		LR11XX_SYSTEM_IRQ_CAD_DONE | LR11XX_SYSTEM_IRQ_CAD_DETECTED,
 		0);
 }
 
-/* ── RX duty cycle — disabled on LR1110 ─────────────────────────────── */
+/* ── RX duty cycle ──────────────────────────────────────────────────── */
 
-/* LR1110 SetRxDutyCycle is fundamentally broken: both MODE_RX and
- * MODE_CAD fail to detect in-progress preambles, dropping 23-40% of
- * packets depending on the sleep fraction.  The SX1262 handles this
- * correctly.  LR1110 always uses continuous RX instead. */
+/* SetRxDutyCycle(MODE_RX): a preamble detect extends the window to
+ * 2*rx + sleep natively, so no StopTimerOnPreamble and no parked-RX
+ * watchdog are needed. Window sizing belongs to the adapter. */
 
 /* ── Start RX (internal) ────────────────────────────────────────────── */
 
@@ -327,20 +384,15 @@ static void lr11xx_start_rx(struct lr11xx_data *data,
 	}
 
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
-	data->preamble_seen_at_ms = 0;
+	lr11xx_reset_rx_busy_signals(data);
 
 	/* Apply modem config for RX */
 	lr11xx_apply_modem_config(data, cfg, false);
 
-	/* Apply RX boost — persistent register, only written once.
-	 * Deferred from hw_init to here so radio is fully configured.
-	 * In duty-cycle mode we force a re-apply on every (re)start: the
-	 * chip's sleep-with-retention warm wakes are autonomous (no IRQ per
-	 * wake, so software can't intervene mid-cycle), and we don't want to
-	 * assume the boost register survives them — cheap insurance against
-	 * the SX126x-style silent -3 dB loss across warm starts. */
-	if (data->rx_boost_enabled &&
-	    (!data->rx_boost_applied || data->rx_duty_cycle_enabled)) {
+	/* RX boost, written once. Not re-applied per duty-cycle re-arm: the LR11xx
+	 * retains its configuration across the sleep phase (UM §7.2.6); only the
+	 * SX126x needs a retention list. Do not port that fix here by analogy. */
+	if (data->rx_boost_enabled && !data->rx_boost_applied) {
 		lr11xx_radio_cfg_rx_boosted(ctx, true);
 		data->rx_boost_applied = true;
 	}
@@ -361,13 +413,8 @@ static void lr11xx_start_rx(struct lr11xx_data *data,
 		lr11xx_radio_set_rx_with_timeout_in_rtc_step(ctx, 0xFFFFFF);
 	}
 
-	/* LR1110 firmware sets CMD_ERROR IRQ flag on several write commands
-	 * (SetModParams, SetSyncWord, SetRxBoosted, SetRx) across all
-	 * tested FW versions (0x0307, 0x0401).  The commands succeed —
-	 * status byte returns OK, BUSY deasserts normally, radio operates
-	 * correctly.  RadioLib has the same behavior but never notices
-	 * because it doesn't read the IRQ register after write commands.
-	 * Clear here so CMD_ERROR doesn't leak into the DIO1 handler. */
+	/* LR1110 firmware raises a benign CMD_ERROR on several writes (all FW);
+	 * clear it so it does not leak into the DIO1 handler. */
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
 
 	data->in_rx_mode = true;
@@ -376,19 +423,20 @@ static void lr11xx_start_rx(struct lr11xx_data *data,
 
 /* ── Lightweight RX restart (no modem reconfig) ─────────────────────── */
 
-/* Used after RX done / CRC error / timeout — frequency/modulation unchanged,
- * skip most of lr11xx_apply_modem_config.
- * Full lr11xx_start_rx() kept for initial start and TX→RX.
- *
- * Packet params are NOT re-applied here — they persist through SetRx.
- * RadioLib (Arduino) also skips re-applying packet params on RX restart.
- * Only TX changes pld_len, and TX→RX goes through full start_rx(). */
-static void lr11xx_restart_rx(struct lr11xx_data *data)
+/* Lightweight RX re-arm after RX done / error / timeout: modulation and
+ * packet params persist through SetRx (TX->RX takes the full start_rx()). */
+/* Returns 0 if the receiver is believed back on air, <0 if SetStandby was
+ * rejected (escalate). Not verified after SetRxDutyCycle: that GetStatus
+ * NSS edge would end the cycle it checks. */
+/* `in_standby`: the chip is already in STDBY_RC (after RX_DONE the loop
+ * returns to that fallback), so skip the standby and its probe on the
+ * per-packet path. False where the loop may still be running. */
+static int lr11xx_restart_rx(struct lr11xx_data *data, bool in_standby)
 {
 	void *ctx = &data->hal_ctx;
 
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
-	data->preamble_seen_at_ms = 0;
+	lr11xx_reset_rx_busy_signals(data);
 
 	if (data->rx_duty_cycle_enabled &&
 	    data->dc_rx_ms != 0 && data->dc_sleep_ms != 0) {
@@ -396,22 +444,343 @@ static void lr11xx_restart_rx(struct lr11xx_data *data)
 		 * or a false-preamble 2*rx+sleep timeout dropped the chip to
 		 * standby).  Re-apply boost — same warm-start caution as
 		 * start_rx. */
-		if (data->rx_boost_enabled) {
-			lr11xx_radio_cfg_rx_boosted(ctx, true);
+
+		/* SetStandby first: after a header error the cycle is still running, and
+		 * an NSS edge into a live cycle is the race UM §7.2.6 warns about (seen on
+		 * the LR2021 as CMD_ERROR + DIO1 stuck high). Free when already in standby. */
+		if (!in_standby) {
+			lr11xx_system_set_standby(ctx,
+						  LR11XX_SYSTEM_STANDBY_CFG_RC);
+
+			/* Safe to poll: the standby above ended any live cycle,
+			 * so this NSS edge has nothing left to disturb.  A chip
+			 * that will not even take a SetStandby will not take a
+			 * duty cycle either. */
+			lr11xx_system_stat1_t s1 = { 0 };
+
+			if (lr11xx_system_get_status(ctx, &s1, NULL, NULL) ==
+				    LR11XX_STATUS_OK &&
+			    s1.command_status != LR11XX_SYSTEM_CMD_STATUS_OK &&
+			    s1.command_status != LR11XX_SYSTEM_CMD_STATUS_DATA) {
+				LOG_WRN("restart_rx: standby rejected (cmd=%d) "
+					"before duty-cycle re-arm",
+					(int)s1.command_status);
+				return -EIO;
+			}
 		}
+
+		/* No boost re-apply: retained across the duty-cycle sleep, see
+		 * the note in lr11xx_start_rx().  This is the per-packet hot
+		 * path — the write bought nothing and cost a command on it. */
 		lr11xx_radio_set_rx_duty_cycle(ctx, data->dc_rx_ms,
 			data->dc_sleep_ms, LR11XX_RADIO_RX_DUTY_CYCLE_MODE_RX);
-	} else {
-		lr11xx_radio_set_rx_with_timeout_in_rtc_step(ctx, 0xFFFFFF);
-		/* RX boost persists through SetRx — no re-apply needed. */
+		data->in_rx_mode = true;
+		return 0;
 	}
 
+	lr11xx_radio_set_rx_with_timeout_in_rtc_step(ctx, 0xFFFFFF);
+	/* RX boost persists through SetRx — no re-apply needed. */
 	data->in_rx_mode = true;
+
+	/* No duty cycle armed, so polling is free of the NSS hazard. */
+	{
+		lr11xx_system_stat2_t s2 = { 0 };
+
+		if (lr11xx_system_get_status(ctx, NULL, &s2, NULL) ==
+			    LR11XX_STATUS_OK &&
+		    s2.chip_mode != LR11XX_SYSTEM_CHIP_MODE_RX) {
+			LOG_WRN("restart_rx: chip is in mode %d, not RX",
+				(int)s2.chip_mode);
+			return -EIO;
+		}
+	}
+	return 0;
 }
 
 /* ── DIO1 IRQ handler (work queue, thread context) ──────────────────── */
 
 static void lr11xx_dio1_callback(void *user_data);
+
+static uint32_t lr11xx_cad_rx_timeout_steps(struct lr11xx_data *data);
+
+/* The DIO1 handler is one pass over the IRQ word, case by case, in this order.
+ * Each case helper runs with spi_mutex held. A helper returns true when it has
+ * released the mutex to invoke a callback, and the handler then returns at
+ * once; otherwise it reports through *rx_restarted whether it left the receiver
+ * running, which the safety net at the end relies on. */
+
+/* ── RX done ──
+ * Deliver unless CRC_ERROR, or HEADER_ERROR with no valid header. A header
+ * error during a valid header is a foreign signal; keep the packet
+ * (RadioLib's rule; dropping these cost ~7-10% under load). */
+static bool lr11xx_irq_rx_done(struct lr11xx_data *data, uint32_t irq,
+			       bool hdr_valid_seen, bool *rx_restarted)
+{
+	void *ctx = &data->hal_ctx;
+
+	if (!(irq & LR11XX_SYSTEM_IRQ_RX_DONE) ||
+	    (irq & LR11XX_SYSTEM_IRQ_CRC_ERROR) ||
+	    ((irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) && !hdr_valid_seen)) {
+		return false;
+	}
+
+	lr11xx_radio_rx_buffer_status_t rx_stat;
+	lr11xx_radio_get_rx_buffer_status(ctx, &rx_stat);
+
+	if (rx_stat.pld_len_in_bytes > 0 &&
+	    rx_stat.pld_len_in_bytes <= 255) {
+		lr11xx_radio_pkt_status_lora_t pkt_stat;
+		lr11xx_radio_get_lora_pkt_status(ctx, &pkt_stat);
+
+		lr11xx_regmem_read_buffer8(ctx, data->rx_buf,
+					   rx_stat.buffer_start_pointer,
+					   rx_stat.pld_len_in_bytes);
+
+		/* Buffer-shift errata: a coalesced foreign HEADER_ERROR drifts the next
+		 * read by +4; standby resets it, after the payload is captured. */
+		if (irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) {
+			lr11xx_system_set_standby(ctx,
+						  LR11XX_SYSTEM_STANDBY_CFG_RC);
+		}
+
+		/* LR1110 errata: RX buffer base shifts 4 bytes per
+		 * received packet.  Without clearing, after ~64
+		 * packets the offset wraps the 256-byte buffer and
+		 * corrupts data.  RadioLib does the same clear. */
+		lr11xx_regmem_clear_rxbuffer(ctx);
+
+		/* Lightweight RX restart — no reconfig needed */
+		lr11xx_restart_rx(data, true);
+		*rx_restarted = true;
+
+		/* When SNR < 0 the packet RSSI is dominated by
+		 * noise — use the signal-only RSSI estimate for a
+		 * more accurate reading on weak links. */
+		int16_t rssi = pkt_stat.rssi_pkt_in_dbm;
+
+		if (pkt_stat.snr_pkt_in_db < 0 &&
+		    pkt_stat.signal_rssi_pkt_in_dbm > rssi) {
+			rssi = pkt_stat.signal_rssi_pkt_in_dbm;
+		}
+
+		k_mutex_unlock(&data->spi_mutex);
+
+		/* Fire callback outside mutex */
+		if (data->async_rx_cb) {
+			data->async_rx_cb(data->dev, data->rx_buf,
+					  rx_stat.pld_len_in_bytes,
+					  rssi,
+					  pkt_stat.snr_pkt_in_db,
+					  data->async_rx_user_data);
+		}
+		return true;
+	}
+
+	LOG_WRN("RX: invalid len %d", rx_stat.pld_len_in_bytes);
+	lr11xx_restart_rx(data, true);
+	*rx_restarted = true;
+	return false;
+}
+
+/* ── CAD done ── */
+static bool lr11xx_irq_cad_done(struct lr11xx_data *data, uint32_t irq,
+				bool *rx_restarted)
+{
+	if (!(irq & LR11XX_SYSTEM_IRQ_CAD_DONE)) {
+		return false;
+	}
+
+	bool detected = (irq & LR11XX_SYSTEM_IRQ_CAD_DETECTED) != 0;
+
+	/* Positive probe: Rx continues on the detected signal. rx_restarted keeps
+	 * the safety net from tearing down the reception being measured. */
+	if (data->cad_exit_rx && detected) {
+		/* CAD_ONLY left the chip in STBY_RC: arm the follow-on Rx with the normal
+		 * SetRx, bounded by the max-payload figure so a terminal IRQ is certain. */
+		lr11xx_radio_set_rx_with_timeout_in_rtc_step(
+			&data->hal_ctx, lr11xx_cad_rx_timeout_steps(data));
+		data->in_rx_mode = true;
+		atomic_set(&data->cad_rx_state, LR11XX_CAD_RX_ARMED);
+		*rx_restarted = true;
+	}
+
+	if (data->cad_cb) {
+		lora_cad_cb cb = data->cad_cb;
+		void *ud = data->cad_user_data;
+
+		data->cad_cb = NULL;
+		data->cad_user_data = NULL;
+		k_mutex_unlock(&data->spi_mutex);
+		cb(data->dev, detected, ud);
+		return true;
+	}
+
+	/* Blocking CAD: signal the semaphore */
+	data->cad_result = detected ? 1 : 0;
+	k_sem_give(&data->cad_sem);
+	return false;
+}
+
+/* ── TX done ── */
+static void lr11xx_irq_tx_done(struct lr11xx_data *data,
+			       const struct lr11xx_config *cfg, uint32_t irq,
+			       bool *rx_restarted)
+{
+	if (!(irq & LR11XX_SYSTEM_IRQ_TX_DONE)) {
+		return;
+	}
+
+	data->tx_active = false;
+
+	/* Full restart — modem was reconfigured for TX */
+	lr11xx_start_rx(data, cfg);
+	*rx_restarted = true;
+
+	/* Raise TX signal */
+	if (data->tx_signal) {
+		k_poll_signal_raise(data->tx_signal, 0);
+	}
+}
+
+/* ── Timeout ── */
+static void lr11xx_irq_timeout(struct lr11xx_data *data,
+			       const struct lr11xx_config *cfg, uint32_t irq,
+			       bool *rx_restarted)
+{
+	if (!(irq & LR11XX_SYSTEM_IRQ_TIMEOUT)) {
+		return;
+	}
+
+	/* cad_timeout expired with nothing decoded: the detection had
+	 * no packet behind it.  Resolved before the branches below,
+	 * which put the receiver back on air. */
+	bool was_cad_rx = lr11xx_cad_rx_resolve(data,
+						LR11XX_CAD_RX_TMOUT);
+
+	if (data->tx_active) {
+		/* Chip TX timeout: TX_DONE will never come. Re-arm RX but do NOT raise
+		 * tx_signal (it means "sent"); the adapter's wait thread owns the loss. */
+		LOG_ERR("TX timeout — chip stopped the transmission, "
+			"packet lost");
+		data->tx_active = false;
+		lr11xx_start_rx(data, cfg);
+		*rx_restarted = true;
+		return;
+	}
+
+	/* Duty-cycle false preamble (UM §7.2.6): counted for `get dc.restarts`,
+	 * except when it is a CAD_RX probe's own timeout. */
+	if (data->rx_duty_cycle_enabled && !was_cad_rx) {
+		atomic_inc(&data->dc_timeout_restarts);
+	}
+	if (lr11xx_restart_rx(data, false) < 0) {
+		/* Escalate: full restart (standby, modem reprogram, SetRx). If that fails
+		 * too, the stuck-DIO1 counter still reaches its hardware reset. */
+		LOG_WRN("Timeout: light re-arm failed — full RX restart");
+		lr11xx_start_rx(data, cfg);
+	}
+	*rx_restarted = true;
+}
+
+/* ── CRC / header error ──
+ * A header error during a valid header with no RX_DONE is a foreign signal
+ * over OUR packet in flight: do not abort, its RX_DONE delivers it. */
+static bool lr11xx_irq_rx_error(struct lr11xx_data *data, uint32_t irq,
+				bool hdr_valid_seen, bool *rx_restarted)
+{
+	void *ctx = &data->hal_ctx;
+
+	if ((irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) && hdr_valid_seen &&
+	    !(irq & LR11XX_SYSTEM_IRQ_RX_DONE)) {
+		LOG_DBG("RX: foreign HDR err during valid header — not aborting");
+		*rx_restarted = true;  /* reception continues; skip safety-net restart */
+		return false;
+	}
+	if (!(irq & (LR11XX_SYSTEM_IRQ_CRC_ERROR |
+		     LR11XX_SYSTEM_IRQ_HEADER_ERROR))) {
+		return false;
+	}
+
+	LOG_DBG("RX error: CRC=%d HDR=%d RXDONE=%d",
+		(irq & LR11XX_SYSTEM_IRQ_CRC_ERROR) ? 1 : 0,
+		(irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) ? 1 : 0,
+		(irq & LR11XX_SYSTEM_IRQ_RX_DONE) ? 1 : 0);
+
+	/* LR1110 errata: a real header error (no valid header) drifts the
+	 * reported buffer_start_pointer +4 per subsequent packet until a
+	 * standby resets it (Arduino MeshCore's CustomLR1110 standbys on
+	 * header error).  Only for a genuine header error — a valid header
+	 * is handled above and must never trigger this abort. */
+	if (irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) {
+		lr11xx_system_set_standby(ctx,
+					  LR11XX_SYSTEM_STANDBY_CFG_RC);
+	}
+
+	/* Drop whatever the failed packet left in the RX buffer — RadioLib
+	 * clears it on the CRC-error read path too. */
+	lr11xx_regmem_clear_rxbuffer(ctx);
+
+	if (!data->tx_active) {
+		lr11xx_restart_rx(data, true);
+		*rx_restarted = true;
+	}
+
+	k_mutex_unlock(&data->spi_mutex);
+
+	/* Notify callback with NULL data for error counting */
+	if (data->async_rx_cb) {
+		data->async_rx_cb(data->dev, NULL, 0, 0, 0,
+				  data->async_rx_user_data);
+	}
+	return true;
+}
+
+/* ── Header valid ──
+ * Stamp the payload-phase latch, unless a terminal bit for our packet came
+ * in the same pass. rx_restarted: the chip is mid-packet, and the safety
+ * net must not restart RX over it. */
+static void lr11xx_irq_header_valid(struct lr11xx_data *data, uint32_t irq,
+				    bool *rx_restarted)
+{
+	if (!(irq & LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID) ||
+	    (irq & (LR11XX_SYSTEM_IRQ_RX_DONE | LR11XX_SYSTEM_IRQ_CRC_ERROR |
+		    LR11XX_SYSTEM_IRQ_TIMEOUT))) {
+		return;
+	}
+
+	uint32_t now = k_uptime_get_32();
+
+	/* 1 as the "set" sentinel if k_uptime is 0 right after boot. */
+	data->header_seen_at_ms = (now == 0) ? 1U : now;
+	/* The latch is the truth source now; a preamble timestamp left
+	 * behind would outlive it and be read as a live grace window. */
+	data->preamble_seen_at_ms = 0;
+	*rx_restarted = true;
+}
+
+/* DIO1 still high after processing: a new IRQ arrived meanwhile, and an
+ * edge-triggered pin will not fire again, so resubmit. Five empty passes
+ * in a row mean a stuck chip: hardware reset. */
+static void lr11xx_dio1_recheck_pin(struct lr11xx_data *data,
+				    const struct lr11xx_config *cfg)
+{
+	if (!gpio_pin_get_dt(&data->hal_ctx.dio1)) {
+		data->dio1_stuck_count = 0;
+		return;
+	}
+
+	data->dio1_stuck_count++;
+	if (data->dio1_stuck_count >= 5) {
+		LOG_ERR("DIO1 stuck HIGH for %d cycles — "
+			"hardware reset", data->dio1_stuck_count);
+		data->dio1_stuck_count = 0;
+		lr11xx_hardware_reset(data, cfg);
+		lr11xx_start_rx(data, cfg);
+	} else {
+		k_work_submit_to_queue(&data->dio1_wq,
+				       &data->dio1_work);
+	}
+}
 
 static void lr11xx_dio1_work_handler(struct k_work *work)
 {
@@ -420,6 +789,9 @@ static void lr11xx_dio1_work_handler(struct k_work *work)
 	const struct lr11xx_config *cfg = data->dev->config;
 	void *ctx = &data->hal_ctx;
 	bool rx_restarted = false;
+
+	/* Proof of life for the wedge watchdog: the chip generated an IRQ. */
+	data->last_dio1_ms = k_uptime_get_32();
 
 	k_mutex_lock(&data->spi_mutex, K_FOREVER);
 
@@ -437,12 +809,7 @@ static void lr11xx_dio1_work_handler(struct k_work *work)
 		goto safety_check;
 	}
 
-	/* CMD_ERROR (bit 22) is expected — LR1110 firmware sets it on
-	 * several write commands (SetModParams, SetSyncWord, SetRxBoosted,
-	 * SetRx) as a benign side effect on all FW versions (0x0307, 0x0401).
-	 * Commands succeed, radio operates correctly.  RadioLib has the same
-	 * behavior but never notices because it doesn't read IRQ after writes.
-	 * ERROR (bit 23) indicates an actual hardware fault. */
+	/* CMD_ERROR is benign on this firmware; ERROR (bit 23) is a real fault. */
 	if (irq & LR11XX_SYSTEM_IRQ_ERROR) {
 		LOG_ERR("IRQ hardware ERROR: 0x%08x", irq);
 	}
@@ -452,192 +819,47 @@ static void lr11xx_dio1_work_handler(struct k_work *work)
 		data->dio1_stuck_count = 0;
 	}
 
-	/* ── RX done ──
-	 * Gated on no error bits: a CRC-failed packet asserts RX_DONE and
-	 * CRC_ERROR together on this chip family (same as SX126x — see the
-	 * sx126x patch's "they co-fire here"; LBM's radio_planner likewise
-	 * checks errors before RX_DONE), so an ungated done-first read
-	 * would deliver corrupted payloads as valid.  A good packet
-	 * coalesced with an earlier HEADER_ERROR in the same handler
-	 * window is dropped too — the header error may have shifted the
-	 * RX buffer pointer (errata handling below), making the read
-	 * suspect.  The error branch below owns the window instead. */
-	if ((irq & LR11XX_SYSTEM_IRQ_RX_DONE) &&
-	    !(irq & (LR11XX_SYSTEM_IRQ_CRC_ERROR |
-		     LR11XX_SYSTEM_IRQ_HEADER_ERROR))) {
-		lr11xx_radio_rx_buffer_status_t rx_stat;
-		lr11xx_radio_get_rx_buffer_status(ctx, &rx_stat);
+	/* Valid header seen, live or latched: the bulk clear removes the live bit
+	 * mid-packet, so only the latch still knows by RX_DONE. Read before any
+	 * branch resets it. */
+	bool hdr_valid_seen =
+		(irq & LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID) != 0 ||
+		data->header_seen_at_ms != 0;
 
-		if (rx_stat.pld_len_in_bytes > 0 &&
-		    rx_stat.pld_len_in_bytes <= 255) {
-			lr11xx_radio_pkt_status_lora_t pkt_stat;
-			lr11xx_radio_get_lora_pkt_status(ctx, &pkt_stat);
-
-			lr11xx_regmem_read_buffer8(ctx, data->rx_buf,
-						   rx_stat.buffer_start_pointer,
-						   rx_stat.pld_len_in_bytes);
-
-			/* LR1110 errata: RX buffer base shifts 4 bytes per
-			 * received packet.  Without clearing, after ~64
-			 * packets the offset wraps the 256-byte buffer and
-			 * corrupts data.  RadioLib does the same clear. */
-			lr11xx_regmem_clear_rxbuffer(ctx);
-
-			/* Lightweight RX restart — no reconfig needed */
-			lr11xx_restart_rx(data);
-			rx_restarted = true;
-
-			/* When SNR < 0 the packet RSSI is dominated by
-			 * noise — use the signal-only RSSI estimate for a
-			 * more accurate reading on weak links. */
-			int16_t rssi = pkt_stat.rssi_pkt_in_dbm;
-
-			if (pkt_stat.snr_pkt_in_db < 0 &&
-			    pkt_stat.signal_rssi_pkt_in_dbm > rssi) {
-				rssi = pkt_stat.signal_rssi_pkt_in_dbm;
-			}
-
-			k_mutex_unlock(&data->spi_mutex);
-
-			/* Fire callback outside mutex */
-			if (data->async_rx_cb) {
-				data->async_rx_cb(data->dev, data->rx_buf,
-						  rx_stat.pld_len_in_bytes,
-						  rssi,
-						  pkt_stat.snr_pkt_in_db,
-						  data->async_rx_user_data);
-			}
-			return;
-		}
-
-		LOG_WRN("RX: invalid len %d", rx_stat.pld_len_in_bytes);
-		lr11xx_restart_rx(data);
-		rx_restarted = true;
-	}
-
-	/* ── CAD done ── */
-	if (irq & LR11XX_SYSTEM_IRQ_CAD_DONE) {
-		bool detected = (irq & LR11XX_SYSTEM_IRQ_CAD_DETECTED) != 0;
-
-		data->cad_active = false;
-
-		if (data->cad_cb) {
-			lora_cad_cb cb = data->cad_cb;
-			void *ud = data->cad_user_data;
-
-			data->cad_cb = NULL;
-			data->cad_user_data = NULL;
-			k_mutex_unlock(&data->spi_mutex);
-			cb(data->dev, detected, ud);
-			return;
-		}
-
-		/* Blocking CAD: signal the semaphore */
-		data->cad_result = detected ? 1 : 0;
-		k_sem_give(&data->cad_sem);
-	}
-
-	/* ── TX done ── */
-	if (irq & LR11XX_SYSTEM_IRQ_TX_DONE) {
-		data->tx_active = false;
-
-		/* Full restart — modem was reconfigured for TX */
-		lr11xx_start_rx(data, cfg);
-		rx_restarted = true;
-
-		/* Raise TX signal */
-		if (data->tx_signal) {
-			k_poll_signal_raise(data->tx_signal, 0);
-		}
-	}
-
-	/* ── Timeout ── */
-	if (irq & LR11XX_SYSTEM_IRQ_TIMEOUT) {
-		if (!data->tx_active) {
-			lr11xx_restart_rx(data);
-			rx_restarted = true;
-		}
-	}
-
-	/* ── CRC / Header error ──
-	 * Plain `CRC || HDR` — no SYNC_WORD_HEADER_VALID gate (RadioLib
-	 * readData's false-alarm filter).  IRQ status is bulk-cleared on
-	 * every handler entry, so a set HEADER_ERROR always belongs to
-	 * this window; a SYNC_VALID bit latched by another packet in the
-	 * same window must not suppress the errata standby below. */
-	if (irq & (LR11XX_SYSTEM_IRQ_CRC_ERROR |
+	/* Ground truth for a CAD_RX probe: anything that proves a transmitter
+	 * was actually there.  A CRC or header error counts as much as a clean
+	 * packet -- the probe is asking whether the detection was real, not
+	 * whether the packet was usable. */
+	if (irq & (LR11XX_SYSTEM_IRQ_RX_DONE | LR11XX_SYSTEM_IRQ_CRC_ERROR |
 		   LR11XX_SYSTEM_IRQ_HEADER_ERROR)) {
-		LOG_DBG("RX error: CRC=%d HDR=%d RXDONE=%d",
-			(irq & LR11XX_SYSTEM_IRQ_CRC_ERROR) ? 1 : 0,
-			(irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) ? 1 : 0,
-			(irq & LR11XX_SYSTEM_IRQ_RX_DONE) ? 1 : 0);
+		lr11xx_cad_rx_resolve(data, LR11XX_CAD_RX_PACKET);
+	}
 
-		/* LR1110 errata: a header error makes the chip's reported
-		 * buffer_start_pointer stale by +4 for every subsequent
-		 * packet (stacking) until a standby resets the shift.
-		 * Arduino MeshCore's CustomLR1110 calls standby() on every
-		 * header error unconditionally — mirror that. */
-		if (irq & LR11XX_SYSTEM_IRQ_HEADER_ERROR) {
-			lr11xx_system_set_standby(ctx,
-						  LR11XX_SYSTEM_STANDBY_CFG_RC);
-		}
-
-		/* Drop whatever the failed (or coalesced) packet left in
-		 * the RX buffer — RadioLib clears it on the CRC-error read
-		 * path too. */
-		lr11xx_regmem_clear_rxbuffer(ctx);
-
-		if (!data->tx_active) {
-			lr11xx_restart_rx(data);
-			rx_restarted = true;
-		}
-
-		k_mutex_unlock(&data->spi_mutex);
-
-		/* Notify callback with NULL data for error counting */
-		if (data->async_rx_cb) {
-			data->async_rx_cb(data->dev, NULL, 0, 0, 0,
-					  data->async_rx_user_data);
-		}
+	if (lr11xx_irq_rx_done(data, irq, hdr_valid_seen, &rx_restarted) ||
+	    lr11xx_irq_cad_done(data, irq, &rx_restarted)) {
+		return;  /* mutex released to deliver a callback */
+	}
+	lr11xx_irq_tx_done(data, cfg, irq, &rx_restarted);
+	lr11xx_irq_timeout(data, cfg, irq, &rx_restarted);
+	if (lr11xx_irq_rx_error(data, irq, hdr_valid_seen, &rx_restarted)) {
 		return;
 	}
+	lr11xx_irq_header_valid(data, irq, &rx_restarted);
 
 safety_check:
-	/* Safety net: if we should be in RX but no IRQ branch restarted it,
-	 * force a restart.  This catches:
-	 *   - SPI failure reading IRQ status (irq=0, rc!=OK)
-	 *   - CMD_ERROR-only DIO1 (benign, but radio fell back to standby)
-	 *   - Unknown IRQ bits not handled above
-	 * Without this, the radio stays in STDBY_RC (fallback mode) and
-	 * never receives again — permanently deaf. */
+	/* Safety net: RX expected but nothing re-armed it (SPI failure, CMD_ERROR-
+	 * only DIO1, unknown bit). Otherwise the chip sits in STDBY_RC, deaf. */
 	if (!rx_restarted && data->in_rx_mode && !data->tx_active) {
 		LOG_ERR("DIO1 safety: no IRQ handled (0x%08x rc=%d), "
 			"restarting RX", irq, rc);
-		lr11xx_restart_rx(data);
+		/* State genuinely unknown here — an SPI failure reading the IRQ
+		 * register or an unhandled bit means we cannot claim the chip
+		 * left the loop.  Keep the defensive standby; this is the one
+		 * path where it is not redundant. */
+		lr11xx_restart_rx(data, false);
 	}
 
-	/* Edge-triggered DIO1: if the pin is still HIGH after processing,
-	 * a new IRQ arrived during handling.  No rising edge will fire,
-	 * so re-submit work to process the pending flags.
-	 *
-	 * Guard against DIO1 stuck HIGH: if we loop here with no
-	 * actionable IRQ, the LR1110 is in a bad state.  After 5
-	 * consecutive empty cycles, do a full hardware reset. */
-	if (gpio_pin_get_dt(&data->hal_ctx.dio1)) {
-		data->dio1_stuck_count++;
-		if (data->dio1_stuck_count >= 5) {
-			LOG_ERR("DIO1 stuck HIGH for %d cycles — "
-				"hardware reset", data->dio1_stuck_count);
-			data->dio1_stuck_count = 0;
-			lr11xx_hardware_reset(data, cfg);
-			lr11xx_start_rx(data, cfg);
-		} else {
-			k_work_submit_to_queue(&data->dio1_wq,
-					       &data->dio1_work);
-		}
-	} else {
-		data->dio1_stuck_count = 0;
-	}
+	lr11xx_dio1_recheck_pin(data, cfg);
 
 	k_mutex_unlock(&data->spi_mutex);
 }
@@ -656,7 +878,7 @@ static int lr11xx_hw_init(struct lr11xx_data *data,
 /* ── Driver API: config ─────────────────────────────────────────────── */
 
 static int lr11xx_lora_config(const struct device *dev,
-			      struct lora_modem_config *config)
+			      const struct lora_modem_config *config)
 {
 	struct lr11xx_data *data = dev->data;
 	const struct lr11xx_config *cfg = dev->config;
@@ -695,20 +917,24 @@ static uint32_t lr11xx_lora_airtime(const struct device *dev,
 	struct lr11xx_data *data = dev->data;
 	struct lora_modem_config *mc = &data->modem_cfg;
 
-	uint8_t sf = (uint8_t)mc->datarate;
-	float bw = bw_enum_to_khz(mc->bandwidth) * 1000.0f;
-	uint8_t cr = (uint8_t)mc->coding_rate + 4;
-
-	float ts = (float)(1 << sf) / bw;
-	int de = (sf >= 11 && bw <= 125000.0f) ? 1 : 0;
-	float n_payload = 8.0f + fmaxf(
-		ceilf((8.0f * data_len - 4.0f * sf + 28.0f + 16.0f) /
-		      (4.0f * (sf - 2.0f * de))) * cr,
-		0.0f);
-	float t_preamble = (mc->preamble_len + 4.25f) * ts;
-	float t_payload = n_payload * ts;
-
-	return (uint32_t)((t_preamble + t_payload) * 1000.0f);
+	/* Use Semtech's calculation, including SF5/6 synchronization and the
+	 * actual LDRO/CRC configuration.  The old SF>=11 && BW<=125 shortcut
+	 * underestimated SF10/BW62.5 and SF12/BW250, including the TX watchdog
+	 * budgets derived from this API. */
+	lr11xx_radio_mod_params_lora_t mod = {
+		.sf = (lr11xx_radio_lora_sf_t)mc->datarate,
+		.bw = bw_enum_to_lr11xx(mc->bandwidth),
+		.cr = cr_enum_to_lr11xx(mc->coding_rate),
+		.ldro = lr11xx_ldro(mc),
+	};
+	lr11xx_radio_pkt_params_lora_t pkt = {
+		.preamble_len_in_symb = mc->preamble_len,
+		.header_type = LR11XX_RADIO_LORA_PKT_EXPLICIT,
+		.pld_len_in_bytes = (uint8_t)data_len,
+		.crc = mc->packet_crc_disable ? LR11XX_RADIO_LORA_CRC_OFF
+					      : LR11XX_RADIO_LORA_CRC_ON,
+	};
+	return lr11xx_radio_get_lora_time_on_air_in_ms(&pkt, &mod);
 }
 
 /* Forward declaration — needed by LBT in send_async */
@@ -751,12 +977,8 @@ static int lr11xx_lora_send_async(const struct device *dev,
 	if (data->tx_active) return -EBUSY;
 	if (data_len > 255 || data_len == 0) return -EINVAL;
 
-	/* LBT: perform blocking CAD before transmitting.  On CAD-busy, restore
-	 * RX in-driver before returning -EBUSY so the C++ layer doesn't have
-	 * to do a full cancel-then-restart round-trip.  lr11xx_lora_cad
-	 * transitions the chip to STANDBY and clears data->in_rx_mode as
-	 * part of running CAD; capture the pre-CAD state to know whether
-	 * to re-arm. */
+	/* LBT: blocking CAD first. On busy, restore RX here before -EBUSY (CAD
+	 * leaves standby and clears in_rx_mode, so remember the pre-CAD state). */
 	if (data->modem_cfg.cad.mode == LORA_CAD_MODE_LBT) {
 		bool was_in_rx = data->in_rx_mode;
 		int cad_ret = lr11xx_lora_cad(dev,
@@ -814,15 +1036,27 @@ static int lr11xx_lora_send_async(const struct device *dev,
 
 	/* Clear IRQ, enable DIO1 */
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
-	data->preamble_seen_at_ms = 0;
+	lr11xx_reset_rx_busy_signals(data);
 	lr11xx_hal_enable_dio1_irq(&data->hal_ctx);
 
-	/* Store signal and start TX.  10 s timeout: worst legal preset
-	 * (SF12 / BW62.5, max payload) exceeds 5 s airtime — a shorter
-	 * timeout would abort mid-transmission.  Matches the SX126x driver. */
+	/* Chip TX timeout (UM §7.2.3: it stops the transmission) scaled from
+	 * airtime +25% +500 ms, floored at the old 10 s, saturated at 24 bits: the
+	 * SDK's ms helper overflows above 131 s. */
 	data->tx_signal = async;
 	data->tx_active = true;
-	lr11xx_radio_set_tx(ctx, 10000);
+	{
+		uint32_t air_ms = lr11xx_lora_airtime(dev, data_len);
+		uint32_t tmo_ms = air_ms + (air_ms / 4U) + 500U;
+		uint32_t steps;
+
+		if (tmo_ms < 10000U) {
+			tmo_ms = 10000U;
+		}
+		steps = zc_lora_ms_to_steps24(tmo_ms, 32768U);
+		LOG_DBG("SET_TX: airtime=%u ms, timeout=%u ms (%u steps)",
+			air_ms, tmo_ms, steps);
+		lr11xx_radio_set_tx_with_timeout_in_rtc_step(ctx, steps);
+	}
 
 	k_mutex_unlock(&data->spi_mutex);
 	return 0;
@@ -906,7 +1140,7 @@ static int lr11xx_lora_recv_duty_cycle(const struct device *dev,
 		return -EINVAL;
 	}
 
-	/* Explicit timing only — the adapter (LoRaRadioBase) owns the window
+	/* Explicit timing only — the adapter (LoRaRadio) owns the window
 	 * sizing.  No driver-side auto-compute. */
 	if (K_TIMEOUT_EQ(rx_period, K_FOREVER) ||
 	    K_TIMEOUT_EQ(sleep_period, K_FOREVER)) {
@@ -953,16 +1187,141 @@ static int lr11xx_lora_recv(const struct device *dev, uint8_t *buf,
 
 /* ── LR11xx extension API ───────────────────────────────────────────── */
 
+/* ── Duty-cycle ownership ─────────────────────────────────────────────
+ *
+ * Any NSS edge during the sleep phase silently ends the RxDutyCycle loop
+ * (UM §7.2.6), and BUSY cannot tell sleep from ordinary Rx on this family.
+ * So a caller that must talk to the chip brackets its work: suspend ends
+ * the cycle with SetStandby, resume re-arms it. Caller holds spi_mutex.
+ * Rationale and measurements: devdocs LLD 04 §13. */
+static bool lr11xx_dc_suspend(struct lr11xx_data *data)
+{
+	if (!data->rx_duty_cycle_enabled || !data->in_rx_mode) {
+		return false;
+	}
+
+	/* Sanctioned termination, and simultaneously the remedy the manual
+	 * prescribes for an NSS edge that has already woken the chip — so this
+	 * is correct whether or not the cycle actually survived to this point. */
+	lr11xx_system_set_standby(&data->hal_ctx, LR11XX_SYSTEM_STANDBY_CFG_RC);
+	data->in_rx_mode = false;
+	return true;
+}
+
+static void lr11xx_dc_resume(struct lr11xx_data *data, bool was_armed)
+{
+	if (!was_armed) {
+		return;
+	}
+
+	/* Same re-arm sequence as restart_rx().  No boost re-apply — retained
+	 * across the duty-cycle sleep, see the note in lr11xx_start_rx().  The
+	 * IRQ/latch state is cleared so the new cycle starts from a known point. */
+	lr11xx_system_clear_irq_status(&data->hal_ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
+	lr11xx_reset_rx_busy_signals(data);
+	lr11xx_radio_set_rx_duty_cycle(&data->hal_ctx, data->dc_rx_ms,
+				       data->dc_sleep_ms,
+				       LR11XX_RADIO_RX_DUTY_CYCLE_MODE_RX);
+	data->in_rx_mode = true;
+}
+
+static uint32_t lr11xx_preamble_grace_ms(struct lr11xx_data *data);
+
+/* Is a duty-cycled reception under way? Ask before dc_suspend(), which
+ * would end it; with a cycle armed is_receiving() cannot see the preamble
+ * phase. Reading IRQs is safe in both phases. A preamble past its grace
+ * with no header is stale. Caller holds spi_mutex. */
+static bool lr11xx_dc_rx_in_flight(struct lr11xx_data *data)
+{
+	lr11xx_system_irq_mask_t irq = 0;
+
+	if (!data->rx_duty_cycle_enabled || !data->in_rx_mode) {
+		return false;
+	}
+	if (lr11xx_system_get_irq_status(&data->hal_ctx, &irq) != LR11XX_STATUS_OK) {
+		return false;
+	}
+	if (irq & LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID) {
+		return true;
+	}
+	if (irq & LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED) {
+		uint32_t now = k_uptime_get_32();
+		uint32_t seen = data->preamble_seen_at_ms;
+
+		if (seen == 0) {
+			data->preamble_seen_at_ms = (now == 0) ? 1U : now;
+			return true;
+		}
+		return (now - seen) < lr11xx_preamble_grace_ms(data);
+	}
+	return false;
+}
+
+/* Settle after Rx entry before the first GetRssiInst: 16 RSSI averaging
+ * windows (DS Table 13-82), the same model as the C++ sampler, floored at
+ * the old 1 ms. */
+static uint32_t lr11xx_rssi_settle_us(struct lr11xx_data *data)
+{
+	uint32_t bw_khz = (uint32_t)bw_enum_to_khz(data->modem_cfg.bandwidth);
+	uint32_t settle;
+
+	if (bw_khz == 0) {
+		return 1000U;
+	}
+	settle = ((936U + bw_khz - 1U) / bw_khz) * 16U;
+
+	return settle < 1000U ? 1000U : settle;
+}
+
+/* Sleep the whole millisecond, busy-wait only the remainder.  k_sleep() rounds
+ * up to a tick and the tick period is a board Kconfig, so asking it for a
+ * sub-millisecond excess is not portable; this keeps the old wait exactly and
+ * adds the deficit on top. */
+static void lr11xx_rssi_settle(struct lr11xx_data *data)
+{
+	uint32_t settle_us = lr11xx_rssi_settle_us(data);
+
+	k_sleep(K_MSEC(1));
+	if (settle_us > 1000U) {
+		k_busy_wait(settle_us - 1000U);
+	}
+}
+
 int16_t lr11xx_get_rssi_inst(const struct device *dev)
 {
 	struct lr11xx_data *data = dev->data;
 	int8_t rssi;
+	int16_t out = -128;
 
-	k_mutex_lock(&data->spi_mutex, K_FOREVER);
-	lr11xx_radio_get_rssi_inst(&data->hal_ctx, &rssi);
+	/* Non-blocking: a contended bus means the sampler simply retries.  -128
+	 * is the sentinel LoRaRadio::triggerNoiseFloorCalibrate expects. */
+	if (k_mutex_lock(&data->spi_mutex, K_NO_WAIT) != 0) {
+		return -128;
+	}
+	if (lr11xx_dc_rx_in_flight(data)) {
+		k_mutex_unlock(&data->spi_mutex);
+		return -128;
+	}
+
+	bool armed = lr11xx_dc_suspend(data);
+
+	if (armed) {
+		/* The stand-down left the chip in standby: enter continuous Rx for the
+		 * reading (after the front-end settle), then hand the cycle back. */
+		lr11xx_radio_set_rx_with_timeout_in_rtc_step(&data->hal_ctx,
+							     0xFFFFFF);
+		lr11xx_rssi_settle(data);
+	}
+
+	if (lr11xx_radio_get_rssi_inst(&data->hal_ctx, &rssi) ==
+	    LR11XX_STATUS_OK) {
+		out = (int16_t)rssi;
+	}
+
+	lr11xx_dc_resume(data, armed);
 	k_mutex_unlock(&data->spi_mutex);
 
-	return (int16_t)rssi;
+	return out;
 }
 
 /* Grace period for the PREAMBLE_DETECTED -> SYNC_WORD_HEADER_VALID gap,
@@ -971,21 +1330,118 @@ int16_t lr11xx_get_rssi_inst(const struct device *dev)
  * decode with margin. */
 static uint32_t lr11xx_preamble_grace_ms(struct lr11xx_data *data)
 {
-	uint8_t sf = (uint8_t)data->modem_cfg.datarate;
-	uint32_t bw_hz = (uint32_t)(bw_enum_to_khz(data->modem_cfg.bandwidth) * 1000.0f);
-	uint16_t preamble = data->modem_cfg.preamble_len;
+	return zc_lora_preamble_grace_ms(
+		(uint8_t)data->modem_cfg.datarate,
+		(uint32_t)(bw_enum_to_khz(data->modem_cfg.bandwidth) * 1000.0f),
+		data->modem_cfg.preamble_len);
+}
 
-	if (bw_hz == 0 || sf < 5 || sf > 12) {
-		return 1000;  /* safe default ~1 s if config is uninitialised */
+/* Payload-phase bound for the header latch (zc_lora_timing.h). */
+static uint32_t lr11xx_max_payload_ms(struct lr11xx_data *data)
+{
+	return zc_lora_max_payload_ms(
+		(uint8_t)data->modem_cfg.datarate,
+		(uint32_t)(bw_enum_to_khz(data->modem_cfg.bandwidth) * 1000.0f));
+}
+
+/* CAD_RX Rx bound in RTC steps (32768 Hz), 64-bit and saturated: the SDK
+ * helper overflows above 131 s, which SF12/BW7.81 (~273 s) exceeds. */
+static uint32_t lr11xx_cad_rx_timeout_steps(struct lr11xx_data *data)
+{
+	return zc_lora_ms_to_steps24(lr11xx_max_payload_ms(data), 32768U);
+}
+
+int lr11xx_get_rssi_burst(const struct device *dev, int16_t *out, int n,
+			 uint32_t spacing_us)
+{
+	struct lr11xx_data *data = dev->data;
+	int got = 0;
+
+	/* One stand-down for the whole burst: a per-sample read cost eight cycle
+	 * tear-downs, latch wipes and settles per sampling interval. */
+	if (k_mutex_lock(&data->spi_mutex, K_NO_WAIT) != 0) {
+		return 0;
 	}
-	uint64_t us = ((uint64_t)(preamble + 8U) << sf) * 1000000ULL / bw_hz;
+	/* A packet already on its way in: same verdict as a preamble landing
+	 * inside the window -- the caller abandons the burst and retries. */
+	if (lr11xx_dc_rx_in_flight(data)) {
+		k_mutex_unlock(&data->spi_mutex);
+		return -EBUSY;
+	}
 
-	return (uint32_t)((us + 999U) / 1000U);
+	bool armed = lr11xx_dc_suspend(data);
+
+	if (armed) {
+		lr11xx_radio_set_rx_with_timeout_in_rtc_step(&data->hal_ctx,
+							     0xFFFFFF);
+		/* Clear the latched reception bits so the check after the loop sees only
+		 * what arrived inside the window (the cycle is already down). */
+		lr11xx_system_clear_irq_status(&data->hal_ctx,
+					       LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED |
+					       LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID |
+					       LR11XX_SYSTEM_IRQ_CMD_ERROR);
+		lr11xx_rssi_settle(data);
+	}
+
+	for (int i = 0; i < n; i++) {
+		int8_t rssi;
+
+		if (i) {
+			k_busy_wait(spacing_us);
+		}
+		if (lr11xx_radio_get_rssi_inst(&data->hal_ctx, &rssi) != LR11XX_STATUS_OK) {
+			break;
+		}
+		out[i] = (int16_t)rssi;
+		got++;
+	}
+
+	/* A reception inside the window contaminates the samples: report -EAGAIN.
+	 * Only this bracket can see it; dc_resume() zeroes the latch before the
+	 * caller's own isReceiving() re-check runs. */
+	if (armed) {
+		lr11xx_system_irq_mask_t irq = 0;
+
+		if (lr11xx_system_get_irq_status(&data->hal_ctx, &irq) ==
+		    LR11XX_STATUS_OK &&
+		    (irq & (LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED |
+			    LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID))) {
+			got = -EAGAIN;
+		}
+	}
+
+	lr11xx_dc_resume(data, armed);
+	k_mutex_unlock(&data->spi_mutex);
+
+	return got;
 }
 
 bool lr11xx_is_receiving(const struct device *dev)
 {
 	struct lr11xx_data *data = dev->data;
+
+	/* Payload phase, from the DIO1-stamped latch: the only answer with a cycle
+	 * armed. Never brackets (that would end the reception asked about) and
+	 * never reads BUSY (high in sleep and in ordinary Rx alike). */
+	uint32_t hdr_seen = data->header_seen_at_ms;
+
+	if (hdr_seen != 0 &&
+	    (k_uptime_get_32() - hdr_seen) < lr11xx_max_payload_ms(data)) {
+		return true;
+	}
+
+	if (data->rx_duty_cycle_enabled) {
+		/* No latch, or its deadline blew: no bus access allowed here. Drop a stale
+		 * latch if the mutex is free; otherwise the DIO1 handler owns it. */
+		if (hdr_seen != 0 &&
+		    k_mutex_lock(&data->spi_mutex, K_NO_WAIT) == 0) {
+			LOG_WRN("RX header latched %u ms with no packet, releasing TX gate",
+				k_uptime_get_32() - hdr_seen);
+			data->header_seen_at_ms = 0;
+			k_mutex_unlock(&data->spi_mutex);
+		}
+		return false;
+	}
 
 	/* Non-blocking — skip if SPI busy */
 	if (k_mutex_lock(&data->spi_mutex, K_NO_WAIT) != 0) {
@@ -997,10 +1453,32 @@ bool lr11xx_is_receiving(const struct device *dev)
 
 	/* Header landed: payload phase in progress.  The bit stays latched
 	 * until the terminal DIO1 event bulk-clears it, so this covers the
-	 * whole packet. */
+	 * whole packet — bounded by a payload deadline, because in continuous
+	 * RX that terminal event is not guaranteed to arrive and a header that
+	 * never completes would otherwise mute TX until reboot. */
 	if (irq & LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID) {
+		uint32_t now = k_uptime_get_32();
+
+		/* The poll can see the bit before the work item runs, so it may stamp. A
+		 * live latch returned true above, so one set here has blown its deadline. */
+		if (data->header_seen_at_ms == 0) {
+			data->header_seen_at_ms = (now == 0) ? 1U : now;
+			k_mutex_unlock(&data->spi_mutex);
+			return true;
+		}
+		LOG_WRN("RX header latched %u ms with no packet, releasing TX gate",
+			now - data->header_seen_at_ms);
+		/* Drop the sticky reception bits so the next poll starts clean.
+		 * CMD_ERROR goes with them — the LR1110 sets it whenever ClearIrq
+		 * is called with a mask that excludes it (all FW versions). */
+		lr11xx_system_clear_irq_status(&data->hal_ctx,
+					       LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED |
+					       LR11XX_SYSTEM_IRQ_SYNC_WORD_HEADER_VALID |
+					       LR11XX_SYSTEM_IRQ_HEADER_ERROR |
+					       LR11XX_SYSTEM_IRQ_CMD_ERROR);
+		lr11xx_reset_rx_busy_signals(data);
 		k_mutex_unlock(&data->spi_mutex);
-		return true;
+		return false;
 	}
 
 	/* PREAMBLE_DETECTED with SF-aware grace (SX126x-parity).  Within
@@ -1026,15 +1504,29 @@ bool lr11xx_is_receiving(const struct device *dev)
 		lr11xx_system_clear_irq_status(&data->hal_ctx,
 					       LR11XX_SYSTEM_IRQ_PREAMBLE_DETECTED |
 					       LR11XX_SYSTEM_IRQ_CMD_ERROR);
-		data->preamble_seen_at_ms = 0;
+		lr11xx_reset_rx_busy_signals(data);
 		k_mutex_unlock(&data->spi_mutex);
 		return false;
 	}
 
 	/* No preamble, no header: nothing in flight. */
-	data->preamble_seen_at_ms = 0;
+	lr11xx_reset_rx_busy_signals(data);
 	k_mutex_unlock(&data->spi_mutex);
 	return false;
+}
+
+uint32_t lr11xx_get_dc_timeout_restarts(const struct device *dev)
+{
+	struct lr11xx_data *data = dev->data;
+
+	return (uint32_t)atomic_get(&data->dc_timeout_restarts);
+}
+
+void lr11xx_reset_dc_timeout_restarts(const struct device *dev)
+{
+	struct lr11xx_data *data = dev->data;
+
+	atomic_set(&data->dc_timeout_restarts, 0);
 }
 
 uint32_t lr11xx_get_wakeup_time_us(const struct device *dev)
@@ -1080,74 +1572,95 @@ void lr11xx_set_rx_boost(const struct device *dev, bool enable)
 	}
 }
 
-uint32_t lr11xx_get_random(const struct device *dev)
+/* ── Extension API: receiver hygiene ─────────────────────────────────
+ *
+ * Warm sleep, then recalibrate (as Arduino's lr11x0ResetAGC()).
+ * calibrate(0x3F) here includes image rejection and reverts it to
+ * 902-928 MHz, so the image cal is re-issued afterwards. */
+static void lr11xx_recalibrate_locked(struct lr11xx_data *data)
 {
-	struct lr11xx_data *data = dev->data;
-	uint32_t random = 0;
-
-	k_mutex_lock(&data->spi_mutex, K_FOREVER);
-	lr11xx_system_get_random_number(&data->hal_ctx, &random);
-	k_mutex_unlock(&data->spi_mutex);
-
-	return random;
-}
-
-void lr11xx_reset_agc(const struct device *dev)
-{
-	struct lr11xx_data *data = dev->data;
-
-	k_mutex_lock(&data->spi_mutex, K_FOREVER);
-
-	/* Warm sleep — powers down analog frontend (resets AGC gain state) */
+	void *ctx = &data->hal_ctx;
 	lr11xx_system_sleep_cfg_t sleep_cfg = {
 		.is_warm_start = true,
 		.is_rtc_timeout = false,
 	};
-	lr11xx_system_set_sleep(&data->hal_ctx, sleep_cfg, 0);
+
+	lr11xx_system_set_sleep(ctx, sleep_cfg, 0);
 	k_sleep(K_USEC(500));
+	data->hal_ctx.radio_is_sleeping = true;
 
-	/* Wake to STDBY_RC for calibration */
-	lr11xx_system_set_standby(&data->hal_ctx, LR11XX_SYSTEM_STANDBY_CFG_RC);
+	lr11xx_system_set_standby(ctx, LR11XX_SYSTEM_STANDBY_CFG_RC);
+	lr11xx_system_calibrate(ctx, 0x3F);
 
-	/* Recalibrate all blocks */
-	lr11xx_system_calibrate(&data->hal_ctx, 0x3F);
-
-	/* Re-calibrate image rejection for the actual operating frequency */
 	if (data->configured) {
 		uint16_t freq_mhz = data->modem_cfg.frequency / 1000000;
-		lr11xx_system_calibrate_image_in_mhz(&data->hal_ctx,
-						     freq_mhz - 4, freq_mhz + 4);
+
+		lr11xx_system_calibrate_image_in_mhz(ctx, freq_mhz - 4,
+						     freq_mhz + 4);
 	}
 
-	/* Re-apply RX boost if it was enabled */
+	/* Settle before handing the chip back: wait_on_busy() can miss a BUSY that
+	 * has not risen yet, and a SetRxDutyCycle into a calibrating chip is
+	 * dropped (deaf until the next reset). */
+	k_sleep(K_MSEC(10));
+
 	if (data->rx_boost_enabled) {
-		lr11xx_radio_cfg_rx_boosted(&data->hal_ctx, true);
-		lr11xx_system_clear_irq_status(&data->hal_ctx,
-					       LR11XX_SYSTEM_IRQ_ALL_MASK);
+		lr11xx_radio_cfg_rx_boosted(ctx, true);
 		data->rx_boost_applied = true;
 	}
 
+	/* Contract with the caller: leave the driver out of RX so its
+	 * startReceive() performs a real re-entry. */
+	data->in_rx_mode = false;
+	lr11xx_reset_rx_busy_signals(data);
+}
+
+/* Redo the frequency-dependent calibrations after temperature drift. Not
+ * an AGC reset: that is an SX126x remedy, and on this part it cost packets.
+ * Leaves the driver out of RX; the caller must startReceive(). */
+void lr11xx_recalibrate(const struct device *dev)
+{
+	struct lr11xx_data *data = dev->data;
+
+	if (!data->configured) {
+		return;
+	}
+
+	/* Bounded, for the same reason sx126x_reset_agc() bounds its own: a long
+	 * TX or RX holds this mutex for the full airtime, and K_FOREVER would
+	 * stall the dispatcher thread for all of it. */
+	if (k_mutex_lock(&data->spi_mutex, K_MSEC(50)) != 0) {
+		LOG_DBG("recalibrate: mutex busy, deferring");
+		return;
+	}
+	if (lr11xx_dc_rx_in_flight(data)) {
+		LOG_DBG("recalibrate: reception in flight, deferring");
+		k_mutex_unlock(&data->spi_mutex);
+		return;
+	}
+
+	/* Own the cycle across the whole sequence.  This opens with SetSleep,
+	 * which is fatal to a chip already in its own sleep phase, and the
+	 * recalibration leaves the radio in standby regardless — so the cycle
+	 * has to be re-armed here rather than left to whoever calls next. */
+	bool armed = lr11xx_dc_suspend(data);
+
+	lr11xx_recalibrate_locked(data);
+
+	lr11xx_dc_resume(data, armed);
 	k_mutex_unlock(&data->spi_mutex);
 }
 
-/* ── Deferred hardware init (runs on first lora_config call) ────────── */
-
 /* ── Driver API: CAD ────────────────────────────────────────────────── */
 
-/* Recommended cad_detect_peak values per SF for 2-symbol CAD.
- * From Semtech SX1261/62/68 / LR1110 reference (same silicon IP). */
-static uint8_t lr11xx_cad_detect_peak(uint8_t sf)
+uint8_t lr11xx_cad_peak_min(void)
 {
-	switch (sf) {
-	case 5:  case 6:  return 56;
-	case 7:           return 56;
-	case 8:           return 58;
-	case 9:           return 58;
-	case 10:          return 60;
-	case 11:          return 64;
-	case 12:          return 68;
-	default:          return 60;
-	}
+	return LR11XX_CAD_PEAK_MIN;
+}
+
+uint8_t lr11xx_cad_peak_max(void)
+{
+	return LR11XX_CAD_PEAK_MAX;
 }
 
 static int lr11xx_do_cad(struct lr11xx_data *data)
@@ -1156,23 +1669,23 @@ static int lr11xx_do_cad(struct lr11xx_data *data)
 	struct lora_modem_config *mc = &data->modem_cfg;
 
 	uint8_t sf = (uint8_t)mc->datarate;
-	uint8_t symb_nb = 2;
-	uint8_t detect_peak = lr11xx_cad_detect_peak(sf);
+	/* Both the table lookup and the timeout need the symbol count, so it is
+	 * resolved before the base peak rather than after it. */
+	uint8_t symb_nb = mc->cad.symbol_num ? (uint8_t)mc->cad.symbol_num : 2;
+	uint16_t bw_khz = (uint16_t)bw_enum_to_khz(mc->bandwidth);
+	uint8_t detect_peak = lr11xx_cad_detect_peak(sf, bw_khz, symb_nb);
 
-	if (mc->cad.symbol_num != 0) {
-		symb_nb = (uint8_t)mc->cad.symbol_num;
-	}
 	if (mc->cad.detection_peak != 0) {
 		detect_peak = mc->cad.detection_peak;
 	} else if (data->cad_peak_offset != 0) {
 		/* Adaptive-CAD operating offset (base +/- learned delta).
-		 * LR11xx detPeak scale is ~48-90 — never mix with SX126x. */
+		 * LR11xx detPeak scale is ~50-85 — never mix with SX126x. */
 		int peak = (int)detect_peak + data->cad_peak_offset;
 
-		if (peak < 48) {
-			peak = 48;
-		} else if (peak > 90) {
-			peak = 90;
+		if (peak < LR11XX_CAD_PEAK_MIN) {
+			peak = LR11XX_CAD_PEAK_MIN;
+		} else if (peak > LR11XX_CAD_PEAK_MAX) {
+			peak = LR11XX_CAD_PEAK_MAX;
 		}
 		detect_peak = (uint8_t)peak;
 	}
@@ -1185,6 +1698,12 @@ static int lr11xx_do_cad(struct lr11xx_data *data)
 		.cad_symb_nb = symb_nb,
 		.cad_detect_peak = detect_peak,
 		.cad_detect_min = mc->cad.detection_minimum ? mc->cad.detection_minimum : 10,
+		/* Per-CAD exit: the probe continues into Rx on a detection, LBT does not.
+		 * Detection itself is identical. cad_timeout is in 32768 Hz RTC steps
+		 * (the SDK prose says 31.25 us; it is wrong). */
+		/* Always CAD_ONLY on the wire: the chip's own CAD_RX exit leaves it in Rx
+		 * but deaf (14% of packets lost, 2026-09-02). The DIO1 handler arms the
+		 * follow-on Rx with a plain SetRx instead, as on the SX126x. */
 		.cad_exit_mode = LR11XX_RADIO_CAD_EXIT_MODE_STANDBYRC,
 		.cad_timeout = 0,
 	};
@@ -1192,8 +1711,7 @@ static int lr11xx_do_cad(struct lr11xx_data *data)
 	lr11xx_radio_set_cad_params(ctx, &cad);
 
 	lr11xx_system_clear_irq_status(ctx, LR11XX_SYSTEM_IRQ_ALL_MASK);
-	data->preamble_seen_at_ms = 0;
-	data->cad_active = true;
+	lr11xx_reset_rx_busy_signals(data);
 	lr11xx_radio_set_cad(ctx);
 
 	return 0;
@@ -1231,7 +1749,6 @@ static int lr11xx_lora_cad(const struct device *dev, k_timeout_t timeout)
 
 	ret = k_sem_take(&data->cad_sem, timeout);
 	if (ret == -EAGAIN) {
-		data->cad_active = false;
 		return -ETIMEDOUT;
 	}
 
@@ -1246,7 +1763,6 @@ static int lr11xx_lora_cad_async(const struct device *dev,
 	if (cb == NULL) {
 		data->cad_cb = NULL;
 		data->cad_user_data = NULL;
-		data->cad_active = false;
 		return 0;
 	}
 
@@ -1284,7 +1800,15 @@ uint8_t lr11xx_cad_base_peak(const struct device *dev)
 {
 	struct lr11xx_data *data = dev->data;
 
-	return lr11xx_cad_detect_peak((uint8_t)data->modem_cfg.datarate);
+	/* Must mirror lr11xx_do_cad()'s lookup exactly — bandwidth and symbol
+	 * count included.  This is what `get cad` prints as the base and what
+	 * the C++ staircase offsets from, so a base that disagreed with the
+	 * peak actually programmed would make every rung a lie. */
+	return lr11xx_cad_detect_peak(
+		(uint8_t)data->modem_cfg.datarate,
+		(uint16_t)bw_enum_to_khz(data->modem_cfg.bandwidth),
+		data->modem_cfg.cad.symbol_num
+			? (uint8_t)data->modem_cfg.cad.symbol_num : 2);
 }
 
 int lr11xx_cad_probe(const struct device *dev, int8_t peak_offset)
@@ -1294,19 +1818,54 @@ int lr11xx_cad_probe(const struct device *dev, int8_t peak_offset)
 	int peak = base + peak_offset;
 	int ret;
 
-	if (peak < 48) {
-		peak = 48;
-	} else if (peak > 90) {
-		peak = 90;
+	if (peak < LR11XX_CAD_PEAK_MIN) {
+		peak = LR11XX_CAD_PEAK_MIN;
+	} else if (peak > LR11XX_CAD_PEAK_MAX) {
+		peak = LR11XX_CAD_PEAK_MAX;
 	}
 
 	/* One-shot absolute override consumed by lr11xx_do_cad().  Probes and
-	 * LBT both run on the mesh loop thread, so no concurrent CAD exists. */
+	 * LBT both run on the mesh loop thread, so no concurrent CAD exists --
+	 * which is also what makes cad_exit_rx safe as a plain flag. */
 	data->cad_probe_peak = (uint8_t)peak;
+	data->cad_exit_rx = true;
+	atomic_set(&data->cad_rx_state, LR11XX_CAD_RX_IDLE);
 	ret = lr11xx_lora_cad(dev, K_MSEC(lr11xx_cad_timeout_ms(data)));
+	data->cad_exit_rx = false;
 	data->cad_probe_peak = 0;
 
+	/* 2 rather than 1 tells the caller the chip is in Rx on the signal it
+	 * detected, so it must NOT re-enter Rx itself, and that an outcome will
+	 * be readable from lr11xx_cad_rx_outcome() once the chip resolves it. */
+	if (ret > 0) {
+		return 2;
+	}
+
 	return ret;
+}
+
+uint32_t lr11xx_cad_rx_timeout_ms(const struct device *dev)
+{
+	struct lr11xx_data *data = dev->data;
+
+	/* Derived from the exact step count do_cad() programs, so the caller's
+	 * wait and the chip's deadline cannot drift apart -- including when the
+	 * 24-bit saturation in lr11xx_cad_rx_timeout_steps() shortens it. */
+	return (uint32_t)(((uint64_t)lr11xx_cad_rx_timeout_steps(data) * 1000U)
+			  / 32768U);
+}
+
+int lr11xx_cad_rx_outcome(const struct device *dev)
+{
+	struct lr11xx_data *data = dev->data;
+	atomic_val_t st = atomic_get(&data->cad_rx_state);
+
+	if (st != LR11XX_CAD_RX_PACKET && st != LR11XX_CAD_RX_TMOUT) {
+		return 0;  /* nothing armed, or still awaiting the terminal IRQ */
+	}
+
+	atomic_set(&data->cad_rx_state, LR11XX_CAD_RX_IDLE);
+	return (st == LR11XX_CAD_RX_PACKET) ? 1 : 2;
 }
 
 /* ── Deferred hardware init ─────────────────────────────────────────── */
@@ -1350,6 +1909,13 @@ static int lr11xx_hw_init(struct lr11xx_data *data,
 
 	LOG_INF("LR11xx HW:0x%02X Type:0x%02X FW:0x%04X",
 		ver.hw, ver.type, ver.fw);
+
+	if (ver.type == LR11XX_TYPE_LR1110 && ver.fw < LR11XX_MIN_FW_SYNC_WORD) {
+		LOG_ERR("LR1110 FW 0x%04X < 0x%04X: sync word cannot be changed, "
+			"node will stay on the public sync word and be invisible "
+			"to the mesh — upgrade the chip firmware",
+			ver.fw, LR11XX_MIN_FW_SYNC_WORD);
+	}
 
 	/* TCXO */
 	if (cfg->tcxo_voltage_mv > 0) {
@@ -1416,6 +1982,60 @@ static int lr11xx_hw_init(struct lr11xx_data *data,
 	return 0;
 }
 
+/* ── Wedge-recovery watchdog ────────────────────────────────────────── */
+
+/* Wedge watchdog: BUSY continuously high past any legitimate DC cycle with
+ * no DIO1 for 12 s can only be a wedge; hardware reset and re-arm. Reads
+ * the BUSY GPIO only, so it cannot disturb the chip. */
+static void lr11xx_wedge_watchdog_handler(struct k_work *work)
+{
+	struct k_work_delayable *dwork = k_work_delayable_from_work(work);
+	struct lr11xx_data *data = CONTAINER_OF(dwork, struct lr11xx_data,
+						wedge_work);
+	const struct lr11xx_config *cfg = data->dev->config;
+
+	/* Only monitor steady RX. */
+	if (!data->in_rx_mode || data->tx_active || !data->configured) {
+		goto rearm;
+	}
+
+	/* Recent DIO1 activity = chip provably alive. */
+	if ((k_uptime_get_32() - data->last_dio1_ms) < LR11XX_WEDGE_IDLE_MS) {
+		goto rearm;
+	}
+
+	/* Idle: either quiet RF (chip still DC-cycling) or a wedge.  Poll BUSY
+	 * continuously for one confirm window — a healthy chip shows a low edge
+	 * within a cycle; a wedge stays high the whole window. */
+	{
+		uint32_t start = k_uptime_get_32();
+		bool saw_low = false;
+
+		while ((k_uptime_get_32() - start) < LR11XX_WEDGE_CONFIRM_MS) {
+			if (!gpio_pin_get_dt(&data->hal_ctx.busy)) {
+				saw_low = true;
+				break;
+			}
+			k_msleep(2);
+		}
+		if (saw_low) {
+			goto rearm;   /* alive */
+		}
+	}
+
+	LOG_ERR("LR11xx wedge (BUSY stuck, DIO1 silent >%ums) — hardware reset",
+		LR11XX_WEDGE_IDLE_MS);
+	k_mutex_lock(&data->spi_mutex, K_FOREVER);
+	lr11xx_hardware_reset(data, cfg);
+	lr11xx_start_rx(data, cfg);
+	k_mutex_unlock(&data->spi_mutex);
+	data->last_dio1_ms = k_uptime_get_32();
+
+rearm:
+	k_work_schedule_for_queue(&data->wedge_wq, &data->wedge_work,
+				  K_MSEC(LR11XX_WEDGE_CHECK_MS));
+}
+
 /* ── Driver init (lightweight — runs at POST_KERNEL) ────────────────── */
 
 static int lr11xx_lora_init(const struct device *dev)
@@ -1434,8 +2054,19 @@ static int lr11xx_lora_init(const struct device *dev)
 	/* Start dedicated DIO1 work queue at high priority */
 	k_work_queue_start(&data->dio1_wq, lr11xx_dio1_wq_stack,
 			   K_THREAD_STACK_SIZEOF(lr11xx_dio1_wq_stack),
-			   K_PRIO_COOP(7), NULL);
-	k_thread_name_set(&data->dio1_wq.thread, "lr11xx_dio1");
+			   K_PRIO_COOP(7),
+			   &(const struct k_work_queue_config){ .name = "lr11xx_dio1" });
+
+	/* Wedge-recovery watchdog on its own queue (see handler).  Same priority
+	 * as DIO1 so it never preempts RX; its confirm poll yields every 2 ms. */
+	k_work_init_delayable(&data->wedge_work, lr11xx_wedge_watchdog_handler);
+	k_work_queue_start(&data->wedge_wq, lr11xx_wedge_wq_stack,
+			   K_THREAD_STACK_SIZEOF(lr11xx_wedge_wq_stack),
+			   K_PRIO_COOP(7),
+			   &(const struct k_work_queue_config){ .name = "lr11xx_wedge" });
+	data->last_dio1_ms = k_uptime_get_32();
+	k_work_schedule_for_queue(&data->wedge_wq, &data->wedge_work,
+				  K_MSEC(LR11XX_WEDGE_CHECK_MS));
 
 	/* Check SPI bus */
 	if (!spi_is_ready_dt(&cfg->bus)) {
@@ -1447,12 +2078,8 @@ static int lr11xx_lora_init(const struct device *dev)
 	memset(&data->hal_ctx, 0, sizeof(data->hal_ctx));
 	data->hal_ctx.spi_dev = cfg->bus.bus;
 	data->hal_ctx.spi_cfg = cfg->bus.config;
-	/* Override CS — we control NSS manually via gpio_pin_set_dt,
-	 * the SPI controller must NOT drive CS. The DTS cs-gpios on
-	 * the SPI bus assigns the pin, but our HAL does manual NSS.
-	 * Clear BOTH cs_is_gpio AND the port pointer so the SPI framework's
-	 * spi_context_cs_control() does not try to drive CS (which would
-	 * NULL-deref on the cleared port pointer). */
+	/* The HAL drives NSS by hand: clear both cs_is_gpio and the port so
+	 * spi_context_cs_control() leaves CS alone. */
 	data->hal_ctx.spi_cfg.cs.cs_is_gpio = false;
 	data->hal_ctx.spi_cfg.cs.gpio.port = NULL;
 	data->hal_ctx.nss.port = cfg->bus.config.cs.gpio.port;
@@ -1496,28 +2123,28 @@ static DEVICE_API(lora, lr11xx_lora_api) = {
 	 * (over-sleep + no header budget), not a chip defect — now sized by
 	 * the shared adapter math.  Default-off via prefs; HW-verify on a
 	 * live LR1110 before trusting in production. */
-	.recv_duty_cycle = lr11xx_lora_recv_duty_cycle,
+	.recv_duty_cycle_async = lr11xx_lora_recv_duty_cycle,
 };
 
 #define LR11XX_INIT(n)                                                     \
 	static const struct lr11xx_config lr11xx_config_##n = {            \
 		.bus = SPI_DT_SPEC_INST_GET(n,                             \
-			SPI_WORD_SET(8) | SPI_OP_MODE_MASTER |             \
+			SPI_WORD_SET(8) | SPI_OP_MODE_CONTROLLER |         \
 			SPI_TRANSFER_MSB),                                 \
 		.reset = GPIO_DT_SPEC_INST_GET(n, reset_gpios),            \
 		.busy  = GPIO_DT_SPEC_INST_GET(n, busy_gpios),            \
-		.dio1  = GPIO_DT_SPEC_INST_GET(n, dio1_gpios),            \
+		.dio1  = GPIO_DT_SPEC_INST_GET(n, irq_gpios),            \
 		.tcxo_voltage_mv =                                         \
-			DT_INST_PROP_OR(n, tcxo_voltage_mv, 0),           \
+			DT_INST_PROP_OR(n, tcxo_voltage, 0),           \
 		.tcxo_startup_delay_ms =                                   \
-			DT_INST_PROP_OR(n, tcxo_startup_delay_ms, 5),     \
+			DT_INST_PROP_OR(n, tcxo_power_startup_delay_ms, 5),     \
 		.rx_boosted = DT_INST_PROP(n, rx_boosted),                 \
-		.rfswitch_enable  = DT_INST_PROP_OR(n, rfswitch_enable, 0),\
-		.rfswitch_standby = DT_INST_PROP_OR(n, rfswitch_standby,0),\
-		.rfswitch_rx      = DT_INST_PROP_OR(n, rfswitch_rx, 0),   \
-		.rfswitch_tx      = DT_INST_PROP_OR(n, rfswitch_tx, 0),   \
-		.rfswitch_tx_hp   = DT_INST_PROP_OR(n, rfswitch_tx_hp, 0),\
-		.rfswitch_gnss    = DT_INST_PROP_OR(n, rfswitch_gnss, 0), \
+		.rfswitch_enable  = DT_INST_PROP_OR(n, rfsw_enable, 0),\
+		.rfswitch_standby = DT_INST_PROP_OR(n, rfsw_standby,0),\
+		.rfswitch_rx      = DT_INST_PROP_OR(n, rfsw_rx, 0),   \
+		.rfswitch_tx      = DT_INST_PROP_OR(n, rfsw_tx, 0),   \
+		.rfswitch_tx_hp   = DT_INST_PROP_OR(n, rfsw_tx_hp, 0),\
+		.rfswitch_gnss    = DT_INST_PROP_OR(n, rfsw_gnss, 0), \
 		.pa_hp_sel        = DT_INST_PROP_OR(n, pa_hp_sel, 7),     \
 		.pa_duty_cycle    = DT_INST_PROP_OR(n, pa_duty_cycle, 4), \
 	};                                                                 \

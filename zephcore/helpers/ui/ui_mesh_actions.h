@@ -55,15 +55,18 @@ void mesh_send_flood_advert(void);
 void mesh_send_zerohop_advert(void);
 void mesh_gps_set_enabled(bool enable);
 void mesh_ble_set_enabled(bool enable);
-void mesh_set_buzzer_quiet(bool quiet);
+void mesh_set_buzzer_mode(uint8_t mode);
 void mesh_set_offgrid_mode(bool enable);
 void mesh_set_leds_disabled(bool disabled);
-void mesh_disable_power_regulators(void);
 void mesh_reboot_to_ota_dfu(void);
 void mesh_save_brightness(uint8_t brightness);
 void mesh_save_and_restart(void);
 void mesh_set_wake_on_msg(bool enabled);
 void mesh_save_screen_off_secs(uint16_t secs);
+/* Mounting orientation. Both are applied live by the caller (panel remap /
+ * axis swap are immediate and cheap); these only persist the choice. */
+void mesh_save_display_rotate(bool rotated);
+void mesh_save_input_rotate(bool rotated);
 /* path_hash_mode: 0/1/2 → 1/2/3 bytes per hop appended to outbound flood path */
 void mesh_save_path_hash_mode(uint8_t mode);
 /* GPS duty-cycle interval in seconds (0 = always on). Applied live immediately

@@ -197,15 +197,6 @@ extern "C" void ui_notify_packet_sent(void)
 	}
 }
 
-extern "C" void ui_set_ble_status(bool connected, const char *name)
-{
-	(void)name;
-	if (s_task) {
-		s_task->setBLEConnected(connected);
-		s_task->notify();
-	}
-}
-
 extern "C" void ui_set_radio_params(
 	uint32_t freq_hz,
 	uint8_t sf,
@@ -218,14 +209,11 @@ extern "C" void ui_set_radio_params(
 	}
 }
 
-extern "C" void ui_set_radio_runtime(int8_t effective_tx_power, bool apc_enabled,
-	int8_t apc_reduction, int16_t apc_margin_x10,
-	uint8_t apc_target_margin, uint8_t sync_word,
+extern "C" void ui_set_radio_runtime(uint8_t sync_word,
 	uint16_t preamble_len, bool rx_duty_cycle,
 	bool radio_ready, bool in_rx, bool tx_active)
 {
-	(void)effective_tx_power; (void)apc_enabled; (void)apc_reduction;
-	(void)apc_margin_x10; (void)apc_target_margin; (void)sync_word;
+	(void)sync_word;
 	(void)preamble_len; (void)rx_duty_cycle; (void)radio_ready;
 	(void)in_rx; (void)tx_active;
 }
@@ -252,10 +240,10 @@ extern "C" bool ui_joystick_try_match_ack(uint32_t ack, uint8_t out_pubkey[6])
 	return true;
 }
 
-extern "C" void ui_set_battery(uint16_t mv, uint8_t /*pct*/)
+extern "C" void ui_set_battery(uint16_t mv, uint8_t pct)
 {
 	if (s_task) {
-		s_task->setCachedBattMilliVolts(mv);
+		s_task->setCachedBattery(mv, pct);
 	}
 }
 
@@ -271,13 +259,14 @@ extern "C" void ui_set_ble_enabled(bool enabled)
  * push-model hooks from the old button UI have no work to do. */
 extern "C" void ui_set_gps_data(bool, uint8_t, int32_t, int32_t, int32_t) {}
 extern "C" void ui_set_clock(uint32_t) {}
+/* The joystick UI reads tz_offset straight off NodePrefs at render time. */
+extern "C" void ui_set_tz(int8_t) {}
 extern "C" void ui_add_recent(const char *, int16_t, uint32_t) {}
 extern "C" void ui_set_node_name(const char *) {}
 extern "C" void ui_clear_recent(void) {}
-extern "C" void ui_set_sensor_data(int16_t, uint32_t, uint16_t, uint16_t) {}
 extern "C" void ui_set_gps_available(bool) {}
 extern "C" void ui_set_gps_enabled(bool) {}
 extern "C" void ui_set_gps_state(uint8_t, uint32_t, uint32_t) {}
-extern "C" void ui_set_buzzer_quiet(bool) {}
+extern "C" void ui_set_buzzer_mode(uint8_t) {}
 extern "C" void ui_set_offgrid_mode(bool) {}
 extern "C" void ui_set_msg_count(uint16_t count) {}

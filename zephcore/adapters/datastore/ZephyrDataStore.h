@@ -9,7 +9,7 @@
 #pragma once
 
 #include <mesh/Identity.h>
-#include <mesh/RTC.h>
+#include <mesh/MeshCore.h>
 #include <NodePrefs.h>
 #include <ContactInfo.h>
 #include <ChannelDetails.h>
@@ -31,14 +31,6 @@ public:
 	bool saveMainIdentity(const mesh::LocalIdentity &identity);
 	void loadPrefs(NodePrefs &prefs);
 	void savePrefs(const NodePrefs &prefs);
-	/* Shutdown-reason breadcrumb: written just before a software power-off
-	 * (low-battery auto-shutdown) so the next boot can report why the node
-	 * went down — the offline queue doesn't survive System OFF, so this
-	 * flash marker is the only reliable channel. saveShutdownReason is
-	 * best-effort (called at critically low battery). takeShutdownReason
-	 * returns the stored code (0 = none) and clears it. */
-	void saveShutdownReason(uint8_t code);
-	uint8_t takeShutdownReason();
 	void loadContacts(DataStoreHost *host);
 	void saveContacts(DataStoreHost *host);
 	void loadChannels(DataStoreHost *host);
@@ -50,20 +42,18 @@ public:
 	uint32_t getStorageUsedKb() const;
 	uint32_t getStorageTotalKb() const;
 
-	/* Factory reset - delete all stored data */
-	void factoryReset();
+	/* Factory reset: erase every storage region, keep the volume marked as
+	 * ours so the next boot does not format it again. */
+	bool factoryReset();
+
+	/* First boot of ZephCore on this volume: format a foreign one, repair
+	 * an old bond store. Must run before bt_enable(). */
+	void adoptVolume();
 
 	/* Check if external QSPI flash is available */
 	bool hasExternalStorage() const { return _has_ext_fs; }
 	uint32_t getExternalStorageKb() const;
 
-	/* First-boot migration helpers — see formatNVSOnly() in .cpp */
-	bool hasInitMarker() const;
-	void writeInitMarker();
-	void formatNVSOnly();
-	bool hasPrefs() const;
-	bool prefsLookLikeArduino() const;
-	bool hasOldSettingsFile() const;
 
 	static bool mount();
 	static void unmount();
@@ -73,9 +63,11 @@ public:
 private:
 	/* Internal flash (always available) - identity, prefs */
 	static constexpr const char *MNT_POINT = "/lfs";
+	static constexpr const char *PREFS_JSON_FILE = "/lfs/prefs.json";
+	/* Legacy binary prefs (PrefsCodec): read once to migrate, then kept for
+	 * firmware from before prefs.json. */
 	static constexpr const char *PREFS_FILE = "/lfs/new_prefs";
 	static constexpr const char *MAIN_ID_FILE = "/lfs/_main.id";
-	static constexpr const char *SHUTDOWN_FILE = "/lfs/shutdn";
 
 	/* External QSPI flash (optional) - contacts, channels, blobs */
 	static constexpr const char *EXT_MNT_POINT = "/ext";
@@ -98,10 +90,13 @@ private:
 	int maxBlobRecs() const { return _has_ext_fs ? 100 : 20; }
 
 	void checkAdvBlobFile();
+	bool loadLegacyPrefs(NodePrefs &prefs);
+	bool hasInitMarker() const;
+	void writeInitMarker();
+	void formatNVSOnly();
+	bool hasPrefs() const;
+	bool prefsRadioImplausible() const;
+	bool hasOldSettingsFile() const;
 	void migrateToExternalFS();
-	bool openRead(const char *path, uint8_t *buf, size_t buf_sz, size_t &out_len) const;
-	bool atomicReplaceFile(const char *path, const uint8_t *buf, size_t len);
-	bool exists(const char *path) const;
-	bool removeFile(const char *path);
 	bool copyFile(const char *src, const char *dst);
 };

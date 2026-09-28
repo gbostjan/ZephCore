@@ -19,6 +19,7 @@
 #include <zephyr/kernel.h>
 
 #include "ui_task.h"
+#include "led_gate.h"
 
 #define WEAK __attribute__((weak))
 
@@ -36,11 +37,6 @@ WEAK void ui_set_msg_count(uint16_t count)
 	ARG_UNUSED(count);
 }
 
-WEAK void ui_set_ble_status(bool connected, const char *name)
-{
-	ARG_UNUSED(connected); ARG_UNUSED(name);
-}
-
 WEAK void ui_set_radio_params(uint32_t freq_hz, uint8_t sf,
 			       uint16_t bw_khz_x10, uint8_t cr,
 			       int8_t tx_power, int16_t noise_floor)
@@ -49,15 +45,11 @@ WEAK void ui_set_radio_params(uint32_t freq_hz, uint8_t sf,
 	ARG_UNUSED(cr); ARG_UNUSED(tx_power); ARG_UNUSED(noise_floor);
 }
 
-WEAK void ui_set_radio_runtime(int8_t effective_tx_power, bool apc_enabled,
-			       int8_t apc_reduction, int16_t apc_margin_x10,
-			       uint8_t apc_target_margin, uint8_t sync_word,
+WEAK void ui_set_radio_runtime(uint8_t sync_word,
 			       uint16_t preamble_len, bool rx_duty_cycle,
 			       bool radio_ready, bool in_rx, bool tx_active)
 {
-	ARG_UNUSED(effective_tx_power); ARG_UNUSED(apc_enabled);
-	ARG_UNUSED(apc_reduction); ARG_UNUSED(apc_margin_x10);
-	ARG_UNUSED(apc_target_margin); ARG_UNUSED(sync_word);
+	ARG_UNUSED(sync_word);
 	ARG_UNUSED(preamble_len); ARG_UNUSED(rx_duty_cycle);
 	ARG_UNUSED(radio_ready); ARG_UNUSED(in_rx); ARG_UNUSED(tx_active);
 }
@@ -83,6 +75,11 @@ WEAK void ui_set_battery(uint16_t mv, uint8_t pct)
 WEAK void ui_set_clock(uint32_t epoch)
 {
 	ARG_UNUSED(epoch);
+}
+
+WEAK void ui_set_tz(int8_t hours)
+{
+	ARG_UNUSED(hours);
 }
 
 WEAK void ui_add_recent(const char *name, int16_t rssi, uint32_t age_s)
@@ -118,14 +115,16 @@ WEAK void ui_set_ble_enabled(bool enabled)
 	ARG_UNUSED(enabled);
 }
 
-WEAK void ui_set_buzzer_quiet(bool quiet)
+WEAK void ui_set_buzzer_mode(uint8_t mode)
 {
-	ARG_UNUSED(quiet);
+	ARG_UNUSED(mode);
 }
 
+/* Not a no-op: a headless build still has the LoRa TX LED, and the gate that
+ * governs it lives outside the UI layer precisely so this case works. */
 WEAK void ui_set_leds_disabled(bool disabled)
 {
-	ARG_UNUSED(disabled);
+	zephcore_leds_set_disabled(disabled);
 }
 
 WEAK void ui_set_heartbeat_led(bool enabled)
@@ -138,24 +137,13 @@ WEAK void ui_set_offgrid_mode(bool enabled)
 	ARG_UNUSED(enabled);
 }
 
-WEAK void ui_set_battery_provider(uint16_t (*provider)(void))
-{
-	ARG_UNUSED(provider);
-}
-
-WEAK void ui_set_power_source_provider(bool (*provider)(void))
-{
-	ARG_UNUSED(provider);
-}
-
-WEAK void ui_set_auto_shutdown_mv(uint16_t mv)
+WEAK void ui_set_battery_provider(uint16_t (*mv)(void), uint8_t (*pct)(void))
 {
 	ARG_UNUSED(mv);
+	ARG_UNUSED(pct);
 }
 
-WEAK void ui_auto_shutdown_check(void) { }
-
-WEAK void ui_set_shutdown_hook(ui_shutdown_fn fn) { ARG_UNUSED(fn); }
+WEAK void ui_show_low_battery(bool hold) { ARG_UNUSED(hold); }
 
 WEAK void ui_refresh_battery(void) { }
 WEAK void ui_invalidate_battery_cache(void) { }
@@ -176,3 +164,11 @@ WEAK void ui_notify_channel_msg(const char *channel_name, const char *text,
 }
 
 WEAK void ui_notify_packet_sent(void) { }
+
+/* Input axis flip. The real state lives in ui_common.c, which is compiled
+ * whenever any UI hardware is present; a headless build has no input to flip,
+ * so the setter is a no-op and the mapper is the identity. The CLI calls
+ * these unconditionally. */
+WEAK void zephcore_input_set_flipped(bool flipped) { ARG_UNUSED(flipped); }
+WEAK bool zephcore_input_is_flipped(void) { return false; }
+WEAK uint16_t zephcore_input_map_code(uint16_t code) { return code; }

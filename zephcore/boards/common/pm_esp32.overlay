@@ -1,0 +1,63 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * Devicetree half of boards/common/pm_esp32.conf — auto-paired by
+ * zephcore_auto_pair_overlay() in CMakeLists.txt, so passing the .conf is
+ * enough; this file does not need to be listed separately.
+ *
+ * Only the board-independent part lives here.  Pin holds are wiring facts and
+ * live in each board's DTS/overlay (see "PAD HOLD" below).
+ */
+
+/*
+ * The RTC timer is the wake source for every timed sleep.  Upstream leaves it
+ * status = "disabled" (zephyr/dts/xtensa/espressif/esp32s3/esp32s3_common.dtsi),
+ * and soc/espressif/common/power.c checks for it in rtc_wakeup_enable():
+ * without a wakeup-capable rtc_timer device it logs "Sleep skipped. Make sure
+ * '&rtc_timer' is enabled as a wakeup source." and returns false — so
+ * CONFIG_PM=y on its own is a silent no-op.  This is the single easiest thing
+ * to forget when enabling ESP32 PM.
+ */
+&rtc_timer {
+	status = "okay";
+	wakeup-source;
+};
+
+/*
+ * Switches on the ESP32 GPIO wake source (ESP_SLEEP_WAKEUP_GPIO):
+ * gpio_esp32_pm_action() calls esp_sleep_enable_gpio_wakeup() on RESUME, which
+ * pm_device_driver_init() runs at boot, when the port is wakeup-capable.  The
+ * source is SoC-wide, so gpio0 alone also covers pins on gpio1.
+ *
+ * WHICH pins wake the SoC is decided by helpers/pm_esp32_wake.c: the LoRa IRQ
+ * line and the user button (alias sw0) become level wakes for the length of
+ * each sleep.  GPIO_INT_WAKEUP is deliberately NOT used anywhere: in Zephyr's
+ * ESP32 driver it means EXT1, which takes RTC pads only, has one trigger
+ * polarity for all its pins on the S3 (an active-low button and an active-high
+ * DIO1 cannot both be armed: the one configured second is refused), and leaves
+ * each pad on the RTC mux after a sleep.  devdocs/lld/13-power-management.md
+ * F-1/F-2.
+ *
+ * Side effect worth knowing: this trigger keeps RTC_PERIPH powered in every
+ * light sleep (esp_sleep_start forces it ON for RTC_GPIO_TRIG_EN).
+ */
+&gpio0 {
+	wakeup-source;
+};
+
+/*
+ * PAD HOLD — with CONFIG_PM, gpio_esp32_sys_init() (and the HAL's
+ * esp_sleep_startup_init()) give every pad an isolated sleep configuration —
+ * input off, output off, no pulls — and turn on the automatic switch to it on
+ * sleep entry.  So EVERY output that is not held floats for the length of each
+ * sleep, whatever its power domain: RTC pads and digital pads alike.  Only
+ * ESP32_GPIO_SLEEP_HOLD_EN (esp32_sleep_gpio_prepare() in power.c) keeps a
+ * level through a sleep.
+ *
+ * The radio keeps receiving while the SoC sleeps, so every line it depends on
+ * must be held by the board: NSS (a floating chip-select lets the sleeping
+ * SX1262 clock garbage into its retention RAM — the node then transmits ~30 dB
+ * down until reboot), RESET, an MCU-driven RF switch or FEM enable, and the
+ * FEM's supply regulator.  The flag is inert when CONFIG_PM=n, so boards carry
+ * it unconditionally.  Check a board's radio lines before declaring
+ * `light_sleep: true` in its zephcore.yml.
+ */

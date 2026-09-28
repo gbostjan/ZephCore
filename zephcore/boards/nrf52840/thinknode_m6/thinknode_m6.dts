@@ -9,16 +9,17 @@
  * - SX1262 LoRa radio on SPI1 (DIO2 RF switch, DIO3 TCXO 3.3V, 22dBm)
  *   NSS=P1.12, DIO1=P1.06, RESET=P1.10, BUSY=P1.11
  * - GPS L76K on UART0 (9600 baud, CASIC/Air530Z — luatos,air530z driver)
- *   Control: GPS_EN=P0.06 (active-HIGH), GPS_RESET=P0.29 (active-LOW),
- *            GPS_STANDBY=P0.30, GPS_PPS=P0.31
+ *   Control: GPS_EN=P0.06 (active-HIGH), GPS_RESET=P0.29 (REINIT — must
+ *            float, see below), GPS_STANDBY=P0.30, GPS_PPS=P0.31
  * - Battery ADC on AIN4 (P0.28), 1.75:1 voltage divider
  *   ADC_CTRL enable pin: P0.11 (gpio-hog, always HIGH)
  * - LEDs: RED=P0.12, BLUE=P0.07 (both active-HIGH, LED_STATE_ON=HIGH)
  *   TX LED = BLUE (P_LORA_TX_LED = PIN_LED_BLUE)
  * - Button on P0.17 (active-low, pull-up)
  * - I2C on P1.09/P0.08 for on-board sensors
- * - QSPI Flash MX25R1635F (2MB): SCK=P1.03, CS=P0.23, IO0=P1.01,
- *   IO1=P1.02, IO2=P1.04, IO3=P1.05, enable=P0.21
+ * - No external flash.  The board routes QSPI (SCK=P1.03, CS=P0.23,
+ *   IO0=P1.01, IO1=P1.02, IO2=P1.04, IO3=P1.05, enable=P0.21) but the
+ *   MX25R1635F is not populated — see the note at the bottom of this file.
  * - Power enable: PIN_PWR_EN=P0.27 (regulator-boot-on)
  */
 
@@ -79,10 +80,10 @@
 
 	/* Multi-tap detection
 	 * 1 tap  → KEY_1 = page next
-	 * 2 taps → KEY_B = flood advert
+	 * 2 taps → KEY_B = LED heartbeat toggle
 	 * 3 taps → KEY_D = buzzer mute toggle
 	 * 4 taps → KEY_C = GPS on/off
-	 * 5 taps → KEY_E = LED heartbeat toggle */
+	 * 5 taps → KEY_E = flood advert */
 	user_btn_multitap {
 		compatible = "zephcore,input-multi-tap";
 		input-codes = <INPUT_KEY_A>;
@@ -103,17 +104,6 @@
 		regulator-name = "pwr-enable";
 		enable-gpios = <&gpio0 27 GPIO_ACTIVE_HIGH>;
 		regulator-boot-on;
-	};
-
-	/* QSPI flash enable (QSPI_FLASH_EN = P0.21) — must be HIGH before flash responds.
-	 * WARNING: Nordic QSPI NOR driver hangs forever if flash doesn't respond.
-	 * This regulator ensures flash is powered before driver init (priority 41). */
-	qspi_flash_enable: qspi-flash-enable {
-		compatible = "regulator-fixed";
-		regulator-name = "qspi-flash-enable";
-		enable-gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
-		regulator-boot-on;
-		startup-delay-us = <1000>;
 	};
 
 	/* ADC_CTRL (PIN_ADC_CTRL = P0.11) — enables the VBAT resistor divider only
@@ -138,9 +128,8 @@
 		};
 	};
 
-	/* GPS_RESET (P0.29) is driven statically HIGH (de-asserted) by a gpio-hog
-	 * in &gpio0 below — see the note there. Arduino MeshCore does the same
-	 * (variant.cpp: digitalWrite(PIN_GPS_RESET, HIGH), never pulsed). */
+	/* GPS_RESET (P0.29) is the module's REINIT line and is intentionally left
+	 * floating (unconfigured input) — see the note in &gpio0 below. */
 
 	aliases {
 		led0 = &led_red;
@@ -154,8 +143,8 @@
 		 * L76K (CASIC/Air530Z) is driven by the luatos,air530z driver via
 		 * on-off-gpios, and exposing those aliases would push M6 down the
 		 * T1000-E GPS sequence in ZephyrGPSManager (HAS_GPS_SLEEP/RESET).
-		 * GPS_RESET (P0.29) and GPS_STANDBY (P0.30) are hogged HIGH in
-		 * &gpio0 instead — static drive, matching Arduino MeshCore. */
+		 * GPS_STANDBY (P0.30) is hogged HIGH in &gpio0; GPS_RESET (P0.29)
+		 * is left floating — see the note there. */
 		gps-enable = &gps_enable_pin;
 	};
 };
@@ -199,26 +188,26 @@
 	 * (see the / node) — not hogged HIGH — so the VBAT divider only draws
 	 * current during a battery sample, matching Arduino MeshCore. */
 
-	/* GPS control lines held static, mirroring Arduino MeshCore variant.cpp
-	 * (GPS_EN is driven separately by the luatos,air530z on-off-gpios):
-	 *   GPS_STANDBY (P0.30) HIGH — L76K runs, never parked in standby.
-	 *   GPS_RESET   (P0.29) HIGH — reset de-asserted (active-LOW line).
+	/* GPS control lines (GPS_EN is driven separately by the luatos,air530z
+	 * on-off-gpios):
+	 *   GPS_STANDBY (P0.30) hogged HIGH — L76K runs, never parked in standby.
+	 *   GPS_RESET   (P0.29) NOT driven — this is the module's REINIT line and
+	 *     must float. Driving it (in particular HIGH, which this board used to
+	 *     do via a gpio-hog on the mistaken premise that HIGH was a de-asserted
+	 *     active-LOW reset) holds the L76K silent: it emits no NMEA at all and
+	 *     GPS is never detected. Upstream MeshCore bench-tested a sealed M6
+	 *     (passive NMEA capture): pin driven HIGH = 0 bytes, floating = full
+	 *     stream — so they set GPS_RESET = -1 (5c534c43). Meshtastic likewise
+	 *     leaves the pin an input.
 	 * M6 has no physical GPS switch; runtime on/off is via GPS_EN
-	 * (gps-enable alias) under software/CLI control. Hogs are used so the
-	 * pins are actively driven at boot without needing a consumer — the
+	 * (gps-enable alias) under software/CLI control. A hog is used for STANDBY
+	 * so the pin is actively driven at boot without needing a consumer — the
 	 * gpio-leds nodes are not bound by any driver in this build. */
 	gps-standby-hog {
 		gpio-hog;
 		gpios = <30 GPIO_ACTIVE_HIGH>;
 		output-high;
 		line-name = "GPS Standby";
-	};
-
-	gps-reset-hog {
-		gpio-hog;
-		gpios = <29 GPIO_ACTIVE_HIGH>;
-		output-high;
-		line-name = "GPS Reset";
 	};
 };
 
@@ -233,7 +222,8 @@
  * via on-off-gpios (P0.06 = GPS_EN, shared with the gps-enable alias used for
  * runtime power control in ZephyrGPSManager). No zephyr,deferred-init: the
  * driver powers the module on-off-gpios HIGH at init before opening the pipe.
- * GPS_RESET (P0.29) and GPS_STANDBY (P0.30) are hogged HIGH in &gpio0. */
+ * GPS_STANDBY (P0.30) is hogged HIGH in &gpio0; GPS_RESET (P0.29) is left
+ * floating (driving it silences the module — see the note there). */
 &uart0 {
 	compatible = "nordic,nrf-uarte";
 	status = "okay";
@@ -294,26 +284,24 @@
 	};
 };
 
-/* QSPI Flash — MX25R1635F 2MB */
-&qspi {
-	status = "okay";
-	pinctrl-0 = <&qspi_default>;
-	pinctrl-1 = <&qspi_sleep>;
-	pinctrl-names = "default", "sleep";
-
-	qspi_flash: qspi_flash@0 {
-		compatible = "nordic,qspi-nor";
-		reg = <0>;
-		writeoc = "pp";
-		readoc = "fastread";
-		sck-frequency = <16000000>;
-		jedec-id = [c2 28 15];        /* MX25R1635F */
-		size = <16777216>;            /* 2MB = 16Mbit */
-		has-dpd;
-		t-enter-dpd = <10000>;
-		t-exit-dpd = <35000>;
-	};
-};
+/* No QSPI flash node.
+ *
+ * The board routes a QSPI bus and the datasheet lists an MX25R1635F, but the
+ * chip is not actually populated: upstream Arduino MeshCore dropped its
+ * QSPIFLASH=1 build flag in 5c534c43's sibling commit e4fbd386 — "M6 doesn't
+ * have flash chip available, so companion roles fail to start" — after
+ * hitting exactly that on real hardware.  ZephCore declared the part (with a
+ * P0.21 enable regulator and a comment warning that the Nordic QSPI NOR
+ * driver hangs if the flash does not answer), which is the same wrong
+ * assumption arrived at independently, so companion builds most likely never
+ * came up here either.
+ *
+ * Everything now lives on internal flash: /lfs holds identity, prefs,
+ * contacts and channels, and ZephyrDataStore reports _has_ext_fs = 0.
+ * If a unit ever turns up with the chip fitted, restore the &qspi node, its
+ * partition, the P0.21 enable regulator and the qspi-ext.dtsi include —
+ * the pinctrl groups are still in thinknode_m6-pinctrl.dtsi.
+ */
 
 /* USB CDC for console/CLI */
 zephyr_udc0: &usbd {
@@ -328,21 +316,4 @@ zephyr_udc0: &usbd {
 /* SoftDevice v6 partition layout (S140 v6 — Adafruit nRF52 bootloader) */
 #include "../../common/nrf52_partitions_sdv6.dtsi"
 
-/* External QSPI flash partitions */
-&qspi_flash {
-	partitions {
-		compatible = "fixed-partitions";
-		#address-cells = <1>;
-		#size-cells = <1>;
-
-		/* Full 2MB for LittleFS storage */
-		qspi_storage_partition: partition@0 {
-			label = "qspi_storage";
-			reg = <0x00000000 0x00200000>;
-		};
-	};
-};
-
-/* External QSPI /ext automount */
-#include "../../common/qspi-ext.dtsi"
 #include "../../common/nrf52_wakeup.dtsi"

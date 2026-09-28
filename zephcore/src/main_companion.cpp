@@ -1,11 +1,9 @@
 /*
  * SPDX-License-Identifier: MIT
- * ZephCore - CompanionMesh (Event-Driven)
+ * ZephCore companion: composition root and mesh event loop.
  *
- * BLE stack is in adapters/ble/ZephyrBLE.cpp.
- * USB CDC transport is in adapters/usb/ZephyrUsbCompanion.cpp.
- * UI ↔ mesh actions are in helpers/ui/ui_mesh_actions.cpp.
- * This file handles: mesh event loop, LoRa, GPS, data storage, init.
+ * Transports: adapters/ble/ZephyrBLE.cpp, adapters/usb/ZephyrCompanionUSB.cpp.
+ * UI to mesh actions: helpers/ui/ui_mesh_actions.cpp.
  */
 
 #include <stdio.h>
@@ -24,30 +22,35 @@ LOG_MODULE_REGISTER(zephcore_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 #include <adapters/clock/ZephyrRTCDiscover.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/drivers/hwinfo.h>
+#include <helpers/boot_info.h>
+#include <helpers/LoopWakeStats.h>
+#include "mesh_events.h"
 #include <zephyr/sys/reboot.h>
 #include <ZephyrSensorManager.h>
 #include <helpers/time_sync.h>
 #include "ui_task.h"
+#include "ui_radio_state.h"
 #include "ui_mesh_actions.h"
+#if IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
+#include "display.h"
+#endif
 #include "oled_power.h"
+#include "led_gate.h"
+#include "buzzer_gate.h"
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_BUZZER)
 #include "buzzer.h"
 #endif
 
-#include <ZephyrBLE.h>
-
-/* The wired-companion stack (ZephyrCompanionUSB) is compiled when either
- * logging needs the CDC console (debug builds), the native-USB companion is
- * enabled (CONFIG_ZEPHCORE_COMPANION_USB, default-y on USB-capable boards), or
- * the plain-UART companion is enabled (CONFIG_ZEPHCORE_COMPANION_SERIAL, for
- * USB-UART-bridge / no-USB boards).  All three share the same frame parser,
- * TX ring, CLI, and BLE arbitration — only the byte backend differs. */
-#define ZEPHCORE_USB_STACK \
-	(IS_ENABLED(CONFIG_LOG) || IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_USB) || \
-	 IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_SERIAL))
+/* The companion transports (BLE, USB/UART, TCP) as upstream
+ * BaseSerialInterfaces; also defines ZEPHCORE_USB_STACK. */
+#include <CompanionInterfaces.h>
+#include <helpers/MultiSerialInterface.h>
+#include <app/CompanionSerial.h>
+#if IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_WIFI)
+#include <app/CompanionWifi.h>
+#endif
 
 #if ZEPHCORE_USB_STACK
-#include <ZephyrCompanionUSB.h>
 #include <ZephyrUSBCDC.h>
 #endif
 
@@ -57,90 +60,66 @@ LOG_MODULE_REGISTER(zephcore_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 #endif
 
 /* Radio + mesh includes (shared header selects LR1110 or SX126x) */
-#include <mesh/RadioIncludes.h>
+#include <src/RadioIncludes.h>
 #ifdef ZEPHCORE_LORA
 #include <app/CompanionMesh.h>
 #include <helpers/CommonCLI.h>
-#include <helpers/ClientACL.h>
+#include <helpers/pm_sleep_guard.h>
 #include <helpers/StatsFormatHelper.h>
+#include <app/CompanionCLI.h>
 #include <helpers/battery_curve.h>
+#include <zephyr_poweroff.h>
+#include <app/PowerPolicy.h>
 #endif
 
-/*
- * BLE Controller assert handler — without this, a controller assert
- * silently freezes the CPU at highest IRQ priority with zero log output.
- * This prints the file/line and reboots so we can actually see what happened.
- */
+#if IS_ENABLED(CONFIG_ZEPHCORE_PACKET_LOGGING)
+/* helpers/PacketLog.h hook, a no-op here: packet_logging.conf is for the
+ * repeater, room server and observer consoles. A companion's USB port carries
+ * the binary app protocol, and its text CLI echoes through its own TX ring
+ * (adapters/usb/ZephyrCompanionUSB.cpp). */
+extern "C" void zc_console_line_start(void) {}
+#endif
+
+/* Without this a BLE controller assert freezes the CPU at top IRQ priority
+ * with no output; log the location and reboot. */
 #if IS_ENABLED(CONFIG_BT_CTLR_ASSERT_HANDLER)
 extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
 {
 	LOG_ERR("!!! BLE CONTROLLER ASSERT: %s:%u !!!", file ? file : "?", line);
-	/* Force flush logs before reboot */
-	k_sleep(K_MSEC(100));
+	k_sleep(K_MSEC(100));  /* let the log drain */
 	sys_reboot(SYS_REBOOT_COLD);
 }
 #endif
 
-/*
- * Event-driven mesh loop - replaces 50ms polling with true event signaling.
- * Events are signaled from ISR/callbacks, mesh loop wakes immediately.
- * NO periodic timer - CPU sleeps until actual events occur.
- */
-#define MESH_EVENT_LORA_RX       BIT(0)  /* LoRa packet received */
-#define MESH_EVENT_LORA_TX_DONE  BIT(1)  /* LoRa TX complete (event-driven!) */
-#define MESH_EVENT_BLE_RX        BIT(2)  /* BLE frame received */
-#define MESH_EVENT_HOUSEKEEPING  BIT(3)  /* Periodic housekeeping (noise floor, etc.) */
-#define MESH_EVENT_UI_ACTION     BIT(4)  /* Button action from UI (deferred to mesh thread) */
-#define MESH_EVENT_GPS_ACTION    BIT(5)  /* GPS state change (must run on main thread!) */
-#define MESH_EVENT_TX_DRAIN      BIT(6)  /* Outbound packet delay expired, run checkSend */
-#define MESH_EVENT_PREFS_DIRTY   BIT(8)  /* Prefs mutated off-main; main flushes to flash */
-#define MESH_EVENT_RTC_SAVE      BIT(9)  /* Hardware-RTC write requested off-main */
-#define MESH_EVENT_CONTACT_ITER  BIT(10) /* Continue contact-dump iteration on main thread */
+/* The mesh thread blocks on these; ISRs and callbacks post them. The shared
+ * bits are in mesh_events.h; these are the companion's own. */
+#define MESH_EVENT_UI_ACTION     BIT(MESH_EVENT_ROLE_BASE)      /* Button action from UI (deferred to mesh thread) */
+#define MESH_EVENT_JOYSTICK_LOOP BIT(MESH_EVENT_ROLE_BASE + 1)  /* Run the joystick UI loop (on input, notify or its timers) */
+#define MESH_EVENT_PREFS_DIRTY   BIT(MESH_EVENT_ROLE_BASE + 2)  /* Prefs mutated off-main; main flushes to flash */
+#define MESH_EVENT_CONTACT_ITER  BIT(MESH_EVENT_ROLE_BASE + 3)  /* Continue contact-dump iteration on main thread */
+#define MESH_EVENT_LINK          BIT(MESH_EVENT_ROLE_BASE + 4)  /* A transport connected or disconnected */
+#define MESH_EVENT_PERSIST       BIT(MESH_EVENT_ROLE_BASE + 5)  /* Flush deferred writes: a reboot/power-off waits on it */
 
 #ifdef ZEPHCORE_LORA
-/* Forward decls — data_store + companion_mesh_ptr statics are defined further
- * down in the file, so mesh_event_loop() can't reference them directly. */
 static void save_prefs_to_flash(void);
-static void vcontact_battery_alert_check(void);
+static void power_policy_tick(void);
 #endif
-
-/* Pending epoch for a deferred zephcore_rtc_save(). gps_fix_callback runs on
- * the GNSS modem_chat worker thread, where the RTC's blocking I2C transactions
- * (burst read/write, several ms each) would stall NMEA ingest — same hazard
- * documented for prefs flash writes below. We stash the latest epoch and let
- * the main thread perform the actual I2C write via MESH_EVENT_RTC_SAVE;
- * concurrent posts coalesce into one save of the latest time. */
-static atomic_t pending_rtc_epoch = ATOMIC_INIT(0);
 
 #define MESH_EVENT_BASE          (MESH_EVENT_LORA_RX | MESH_EVENT_LORA_TX_DONE | \
 	MESH_EVENT_BLE_RX | MESH_EVENT_HOUSEKEEPING | MESH_EVENT_UI_ACTION |  \
 	MESH_EVENT_GPS_ACTION | MESH_EVENT_TX_DRAIN | MESH_EVENT_PREFS_DIRTY | \
-	MESH_EVENT_RTC_SAVE | MESH_EVENT_CONTACT_ITER)
+	MESH_EVENT_CONTACT_ITER | MESH_EVENT_LINK | MESH_EVENT_PERSIST)
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_DESIGN_JOYSTICK)
-#define MESH_EVENT_JOYSTICK_LOOP BIT(7)  /* Joystick UI loop tick (50 ms) */
 #define MESH_EVENT_ALL           (MESH_EVENT_BASE | MESH_EVENT_JOYSTICK_LOOP)
 #else
 #define MESH_EVENT_ALL           MESH_EVENT_BASE
 #endif
 
-/* Housekeeping interval - infrequent to preserve power savings */
 #define HOUSEKEEPING_INTERVAL_MS CONFIG_ZEPHCORE_HOUSEKEEPING_INTERVAL_MS
 
-/* Event-driven mesh loop - k_event for signaling from ISR/callbacks */
 static struct k_event mesh_events;
 
-/* Defer a hardware-RTC write to the main thread (see pending_rtc_epoch above
- * for why gps_fix_callback can't do this inline). Coalesces like prefs-dirty:
- * only the latest epoch survives if multiple fixes land before the main loop
- * services the event. */
-static void request_rtc_save(uint32_t epoch)
-{
-	atomic_set(&pending_rtc_epoch, (atomic_val_t)epoch);
-	k_event_post(&mesh_events, MESH_EVENT_RTC_SAVE);
-}
-
-/* Work items for event-driven processing */
-static void process_companion_rx(void);   /* runs on MAIN thread (see ble_on_rx_frame) */
+static void process_companion_rx(void);   /* runs on MAIN thread (see link_on_rx) */
 static void run_contact_iteration(void);  /* runs on MAIN thread (see MESH_EVENT_CONTACT_ITER) */
 static void housekeeping_timer_fn(struct k_timer *timer);
 #if ZEPHCORE_USB_STACK
@@ -161,127 +140,123 @@ static void joystick_signal_tx(void)
 }
 #endif
 
+/* Threading rule for everything below: the mesh state (packet pool,
+ * dispatcher, contact table) belongs to the MAIN thread. Transport callbacks
+ * run on sysworkq or in ISR context, so they only queue and post an event;
+ * the work happens in the event loop. Breaking this caused the stuck
+ * "Sending..." bug (a reply parsed on sysworkq raced loop()). */
+
 #if ZEPHCORE_USB_STACK
-/* Completed USB text-CLI lines are run on the MAIN thread (the USB adapter
- * assembles them on sysworkq).  CommonCLI::handleCommand mutates mesh state
- * shared with loop(), so it can't run on sysworkq — same hazard as the
- * binary protocol path.  Drained on MESH_EVENT_BLE_RX. */
+/* Completed USB text-CLI lines, drained on MESH_EVENT_BLE_RX. */
 #define CLI_LINE_BUF_SIZE 256
 struct companion_cli_line { char buf[CLI_LINE_BUF_SIZE]; };
 K_MSGQ_DEFINE(companion_cli_queue, sizeof(struct companion_cli_line), 4, 4);
 #endif
 
-#if ZEPHCORE_USB_STACK
-/* USB TX-drained callback (mirrors BLE on_tx_idle): the TX ring emptied, so
- * resume the contact pump to queue the next batch. Runs in the CDC TX
- * interrupt-callback context — k_event_post is ISR-safe.  The contact dump
- * reads the contact table, which the main thread can mutate (addContact on
- * inbound advert), so it MUST run on the main thread, not here. */
-static void usb_on_tx_drain(void)
+K_TIMER_DEFINE(housekeeping_timer, housekeeping_timer_fn, NULL);
+
+#ifdef ZEPHCORE_LORA
+static CompanionMesh *companion_mesh_ptr;
+
+/* The thread running mesh_event_loop(), once it is running. */
+static k_tid_t mesh_thread;
+static K_SEM_DEFINE(persist_done, 0, 1);
+
+/* Bounds a reboot/power-off requested off the main thread. A full contacts
+ * rewrite is a second or two on internal flash; past this the device goes
+ * down anyway rather than hang on a wedged main thread. */
+#define PERSIST_WAIT_MS 5000
+
+/* Main thread: the deferred contacts/channels writes, and a prefs save still
+ * waiting in the event mask. */
+static void persist_pending_writes(void)
 {
-	k_event_post(&mesh_events, MESH_EVENT_CONTACT_ITER);
+	if (k_event_clear(&mesh_events, MESH_EVENT_PREFS_DIRTY) & MESH_EVENT_PREFS_DIRTY) {
+		save_prefs_to_flash();
+	}
+	companion_mesh_ptr->flushPendingWrites();
+}
+
+/* zephyr_poweroff.h: every clean reboot and power-off path calls this. The
+ * lazy contacts deadline is long (CompanionMesh.h), so a clean shutdown that
+ * skipped it would lose the last hour of contact updates. */
+extern "C" void zephcore_persist_before_off(void)
+{
+	if (!companion_mesh_ptr) {
+		return;
+	}
+	if (!mesh_thread || k_current_get() == mesh_thread) {
+		persist_pending_writes();
+		return;
+	}
+	/* The mesh state belongs to the main thread: hand the flush over. */
+	k_sem_reset(&persist_done);
+	k_event_post(&mesh_events, MESH_EVENT_PERSIST);
+	if (k_sem_take(&persist_done, K_MSEC(PERSIST_WAIT_MS)) != 0) {
+		LOG_WRN("persist before off: main thread did not flush in %d ms",
+			PERSIST_WAIT_MS);
+	}
 }
 #endif
 
-/* Housekeeping timer for periodic tasks (noise floor calibration, etc.)
- * Fires every 5 seconds to wake event loop for maintenance without
- * compromising event-driven power savings. */
-K_TIMER_DEFINE(housekeeping_timer, housekeeping_timer_fn, NULL);
-
-/* Forward declarations */
-#ifdef ZEPHCORE_LORA
-static CompanionMesh *companion_mesh_ptr;
+/* ========== Companion transports ==========
+ *
+ * As upstream's companion_radio/main.cpp: every transport this build has is a
+ * BaseSerialInterface in one MultiSerialInterface, and CompanionMesh sees only
+ * that (through CompanionSerial, which keeps a lossless reply the transports
+ * could not take). Every connected transport gets every frame; a command from
+ * any of them is served. */
+static MultiSerialInterface interface_manager;
+static CompanionSerial companion_serial(interface_manager);
+#if IS_ENABLED(CONFIG_BT)
+static ZephyrBLEInterface ble_interface;
+#endif
+#if ZEPHCORE_USB_STACK
+static ZephyrSerialInterface usb_interface;
+#endif
+#if IS_ENABLED(CONFIG_ZEPHCORE_TRANSPORT_TCP)
+static ZephyrTcpInterface tcp_interface;
 #endif
 
-/* ========== BLE callbacks → main ========== */
-
-/* BLE RX callback — called from BLE adapter when a frame arrives.
- * Queues to recv_queue and wakes mesh event loop. */
-static void ble_on_rx_frame(const uint8_t *data, uint16_t len)
+/* The transports' callbacks run on their own threads (BT, sysworkq, ISR, the
+ * TCP listener), so they only post; the work happens in the event loop. */
+static void link_on_rx(void)
 {
-	struct {
-		uint16_t len;
-		uint8_t buf[MAX_FRAME_SIZE];
-	} f;
-
-	if (len == 0 || len > MAX_FRAME_SIZE) {
-		return;
-	}
-
-	f.len = len;
-	memcpy(f.buf, data, len);
-
-	if (k_msgq_put(zephcore_ble_get_recv_queue(), &f, K_NO_WAIT) != 0) {
-		LOG_WRN("recv queue full");
-		return;
-	}
-
-	/* Wake the MAIN thread to parse the frame.  handleProtocolFrame()
-	 * mutates the lock-free packet pool / dispatcher that loop() also
-	 * touches, so it MUST run on the main thread — parsing on sysworkq
-	 * races the main loop (the source of the stuck-"Sending…" bug when an
-	 * inbound reply is processed while a send command is parsed). */
 	k_event_post(&mesh_events, MESH_EVENT_BLE_RX);
 }
 
-/* BLE TX idle callback — called when TX queue is empty.
- * Continues contact iteration on the MAIN thread (the dump reads the contact
- * table, which the main thread can mutate — so it can't run on sysworkq). */
-static void ble_on_tx_idle(void)
+/* A transport's TX drained: resume the contact dump and the TX drain. */
+static void link_on_tx_idle(void)
 {
 	k_event_post(&mesh_events, MESH_EVENT_CONTACT_ITER);
 	k_event_post(&mesh_events, MESH_EVENT_TX_DRAIN);
 }
 
-/* BLE connected callback — notify UI, clear USB state if needed */
-static void ble_on_connected(void)
+/* Counted, so the loop sees every edge even when several coalesce into one
+ * MESH_EVENT_LINK. */
+static atomic_t link_ups;
+static atomic_t link_downs;
+
+static void link_on_connected(void)
 {
-	ui_notify(UI_EVENT_BLE_CONNECTED);
+	atomic_inc(&link_ups);
+	k_event_post(&mesh_events, MESH_EVENT_LINK);
 }
 
-/* Per-session cleanup shared by BLE disconnect and USB session-end.
- * Silently cancels in-progress contact iteration (a reconnect would otherwise
- * send a stale PACKET_CONTACT_END to the new session and confuse the phone's
- * sync state machine), resets message sync (un-ACKed peeked message stays in
- * the queue and is re-sent on the next CMD_SYNC_NEXT_MESSAGE), and frees the
- * Ed25519 sign buffer if a sign op was interrupted (else an 8KB leak). */
-static void companion_session_cleanup(void)
+static void link_on_disconnected(void)
 {
-#ifdef ZEPHCORE_LORA
-	companion_mesh_ptr->cancelContactIterator();
-	companion_mesh_ptr->cancelSyncPending();
-	companion_mesh_ptr->cleanupSignState();
-#endif
+	atomic_inc(&link_downs);
+	k_event_post(&mesh_events, MESH_EVENT_LINK);
 }
 
-#if ZEPHCORE_USB_STACK
-/* USB session start — mirror ble_on_connected's UI notification so the
- * device shows "connected" during a USB session (matches Arduino, which
- * lights the indicator for serial transports too). */
-static void usb_on_session_start(void)
-{
-	ui_notify(UI_EVENT_BLE_CONNECTED);
-}
+static const struct companion_link_cbs link_cbs = {
+	.on_rx = link_on_rx,
+	.on_tx_idle = link_on_tx_idle,
+	.on_connected = link_on_connected,
+	.on_disconnected = link_on_disconnected,
+};
 
-/* USB session end (host closed the port) — same cleanup + UI notification
- * as ble_on_disconnected. */
-static void usb_on_session_end(void)
-{
-	companion_session_cleanup();
-	ui_notify(UI_EVENT_BLE_DISCONNECTED);
-}
-#endif
-
-/* BLE disconnected callback — clean up state and notify UI */
-static void ble_on_disconnected(void)
-{
-#if ZEPHCORE_USB_STACK
-	zephcore_usb_companion_reset_rx();
-#endif
-	companion_session_cleanup();
-	ui_notify(UI_EVENT_BLE_DISCONNECTED);
-}
-
+#if IS_ENABLED(CONFIG_BT)
 #if IS_ENABLED(CONFIG_ZEPHCORE_BLE_DFU)
 static void ble_on_dfu_request(void)
 {
@@ -290,201 +265,143 @@ static void ble_on_dfu_request(void)
 #endif
 
 static const struct ble_callbacks ble_cbs = {
-	.on_rx_frame = ble_on_rx_frame,
-	.on_tx_idle = ble_on_tx_idle,
-	.on_connected = ble_on_connected,
-	.on_disconnected = ble_on_disconnected,
+	.link = link_cbs,
 #if IS_ENABLED(CONFIG_ZEPHCORE_BLE_DFU)
 	.on_dfu_request = ble_on_dfu_request,
 #endif
 };
-
-/* ========== Frame send/receive (mesh ↔ BLE/USB) ========== */
-
-static size_t write_frame(const uint8_t *src, size_t len)
-{
-#if ZEPHCORE_USB_STACK
-	/* When USB owns the interface, replies must go out the CDC port — the BLE
-	 * send queue is never drained while USB is active (tx_drain no-ops on
-	 * IFACE_USB), so routing through zephcore_ble_send would strand the frame. */
-	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
-		/* A text-CLI session owns USB — swallow binary V3 output so the serial
-		 * console never sees framed garbage. Report success so callers don't
-		 * retry/back off on a frame we intentionally dropped. */
-		if (zephcore_usb_companion_is_text_session()) {
-			return len;
-		}
-		return zephcore_usb_companion_write_frame(src, len);
-	}
 #endif
-	return zephcore_ble_send(src, (uint16_t)len);
+
+/* The last client went away: drop the contact dump (a stale
+ * PACKET_CONTACT_END would confuse the next session), keep the un-ACKed
+ * message queued for re-send, free an abandoned sign buffer, and drop a held
+ * reply nobody will read. Not while another transport is still connected:
+ * it shares the dump and the sync. */
+static void companion_session_cleanup(void)
+{
+	companion_serial.drop();
+#ifdef ZEPHCORE_LORA
+	companion_mesh_ptr->cancelContactIterator();
+	companion_mesh_ptr->cancelSyncPending();
+	companion_mesh_ptr->cleanupSignState();
+#endif
 }
 
-/**
- * Push notification callback - sends push frames to BLE.
- * Push frames have format: [push_code] [data...]
- */
-static void push_callback(uint8_t code, const uint8_t *data, size_t len)
+/* MESH_EVENT_LINK: a transport (USB and TCP sessions included) connected or
+ * disconnected. */
+static void process_link_change(void)
 {
-	/* No point serializing if nobody is listening. A USB companion session
-	 * is "connected" too, but zephcore_ble_is_connected() only reports the BLE
-	 * link — without the USB check, pushes (new messages, etc.) are silently
-	 * dropped on a USB-attached client. */
-	bool transport_up = zephcore_ble_is_connected();
-#if ZEPHCORE_USB_STACK
-	/* A text-CLI session is not a binary companion — don't push V3 frames to it. */
-	transport_up = transport_up ||
-		(zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB &&
-		 !zephcore_usb_companion_is_text_session());
-#endif
-	if (!transport_up) return;
-
-	/* Push frame: code byte + optional data */
-	uint8_t push_buf[1 + MAX_FRAME_SIZE - 1];
-	size_t total_len = 1 + len;
-
-	if (total_len > MAX_FRAME_SIZE) {
-		LOG_WRN("data too long %u", (unsigned)len);
-		total_len = MAX_FRAME_SIZE;
-		len = MAX_FRAME_SIZE - 1;
+	if (atomic_set(&link_ups, 0) > 0) {
+		ui_notify(UI_EVENT_BLE_CONNECTED);
 	}
-
-	push_buf[0] = code;
-	if (len > 0 && data != nullptr) {
-		memcpy(&push_buf[1], data, len);
+	if (atomic_set(&link_downs, 0) > 0 && !companion_serial.isConnected()) {
+		companion_session_cleanup();
+		ui_notify(UI_EVENT_BLE_DISCONNECTED);
 	}
-
-	LOG_DBG("code=0x%02x len=%u (total frame)", code, (unsigned)total_len);
-	write_frame(push_buf, total_len);
 }
 
-/* RX processing work - handles received BLE/USB frames */
-/* Parse inbound BLE/USB binary frames on the MAIN thread.  Called from the
- * event loop on MESH_EVENT_BLE_RX (formerly a sysworkq work item — moved to
- * the main thread so handleProtocolFrame's mesh-state mutation can't race
- * loop()). */
+/* A binary companion client is listening on some transport (a USB text-CLI
+ * session is not one). */
+static bool companion_transport_up(void)
+{
+	return companion_serial.isConnected();
+}
+
+/* Inbound binary frames, on MESH_EVENT_BLE_RX. */
 static void process_companion_rx(void)
 {
-	struct {
-		uint16_t len;
-		uint8_t buf[MAX_FRAME_SIZE];
-	} f;
+	uint8_t buf[MAX_FRAME_SIZE];
+	size_t len;
+	bool handled = false;
 
-	/* Process all queued frames */
-	while (k_msgq_get(zephcore_ble_get_recv_queue(), &f, K_NO_WAIT) == 0) {
+	/* CompanionSerial reads nothing while it holds a reply */
+	while ((len = companion_serial.checkRecvFrame(buf)) > 0) {
+		handled = true;
 #ifdef ZEPHCORE_LORA
-		/* An in-flight contact dump deliberately survives commands parsed
-		 * here — it is only cancelled by CMD_APP_START (new session) or by
-		 * disconnect.  Do not abort it on inbound traffic: the app talks to
-		 * us mid-sync, and truncating the dump left it waiting forever. */
-		if (!companion_mesh_ptr->handleProtocolFrame(f.buf, f.len)) {
-			LOG_DBG("rx_process: unknown cmd 0x%02x len=%u", f.buf[0], (unsigned)f.len);
+		/* A contact dump survives commands in between (the app talks to us
+		 * mid-sync); only CMD_APP_START or a disconnect ends it. */
+		if (!companion_mesh_ptr->handleCmdFrame(buf, len)) {
+			LOG_DBG("rx_process: unknown cmd 0x%02x len=%u", buf[0], (unsigned)len);
 			uint8_t err_rsp[] = { 0x01, 0x01 };  /* PACKET_ERROR, ERR_UNSUPPORTED */
-			write_frame(err_rsp, sizeof(err_rsp));
+			companion_serial.writeFrame(err_rsp, sizeof(err_rsp));
 		}
 #endif
 	}
 
-#if ZEPHCORE_USB_STACK
-	/* Over USB, write_frame is synchronous and never kicks the BLE
-	 * tx-drain/on_tx_idle pump that paces multi-frame responses (e.g. contact
-	 * sync, which only emits PACKET_CONTACT_START in the command handler and
-	 * relies on continueContactIteration() for the rest). Kick the pump here so
-	 * any iteration started by the command(s) just handled actually proceeds;
-	 * the USB branch of tx_drain fires on_tx_idle and the loop self-sustains. */
-	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
-		zephcore_ble_kick_tx();
+	/* A command may have started a multi-frame response (the contact dump);
+	 * pump it. Only after a handled frame: CONTACT_ITER also runs this
+	 * function, and an unconditional post spun the main thread at 100% CPU. */
+	if (handled) {
+		k_event_post(&mesh_events, MESH_EVENT_CONTACT_ITER);
 	}
-#endif
 }
 
-/* Continue the contact-dump iteration when TX has space.  Runs on the MAIN
- * thread (driven by MESH_EVENT_CONTACT_ITER, posted from the BLE/USB tx-idle
- * callbacks) so reading the contact table never races a main-thread
- * addContact() from an inbound advert. */
+/* The contact dump, as far as every connected transport has room
+ * (MESH_EVENT_CONTACT_ITER): BLE and TCP below their 2/3 high-water mark and
+ * not congested, USB with room for a whole frame. A transport's TX idle
+ * brings us back. */
 static void run_contact_iteration(void)
 {
 #ifdef ZEPHCORE_LORA
 	if (!companion_mesh_ptr) {
 		return;
 	}
-
-#if ZEPHCORE_USB_STACK
-	if (zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB) {
-		/* Event-driven pacing (no fixed delay): fill the USB TX ring as far
-		 * as it'll hold, then stop. The CDC TX ISR drains it to the wire at
-		 * full speed and calls usb_on_tx_drain() when empty, which re-kicks
-		 * this work to queue the next batch — real backpressure, like BLE's
-		 * on_tx_idle. tx_has_space() guarantees each continueContactIteration
-		 * frame fits, so writeFrame never fails mid-dump. */
-		while (zephcore_usb_companion_tx_has_space(CONTACT_FRAME_SIZE)) {
-			if (!companion_mesh_ptr->continueContactIteration()) {
-				break;  /* iteration complete */
-			}
-		}
-		return;
-	}
-#endif
-
-	/* Don't iterate while BLE TX is congested — wait for drain to clear.
-	 * Also check 2/3 high-water mark (catches stray frames before full). */
-	if (zephcore_ble_is_congested()) {
-		return;
-	}
-
-	uint32_t used = k_msgq_num_used_get(zephcore_ble_get_send_queue());
-	uint32_t queue_size = CONFIG_ZEPHCORE_BLE_QUEUE_SIZE;
-	bool has_space = (used < (queue_size * 2 / 3));
-
-	if (has_space && companion_mesh_ptr) {
-		if (companion_mesh_ptr->continueContactIteration()) {
-			/* More contacts to send - kick TX drain which will re-trigger us */
-			zephcore_ble_kick_tx();
+	while (!companion_serial.isWriteBusy()) {
+		if (!companion_mesh_ptr->continueContactIteration()) {
+			break;  /* iteration complete */
 		}
 	}
 #endif
 }
 
-/*
- * Event-driven mesh loop - runs in main thread context.
- * Wakes on actual events: LoRa RX, LoRa TX done, BLE RX.
- * Plus a 5-second housekeeping timer for noise floor calibration, etc.
- */
+/* The main thread: blocks until an event, plus the housekeeping tick. */
 static void mesh_event_loop(void)
 {
 	LOG_INF("starting event-driven loop");
+#ifdef ZEPHCORE_LORA
+	mesh_thread = k_current_get();
+#endif
 
-	/* Start housekeeping timer for periodic maintenance tasks */
 	k_timer_start(&housekeeping_timer, K_MSEC(HOUSEKEEPING_INTERVAL_MS),
 		      K_MSEC(HOUSEKEEPING_INTERVAL_MS));
 
 	for (;;) {
-		/* Wait for any mesh event - blocks until signaled */
 		uint32_t events = k_event_wait(&mesh_events, MESH_EVENT_ALL, false, K_FOREVER);
-
-		/* Clear the events we're handling */
 		k_event_clear(&mesh_events, events);
+		loopWakeNote(events);
+
+		/* TX-idle resumes both the retained reply and commands left in RX.
+		 * Housekeeping is a fallback if a transport loses its drain kick. */
+		companion_serial.retry();
+
+		if (events & MESH_EVENT_LINK) {
+			process_link_change();
+		}
 
 #ifdef ZEPHCORE_LORA
-		/* Handle deferred UI button actions (flood advert, pref saves).
-		 * Must run in this thread — LoRa TX and flash writes block. */
+		/* A reboot/power-off on another thread is waiting for this. */
+		if ((events & MESH_EVENT_PERSIST) && companion_mesh_ptr) {
+			persist_pending_writes();
+			k_sem_give(&persist_done);
+		}
+#endif
+
+#ifdef ZEPHCORE_LORA
+		/* UI button actions (advert, pref saves) */
 		if (events & MESH_EVENT_UI_ACTION) {
 			mesh_handle_ui_actions();
 		}
 
-		/* Handle deferred GPS state transitions (wake/timeout).
-		 * MUST run here (main thread) because GNSS configuration uses
-		 * modem_chat_run_script() which blocks on a semaphore signaled
-		 * from the system work queue. Running it on the system work
-		 * queue would deadlock. */
+		/* GPS wake/timeout. GNSS configuration blocks on a semaphore the
+		 * system work queue signals, so it would deadlock there. */
 		if (events & MESH_EVENT_GPS_ACTION) {
 			gps_process_event();
 		}
 
-		/* Parse inbound BLE/USB frames + USB text-CLI lines HERE (main
-		 * thread) before loop() drains any outbound they enqueued — keeps
-		 * all mesh-state mutation on one thread (see ble_on_rx_frame). */
-		if (events & MESH_EVENT_BLE_RX) {
+		/* Inbound frames and CLI lines, before loop() drains what they
+		 * queued. */
+		if (events & (MESH_EVENT_BLE_RX | MESH_EVENT_CONTACT_ITER |
+			      MESH_EVENT_HOUSEKEEPING)) {
 			process_companion_rx();
 #if ZEPHCORE_USB_STACK
 			struct companion_cli_line c;
@@ -494,34 +411,30 @@ static void mesh_event_loop(void)
 #endif
 		}
 
-		/* Continue contact-dump iteration on the main thread (see
-		 * run_contact_iteration / MESH_EVENT_CONTACT_ITER). */
 		if (events & MESH_EVENT_CONTACT_ITER) {
 			run_contact_iteration();
 		}
 
-		/* Packet processing — only on radio/BLE/TX events */
+		/* Radio/transport/TX events, and housekeeping for loop()'s own
+		 * deadlines (lazy contact/channel flush, send timeout, keep-alive),
+		 * which would otherwise wait for unrelated traffic. */
 		if (companion_mesh_ptr &&
 		    (events & (MESH_EVENT_LORA_RX | MESH_EVENT_LORA_TX_DONE |
-			       MESH_EVENT_BLE_RX | MESH_EVENT_TX_DRAIN))) {
+			       MESH_EVENT_BLE_RX | MESH_EVENT_TX_DRAIN |
+			       MESH_EVENT_HOUSEKEEPING))) {
 			companion_mesh_ptr->loop();
 		}
 
-		/* Periodic housekeeping — maintenance + UI refresh */
 		if (events & MESH_EVENT_HOUSEKEEPING) {
-			/* Radio maintenance: noise floor calibration, AGC reset,
-			 * RX watchdog.  Separated from loop() so these never run
-			 * on packet-driven events. */
+			/* Noise floor, adaptive-CAD probe, RX watchdog: never on
+			 * packet-driven events. */
 			if (companion_mesh_ptr) {
 				companion_mesh_ptr->maintenanceLoop();
 			}
 
-			/* Contact-dump watchdog — the dump is pumped solely by the
-			 * BLE/USB tx-idle callback, so a single lost kick strands it
-			 * silently and the app waits for contacts that never arrive.
-			 * Only re-kick when the cursor has not moved across a whole
-			 * tick: a large dump legitimately spans several ticks, and
-			 * back-pressure resolves itself. */
+			/* Contact-dump watchdog: only the tx-idle callback pumps the
+			 * dump, so one lost kick strands it. Re-kick only if the
+			 * cursor did not move for a whole tick. */
 			static int wd_last_iter_idx = -1;
 			if (companion_mesh_ptr && companion_mesh_ptr->isContactIterActive()) {
 				int idx = companion_mesh_ptr->getContactIterIdx();
@@ -534,58 +447,39 @@ static void mesh_event_loop(void)
 				wd_last_iter_idx = -1;
 			}
 
-			/* BLE advertising watchdog — if bt_le_adv_start failed
-			 * transiently (HCI timeout, controller pacing) the device
-			 * would silently stop advertising and be undiscoverable
-			 * until next reboot.  Cheap to nudge it back here. */
+			/* Offline-queue watchdog (see msgWaitingWatchdog), only with
+			 * a live client: a reconnect drains the queue anyway, and a
+			 * prompt into a dead link would only delay the next one. */
+			if (companion_mesh_ptr && companion_transport_up()) {
+				companion_mesh_ptr->msgWaitingWatchdog();
+			}
+
+#if IS_ENABLED(CONFIG_BT)
+			/* Advertising watchdog: a transient bt_le_adv_start failure
+			 * otherwise leaves the node undiscoverable until reboot. */
 			if (zephcore_ble_is_enabled() && !zephcore_ble_is_connected() && !zephcore_ble_is_advertising()) {
 				LOG_WRN("BLE adv watchdog: not advertising, re-enabling");
 				zephcore_ble_set_enabled(true);
 			}
+#endif
 
 			mesh_housekeeping_ui_refresh();
 
-			/* Mesh time-sync paced evaluation — loop() only runs on
-			 * packet-driven events, so drive the 15-min tick here. */
 			if (companion_mesh_ptr) {
 				companion_mesh_ptr->timeSyncTick();
 			}
 
-			/* Low-battery auto-shutdown (companion only). Self-throttled
-			 * and compiled out unless the board sets a threshold — no
-			 * extra poll, just a cheap call on the existing tick. */
-			ui_auto_shutdown_check();
-
-			/* V-contact low-battery alert — independent of the UI-driven
-			 * auto-shutdown above (which is a weak no-op on headless
-			 * builds), same 30 s self-throttle. */
-			vcontact_battery_alert_check();
+			/* Low-battery auto-shutdown and the v-contact alert, UI or
+			 * not (app/PowerPolicy.cpp). */
+			power_policy_tick();
 		}
 
-		/* Off-main pref mutators (e.g. the autoshutdown CLI handler on
-		 * the sysworkq USB RX path) post this bit and update _prefs in
-		 * memory; we flush to flash here so the synchronous LittleFS
-		 * write doesn't block the originating thread.  Multiple posts
-		 * coalesce into one write of the latest _prefs values. */
+		/* Prefs changed off-main: the flash write happens here, and posts
+		 * coalesce into one write. */
 		if ((events & MESH_EVENT_PREFS_DIRTY) && companion_mesh_ptr) {
 			save_prefs_to_flash();
 		}
 #endif
-
-		/* Off-main RTC write request (gps_fix_callback runs in modem_chat
-		 * context — see request_rtc_save()). Perform the blocking I2C
-		 * write here on the main thread instead. */
-		if (events & MESH_EVENT_RTC_SAVE) {
-			zephcore_rtc_save((uint32_t)atomic_get(&pending_rtc_epoch));
-#ifdef ZEPHCORE_LORA
-			/* GPS just set the clock — arm the mesh time-sync drift envelope
-			 * and activate the deferred v-contact / flush buffered notices. */
-			if (companion_mesh_ptr) {
-				companion_mesh_ptr->noteGPSTimeSync();
-				companion_mesh_ptr->vcontactClockSynced();
-			}
-#endif
-		}
 
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_DESIGN_JOYSTICK)
 		if (events & MESH_EVENT_JOYSTICK_LOOP) {
@@ -595,7 +489,6 @@ static void mesh_event_loop(void)
 	}
 }
 
-/* Housekeeping timer callback - signals event to wake mesh loop periodically */
 static void housekeeping_timer_fn(struct k_timer *timer)
 {
 	ARG_UNUSED(timer);
@@ -603,24 +496,21 @@ static void housekeeping_timer_fn(struct k_timer *timer)
 }
 
 #ifdef ZEPHCORE_LORA
-/* LoRa RX callback - called from ISR context when packet received */
+/* ISR context */
 static void lora_rx_callback(void *user_data)
 {
 	ARG_UNUSED(user_data);
-	/* Signal event to wake mesh loop immediately */
 	k_event_post(&mesh_events, MESH_EVENT_LORA_RX);
 }
 
-/* LoRa TX complete callback - called from work queue when async TX finishes */
+/* Driver work queue, when an async TX finishes */
 static void lora_tx_done_callback(void *user_data)
 {
 	ARG_UNUSED(user_data);
-	/* Signal event to wake mesh loop for TX completion handling */
 	k_event_post(&mesh_events, MESH_EVENT_LORA_TX_DONE);
 }
 
-/* TX drain — Dispatcher queued a packet with a delay.
- * Schedule a precise wake so checkSend runs when the delay expires. */
+/* The dispatcher queued a delayed packet: wake when the delay expires. */
 static void tx_drain_work_fn(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -642,211 +532,84 @@ static ZephyrDataStore data_store(rtc_clock);
 #ifdef ZEPHCORE_LORA
 static mesh::ZephyrBoard zephyr_board;
 
-/* NodePrefs placeholder - will be set from CompanionMesh */
-static NodePrefs temp_prefs;
-
-#if IS_ENABLED(CONFIG_ZEPHCORE_RADIO_LR1110)
-/* LR1110 via Zephyr LoRa driver */
+/* main() binds the radio to companion_mesh.prefs (setPrefs) before begin(). */
 static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
-static mesh::LR1110Radio lora_radio(lora_dev, zephyr_board, &temp_prefs);
-#elif IS_ENABLED(CONFIG_ZEPHCORE_RADIO_LR2021)
-/* LR2021 via Zephyr LoRa driver */
-static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
-static mesh::LR2021Radio lora_radio(lora_dev, zephyr_board, &temp_prefs);
-#elif IS_ENABLED(CONFIG_ZEPHCORE_RADIO_SX127X)
-/* SX127x via Zephyr loramac-node driver */
-static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
-static mesh::SX127xRadio lora_radio(lora_dev, zephyr_board, &temp_prefs);
-#else
-/* SX126x via Zephyr LoRa driver */
-static const struct device *const lora_dev = DEVICE_DT_GET(DT_ALIAS(lora0));
-static mesh::SX126xRadio lora_radio(lora_dev, zephyr_board, &temp_prefs);
-#endif
+static mesh::LoRaRadio lora_radio(lora_dev, zephyr_board);
 
 static uint16_t get_battery_mv(void)
 {
 	return zephyr_board.getBattMilliVolts();
 }
 
-static void radio_reconfigure(void)
-{
-	lora_radio.reconfigure();
-}
-
 static mesh::ZephyrMillisecondClock ms_clock;
 static mesh::ZephyrRNG zephyr_rng;
-static mesh::SimpleMeshTables mesh_tables;
-static mesh::StaticPoolPacketManager packet_mgr;
-static CompanionMesh companion_mesh(lora_radio, ms_clock, zephyr_rng, rtc_clock,
-	packet_mgr, mesh_tables, data_store);
+static SimpleMeshTables mesh_tables;
+static StaticPoolPacketManager packet_mgr;
+/* A WiFi companion on a PSRAM board keeps this object (its contacts table and
+ * offline queue are ~110 KB) in PSRAM, so WiFi and BLE fit in internal DRAM.
+ * Safe: only the main thread touches it, never an ISR or a flash operation,
+ * and the SoC boot zeroes .ext_ram.bss before any constructor runs. */
+#if IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_WIFI) && IS_ENABLED(CONFIG_ESP_SPIRAM)
+#define COMPANION_MESH_SECTION __attribute__((section(".ext_ram.bss.companion_mesh")))
+#else
+#define COMPANION_MESH_SECTION
+#endif
+static CompanionMesh companion_mesh COMPANION_MESH_SECTION (lora_radio, ms_clock, zephyr_rng,
+	rtc_clock, packet_mgr, mesh_tables, data_store);
 
-/* Defined here (after data_store + companion_mesh_ptr statics) and
- * forward-declared near the top of the file so mesh_event_loop() can
- * call it without the static decls being in scope. */
 static void save_prefs_to_flash(void)
 {
 	data_store.savePrefs(companion_mesh_ptr->prefs);
 }
 
-/* ========== Companion text CLI ==========
- * One CommonCLI instance shared by two front-ends: the USB CDC text sideband
- * (its '<' sync byte separates binary V3 frames from text; BLE NUS has no
- * such prefix, so a direct BLE text sideband can't be disambiguated) and the
- * v-contact chat, which carries CLI lines inside the binary protocol on
- * either transport — so this block is NOT gated on ZEPHCORE_USB_STACK. */
+/* ========== Companion CLI ==========
+ * The CommonCLI behind CompanionMesh::handleCommand, whose front-ends are the
+ * app's CMD_RUN_CLI_COMMAND, the USB text console (the '<' sync byte tells V3
+ * frames from text; BLE NUS has no such marker, so it has no text console),
+ * the v-contact chat, and over-the-air TXT_TYPE_CLI_COMMAND. Not gated on
+ * ZEPHCORE_USB_STACK. */
 
-class CompanionCLICallbacks : public CommonCLICallbacks {
-public:
-	void savePrefs() override {
-		data_store.savePrefs(companion_mesh.prefs);
+/* No reply held, and every transport's TX drained. */
+static bool companion_transport_tx_idle(void)
+{
+	if (companion_serial.holding()) {
+		return false;
 	}
-	const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
-	const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
-	const char* getRole() override { return "companion"; }
-	bool formatFileSystem() override { return data_store.formatFileSystem(); }
-
-	/* Advert — the companion can originate its own self-advert. delay_millis is
-	 * unused (companion sends flood at 0 ms / zero-hop immediately, matching the
-	 * app-triggered path); previously a no-op stub, so `advert` from the CLI
-	 * reported success but transmitted nothing. */
-	void sendSelfAdvertisement(int delay_millis, bool flood) override {
-		(void)delay_millis;
-		companion_mesh.sendSelfAdvert(flood);
-	}
-	void updateAdvertTimer() override {}
-	void updateFloodAdvertTimer() override {}
-
-	/* Log control — no log file on companion. */
-	void setLoggingOn(bool enable) override { (void)enable; }
-	void eraseLogFile() override {}
-	void dumpLogFile() override {}
-
-	/* TX power — Zephyr LoRa driver has no runtime API; log only (matches repeater). */
-	void setTxPower(int8_t power_dbm) override {
-		LOG_INF("TX power %d dBm requested (reboot to apply)", power_dbm);
-	}
-
-	bool setRxBoostedGain(bool enable) override {
-		return lora_radio.setRxBoost(enable);
-	}
-
-	/* Adaptive CAD */
-	int formatCadStatus(char* buf, int cap) override {
-		return lora_radio.formatCadStatus(buf, cap);
-	}
-	void applyCadPrefs() override {
-		lora_radio.setCadParams(companion_mesh.prefs.cad_auto != 0,
-					companion_mesh.prefs.cad_offset,
-					companion_mesh.prefs.cad_probe_interval,
-					companion_mesh.prefs.cad_busycap);
-	}
-	void resetCadStats() override {
-		lora_radio.resetCadStats();
-	}
-
-#ifdef CONFIG_ZEPHCORE_APC
-	int8_t getAPCReduction() const override {
-		return companion_mesh.getAPCReduction();
-	}
-	float getAPCMargin() const override {
-		return companion_mesh.getAPCMargin();
-	}
-	bool isAPCEnabled() const override {
-		return companion_mesh.isAPCEnabled();
-	}
-	void setAPCEnabled(bool en) override {
-		companion_mesh.setAPCEnabled(en);
-	}
-	uint8_t getAPCTargetMargin() const override {
-		return companion_mesh.getAPCTargetMargin();
-	}
-	void setAPCTargetMargin(uint8_t margin_db) override {
-		companion_mesh.setAPCTargetMargin(margin_db);
+#if IS_ENABLED(CONFIG_BT)
+	if (!ble_interface.txIdle()) {
+		return false;
 	}
 #endif
+#if ZEPHCORE_USB_STACK
+	if (!usb_interface.txIdle()) {
+		return false;
+	}
+#endif
+#if IS_ENABLED(CONFIG_ZEPHCORE_TRANSPORT_TCP)
+	if (!tcp_interface.txIdle()) {
+		return false;
+	}
+#endif
+	return true;
+}
 
-	mesh::LocalIdentity& getSelfId() override { return companion_mesh.self_id; }
-
-	void saveIdentity(const mesh::LocalIdentity& new_id) override {
-		companion_mesh.self_id = new_id;
-		data_store.saveMainIdentity(new_id);
-	}
-
-	void clearStats() override {
-		lora_radio.resetStats();
-		companion_mesh.resetStats();
-	}
-
-	/* Temp radio params — deferred; stub for now. */
-	void applyTempRadioParams(float freq, float bw, uint8_t sf, uint8_t cr,
-				  int timeout_mins) override {
-		(void)freq; (void)bw; (void)sf; (void)cr; (void)timeout_mins;
-	}
-
-	MeshTimeSync* getMeshTimeSync() override {
-		return companion_mesh.getMeshTimeSync();
-	}
-
-	/* GPS control — companion delegates to the GPS manager (same as repeater).
-	 * Without these, the base CommonCLICallbacks stubs make the CLI report
-	 * "off" / "gps toggle not found" regardless of real GPS state. */
-	bool setGpsEnabled(bool enabled) override {
-		if (!gps_is_available()) return false;
-		gps_enable(enabled);
-		return true;
-	}
-	bool isGpsEnabled() const override {
-		return gps_is_enabled();
-	}
-	void formatGpsStatsReply(char* reply) override {
-		if (!gps_is_enabled()) {
-			strcpy(reply, "off");
-			return;
-		}
-		struct gps_state_info gsi;
-		gps_get_state_info(&gsi);
-		static const char* const state_str[] = { "off", "standby", "acquiring" };
-		const char* state = gsi.state < 3 ? state_str[gsi.state] : "unknown";
-		struct gps_position pos;
-		bool has_pos = gps_get_last_known_position(&pos);
-		if (has_pos) {
-			snprintf(reply, CLI_REPLY_SIZE,
-				"on state=%s sats=%u fix=%us ago lat=%.6f lon=%.6f",
-				state, gsi.satellites, gsi.last_fix_age_s,
-				pos.latitude_ndeg / 1e9, pos.longitude_ndeg / 1e9);
-		} else if (gsi.next_search_s > 0) {
-			snprintf(reply, CLI_REPLY_SIZE,
-				"on state=%s sats=%u no fix next=%us",
-				state, gsi.satellites, gsi.next_search_s);
-		} else {
-			snprintf(reply, CLI_REPLY_SIZE,
-				"on state=%s sats=%u no fix",
-				state, gsi.satellites);
-		}
-	}
-
-	/* Stats — same JSON format as the repeater CLI (StatsFormatHelper), so
-	 * `stats-core` / `stats-radio` / `stats-packets` work over USB and the
-	 * v-contact chat instead of the base-class "not available" stubs. */
-	void formatStatsReply(char* reply) override {
-		StatsFormatHelper::formatCoreStats(reply, zephyr_board, ms_clock,
-			companion_mesh.getErrFlags(), &packet_mgr);
-	}
-	void formatRadioStatsReply(char* reply) override {
-		StatsFormatHelper::formatRadioStats(reply, &lora_radio, lora_radio,
-			companion_mesh.getTotalAirTime(), companion_mesh.getReceiveAirTime());
-	}
-	void formatPacketStatsReply(char* reply) override {
-		StatsFormatHelper::formatPacketStats(reply, lora_radio,
-			companion_mesh.getNumSentFlood(), companion_mesh.getNumSentDirect(),
-			companion_mesh.getNumRecvFlood(), companion_mesh.getNumRecvDirect());
-	}
-};
-
-static CompanionCLICallbacks companion_cli_cbs;
-static ClientACL companion_acl;  /* unused by CommonCLI but required by constructor */
-static CommonCLI companion_cli(zephyr_board, rtc_clock, companion_acl,
+static CompanionCLICallbacks companion_cli_cbs(data_store, companion_mesh, lora_radio, zephyr_board,
+					       ms_clock, packet_mgr, companion_transport_tx_idle);
+/* No region map and no client ACL: a companion has neither (nullptr both). */
+static CommonCLI companion_cli(zephyr_board, rtc_clock, sensors, nullptr, nullptr,
 			       &companion_mesh.prefs, &companion_cli_cbs);
+
+/* CMD_SET_RADIO_PARAMS / CMD_SET_RADIO_TX_POWER (needs companion_cli, hence
+ * here). Unlike the CLI's `set radio` this applies live, so the radio is
+ * already on the new preset when the CAD state resets: preset_pending false. */
+static void radio_reconfigure(bool preset_changed)
+{
+	lora_radio.reconfigure();
+
+	if (preset_changed) {
+		companion_cli.resetCadState(false);
+	}
+}
 
 #if defined(CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) && \
 	CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0
@@ -855,93 +618,64 @@ static CommonCLI companion_cli(zephyr_board, rtc_clock, companion_acl,
 #define ZEPHCORE_HAS_AUTO_SHUTDOWN 0
 #endif
 
-#if ZEPHCORE_HAS_AUTO_SHUTDOWN
-/* Companion-only CLI sideband for the low-battery auto-shutdown threshold.
- * Handled here (not in shared CommonCLI) so the pref persists via the
- * companion datastore and the command never appears on repeater builds.
- * Returns true if the line was a recognised autoshutdown command. */
-static bool handle_autoshutdown_cli(const char *line, char *reply)
+/* ========== Low-battery policy (app/PowerPolicy.cpp) ==========
+ * Auto-shutdown and the v-contact alert, on every companion that reads a
+ * battery. These hooks are its only v-contact side. */
+
+/* Just before a low-battery power-off: with an app connected, send the notice
+ * live (the policy then waits a short grace). Otherwise the policy stores the
+ * reason for the next boot, since the offline queue does not survive System
+ * OFF. */
+static bool power_notify_shutdown(void)
 {
-	if (strcmp(line, "get autoshutdown") == 0) {
-		uint16_t mv = companion_mesh.prefs.auto_shutdown_mv;
-		if (mv == 0) {
-			strcpy(reply, "autoshutdown: off");
-		} else {
-			snprintf(reply, CLI_REPLY_SIZE, "autoshutdown: %u mV", mv);
-		}
-		return true;
-	}
-	if (strncmp(line, "set autoshutdown ", 17) == 0) {
-		const char *arg = line + 17;
-		while (*arg == ' ') {
-			arg++;
-		}
-		/* Numbers only: first char must be a digit (rejects sign, letters,
-		 * empty), and nothing but trailing whitespace may follow. */
-		char *end = NULL;
-		long v = strtol(arg, &end, 10);
-		while (*end == ' ' || *end == '\r' || *end == '\n' || *end == '\t') {
-			end++;
-		}
-		if (arg[0] < '0' || arg[0] > '9' || *end != '\0') {
-			strcpy(reply, "ERROR: numbers only (0 = off, 1-5000 mV)");
-			return true;
-		}
-		if (v > 5000) {
-			strcpy(reply, "ERROR: must be 0 (off) or 1-5000 mV");
-			return true;
-		}
-		companion_mesh.prefs.auto_shutdown_mv = (uint16_t)v;
-		/* Defer the flash write to the main thread (this runs on sysworkq via
-		 * the USB RX work handler). A synchronous savePrefs here could race a
-		 * concurrent main-thread save (e.g. a companion-app command handler)
-		 * on the same prefs .tmp file. Posting the event coalesces onto main. */
-		k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
-		ui_set_auto_shutdown_mv((uint16_t)v);
-		if (v == 0) {
-			strcpy(reply, "OK - autoshutdown off");
-		} else {
-			snprintf(reply, CLI_REPLY_SIZE, "OK - autoshutdown %ld mV", v);
-		}
+	if (companion_transport_up() && companion_mesh.isVContactEnabled()) {
+		companion_mesh.vcontactNotify("Powering off: low battery");
 		return true;
 	}
 	return false;
 }
-#endif /* ZEPHCORE_HAS_AUTO_SHUTDOWN */
 
-/* V-contact battery alert state — defined below with the checker. */
-static void vcontact_battery_alert_rearm(void);
-
-/* Resolve the effective v-contact battery-alert threshold in mV.
- * 0 = alert off; the 0xFFFF sentinel derives the board default: 200 mV above
- * the auto-shutdown cutoff so the alert wins the race against the shutdown
- * confirm window (90 s), falling back to 3500 mV on boards without one. */
-static uint16_t vcontact_battery_alert_threshold_mv(void)
+static void power_battery_alert(uint16_t mv, uint16_t threshold_mv)
 {
-	uint16_t pref = companion_mesh.prefs.v_battery_alert_mv;
-	if (pref == 0) return 0;
-	if (pref != 0xFFFF) return pref;
-	uint16_t cutoff = companion_mesh.prefs.auto_shutdown_mv;
-	return cutoff ? (uint16_t)(cutoff + 200) : 3500;
+	char msg[48];
+
+	snprintf(msg, sizeof(msg), "Battery low: %u mV (alert at %u mV)", mv, threshold_mv);
+	companion_mesh.vcontactNotify(msg);
 }
 
-/* Companion-only `v.*` commands (v-contact settings) + the shared help text.
- * Runs on the main thread for both front-ends (USB lines are drained from
- * companion_cli_queue in the event loop; v-contact lines arrive via
- * handleProtocolFrame). PREFS_DIRTY keeps the flash write on the main loop
- * regardless. Returns true if the line was recognised. */
+static bool power_alert_enabled(void)
+{
+	return companion_mesh.isVContactEnabled();
+}
+
+static void power_prefs_dirty(void)
+{
+	k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
+}
+
+static PowerPolicy power_policy(zephyr_board, companion_mesh.prefs,
+				{power_notify_shutdown, power_battery_alert, power_alert_enabled,
+				 power_prefs_dirty});
+
+static void power_policy_tick(void)
+{
+	power_policy.tick();
+}
+
+/* The `v.*` commands (v-contact settings) and `help`. True if the line was one. */
 static bool handle_vcontact_cli(const char *line, char *reply)
 {
 	if (strcmp(line, "help") == 0 || strcmp(line, "?") == 0) {
-		/* No global CLI help exists; list only the companion-specific extras
-		 * and make clear the standard set/get radio+mesh commands also work. */
+		/* There is no global help: list the companion extras only. */
 		strcpy(reply,
-		       "Companion extras (standard set/get commands also work):\r\n"
+		/* Short: the whole reply must fit one companion frame (the
+		 * padded table this replaced lost its last line). */
+		       "Companion extras (get|set):\r\n"
 #if ZEPHCORE_HAS_AUTO_SHUTDOWN
-		       "  get|set autoshutdown <mV>     - low-batt cutoff, 0 = off\r\n"
+		       " autoshutdown <mV>, 0 = off\r\n"
 #endif
-		       "  get|set v.contact on|off      - loopback admin contact\r\n"
-		       "  get|set v.batteryalert <mV>   - 0 = off, or default");
+		       " v.contact on|off\r\n"
+		       " v.batteryalert <mV>|0|default");
 		return true;
 	}
 	if (strcmp(line, "get v.contact") == 0) {
@@ -964,11 +698,12 @@ static bool handle_vcontact_cli(const char *line, char *reply)
 		bool was = companion_mesh.prefs.v_contact_enabled != 0;
 		companion_mesh.prefs.v_contact_enabled = en ? 1 : 0;
 		k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
-		/* Tell a connected app right away — add or remove the contact. */
 		if (en && !was) {
 			companion_mesh.vcontactPushAdvert();
 		} else if (!en && was) {
 			companion_mesh.vcontactPushDeleted();
+			/* The app drops the contact, and its flags with it. */
+			companion_mesh.prefs.v_contact_flags = 0;
 		}
 		snprintf(reply, CLI_REPLY_SIZE, "OK - v.contact %s", en ? "on" : "off");
 		return true;
@@ -979,7 +714,7 @@ static bool handle_vcontact_cli(const char *line, char *reply)
 			strcpy(reply, "v.batteryalert: off");
 		} else if (pref == 0xFFFF) {
 			snprintf(reply, CLI_REPLY_SIZE, "v.batteryalert: default (%u mV)",
-				 vcontact_battery_alert_threshold_mv());
+				 power_policy.alertThresholdMv());
 		} else {
 			snprintf(reply, CLI_REPLY_SIZE, "v.batteryalert: %u mV", pref);
 		}
@@ -1006,12 +741,12 @@ static bool handle_vcontact_cli(const char *line, char *reply)
 		}
 		companion_mesh.prefs.v_battery_alert_mv = v;
 		k_event_post(&mesh_events, MESH_EVENT_PREFS_DIRTY);
-		vcontact_battery_alert_rearm();
+		power_policy.rearmAlert();
 		if (v == 0) {
 			strcpy(reply, "OK - v.batteryalert off");
 		} else if (v == 0xFFFF) {
 			snprintf(reply, CLI_REPLY_SIZE, "OK - v.batteryalert default (%u mV)",
-				 vcontact_battery_alert_threshold_mv());
+				 power_policy.alertThresholdMv());
 		} else {
 			snprintf(reply, CLI_REPLY_SIZE, "OK - v.batteryalert %u mV", v);
 		}
@@ -1020,126 +755,38 @@ static bool handle_vcontact_cli(const char *line, char *reply)
 	return false;
 }
 
-/* Pre-shutdown hook, registered with the UI layer and called on the main
- * thread just before a low-battery power-off.  If an app is connected, queue a
- * live v-contact notice and return true so the UI defers the power-off by a
- * short grace (letting the notify→fetch→send round-trip finish).  If nobody is
- * connected, persist the reason to flash and return false (power off now) — the
- * offline queue doesn't survive System OFF, so the flash marker is the only way
- * the shutdown gets reported, which it does on the next boot. */
-static bool companion_shutdown_hook(int reason)
-{
-	const char *msg = (reason == UI_SHUTDOWN_LOW_BATTERY)
-			  ? "Powering off: low battery"
-			  : "Powering off";
 
-	bool connected = zephcore_ble_is_connected();
-#if ZEPHCORE_USB_STACK
-	connected = connected ||
-		(zephcore_ble_get_active_iface() == ZEPHCORE_IFACE_USB &&
-		 !zephcore_usb_companion_is_text_session());
-#endif
+/* The CompanionMesh::handleCommand callback (main thread). The v-contact and
+ * autoshutdown commands never see a remote sender: handleCommand stops those. */
+static_assert(COMPANION_CLI_REPLY_SIZE == CLI_REPLY_SIZE,
+	      "companion CLI reply buffer must match CommonCLI reply size");
 
-	if (connected && companion_mesh.isVContactEnabled()) {
-		companion_mesh.vcontactNotify(msg);
-		return true;   /* deliver live — ask the UI for the grace delay */
-	}
-
-	data_store.saveShutdownReason((uint8_t)reason);
-	return false;      /* nobody listening — flash marker, power off now */
-}
-
-/* Transport-neutral CLI line execution — runs on the MAIN thread only
- * (CommonCLI::handleCommand touches mesh state shared with loop()). Both the
- * USB text sideband and the v-contact chat funnel through here. `reply` must
- * be CLI_REPLY_SIZE (== VCONTACT_CLI_REPLY_SIZE). */
-static_assert(VCONTACT_CLI_REPLY_SIZE == CLI_REPLY_SIZE,
-	      "v-contact reply buffer must match CommonCLI reply size");
-
-static void companion_cli_exec(const char *line, char *reply)
+static void companion_cli_exec(const char *line, uint32_t sender_timestamp,
+			       uint8_t reply_hdr_used, char *reply)
 {
 	reply[0] = '\0';
 	if (handle_vcontact_cli(line, reply)) {
 		return;
 	}
-#if ZEPHCORE_HAS_AUTO_SHUTDOWN
-	if (handle_autoshutdown_cli(line, reply)) {
+	if (power_policy.handleCommand(line, reply, CLI_REPLY_SIZE)) {
+		return;
+	}
+#if IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_WIFI)
+	if (companion_wifi_cli(line, companion_mesh.prefs, save_prefs_to_flash, reply)) {
 		return;
 	}
 #endif
-	companion_cli.handleCommand(0, line, reply);
-}
-
-/* ========== V-contact battery alert ==========
- * Deliberately NOT hooked into ui_auto_shutdown_check() — that is a weak
- * no-op on headless builds. Same proven pattern though: 30 s ADC sample gate
- * off the 5 s housekeeping tick, 3-strike confirm so a TX-induced sag can't
- * false-trigger, skip while externally powered. One-shot latch per discharge
- * cycle; re-arms on charge/recovery (threshold + 150 mV) or threshold change.
- * The message rides the offline queue, so it still reaches the app if nothing
- * is connected when it fires. */
-static bool vcontact_batt_latched;
-static uint8_t vcontact_batt_low_count;
-
-static void vcontact_battery_alert_rearm(void)
-{
-	vcontact_batt_latched = false;
-	vcontact_batt_low_count = 0;
-}
-
-static void vcontact_battery_alert_check(void)
-{
-	if (!companion_mesh.isVContactEnabled()) {
-		return;
-	}
-	uint16_t thresh = vcontact_battery_alert_threshold_mv();
-	if (thresh == 0) {
-		return;
-	}
-
-	uint32_t now = k_uptime_get_32();
-	static uint32_t next_check_ms;  /* 0 at boot → first tick samples */
-	if (next_check_ms != 0 && (now - next_check_ms) < 30000) {
-		return;
-	}
-	next_check_ms = now;
-
-	uint16_t mv = zephyr_board.getBattMilliVolts();
-	if (mv == 0) {  /* no battery hardware / no reading */
-		vcontact_batt_low_count = 0;
-		return;
-	}
-	if (zephyr_board.isExternalPowered() || mv >= thresh + 150) {
-		/* charging or recovered — re-arm for the next discharge cycle */
-		vcontact_battery_alert_rearm();
-		return;
-	}
-	if (mv >= thresh) {
-		vcontact_batt_low_count = 0;
-		return;
-	}
-	if (vcontact_batt_latched) {
-		return;
-	}
-	if (++vcontact_batt_low_count < 3) {
-		return;
-	}
-	vcontact_batt_latched = true;
-	char msg[48];
-	snprintf(msg, sizeof(msg), "Battery low: %u mV (alert at %u mV)", mv, thresh);
-	companion_mesh.vcontactNotify(msg);
+	companion_cli.setReplyHeaderUsed(reply_hdr_used);
+	companion_cli.handleCommand(sender_timestamp, line, reply);
 }
 
 #if ZEPHCORE_USB_STACK
-/* Executes a text-CLI line from USB, reply back over USB CDC. Output mirrors
- * the repeater's serial CLI ("\r\n  -> <reply>\r\n", CRLF) so the
- * flasher.meshcore.io serial console renders companion replies identically.
- * Runs on the MAIN thread (drained from companion_cli_queue in the event
- * loop). */
+/* A USB text-CLI line. The reply is framed like the repeater's serial CLI
+ * ("\r\n  -> <reply>\r\n") so web serial consoles render it the same. */
 static void companion_cli_run(const char *line)
 {
-	char reply[CLI_REPLY_SIZE];
-	companion_cli_exec(line, reply);
+	char reply[COMPANION_CLI_PREFIX_ROOM + CLI_REPLY_SIZE];
+	companion_mesh.handleCommand(line, 0, reply);
 	if (reply[0] != '\0') {
 		zephcore_usb_companion_write_text("\r\n  -> ", 7);
 		zephcore_usb_companion_write_text(reply, strlen(reply));
@@ -1147,8 +794,7 @@ static void companion_cli_run(const char *line)
 	zephcore_usb_companion_write_text("\r\n", 2);
 }
 
-/* USB-adapter callback (runs on sysworkq).  Just queue the line and wake the
- * main thread — the actual handleCommand happens in companion_cli_run(). */
+/* USB adapter callback (sysworkq): queue the line for companion_cli_run(). */
 static void companion_cli_dispatch(const char *line)
 {
 	struct companion_cli_line c;
@@ -1165,48 +811,44 @@ static void companion_cli_dispatch(const char *line)
 
 #endif
 
-/* GPS enable callback - logs state changes
- * Note: GPS persistence is handled in CompanionMesh.cpp CMD_SET_CUSTOM_VAR handler */
+/* GPS on/off (persisted by the CMD_SET_CUSTOM_VAR handler) */
 static void gps_enable_callback(bool enabled)
 {
 	LOG_INF("GPS %s", enabled ? "enabled" : "disabled");
 	ui_set_gps_enabled(enabled);
 }
 
-/* GPS event callback - called when GPS work handlers need the main thread
- * to process a state transition (wake from standby, timeout, etc.).
- * Runs from system work queue context — just posts an event, no blocking. */
+/* A GPS state transition for the main thread (from the system work queue). */
 static void gps_event_callback(void)
 {
 	k_event_post(&mesh_events, MESH_EVENT_GPS_ACTION);
 }
 
-/* GPS fix callback - called when GPS acquires a valid fix.
- * Updates mesh node position and RTC. */
+/* A validated fix (main thread, from gps_process_event()): set the clock and
+ * the node position. */
 static void gps_fix_callback(double lat, double lon, int64_t utc_time)
 {
-	/* Sync RTC from GPS time */
 	if (utc_time > 0) {
 		LOG_INF("GPS fix: RTC sync time=%lld", utc_time);
 		rtc_clock.setCurrentTime((uint32_t)utc_time);
 		time_sync_report(TIME_SYNC_GPS);
-		/* Defer the hardware-RTC write to the main thread — see
-		 * request_rtc_save()/pending_rtc_epoch: blocking I2C here would
-		 * stall NMEA ingest, same hazard as the prefs flash write below. */
-		request_rtc_save((uint32_t)utc_time);
+#ifdef ZEPHCORE_LORA
+		/* Arm the time-sync drift envelope; activate a deferred v-contact. */
+		companion_mesh.noteGPSTimeSync();
+		companion_mesh.vcontactClockSynced();
+#endif
 	}
 
+	sensors.node_lat = lat;
+	sensors.node_lon = lon;
+
 #ifdef ZEPHCORE_LORA
-	/* Update node position for mesh advertising — RAM only, no flash
-	 * write. Matches upstream Arduino (sensors.node_lat/lon): the
-	 * position reaches flash only piggybacked on the next savePrefs()
-	 * triggered by an actual settings change. Persisting from here
-	 * would rewrite the full prefs blob on nearly every promoted fix,
-	 * since GPS jitter defeats the exact-double comparison below. */
+	/* RAM only, as upstream: GPS jitter would otherwise rewrite prefs on
+	 * nearly every fix. It reaches flash with the next real settings save. */
 	if (lat != companion_mesh.prefs.node_lat || lon != companion_mesh.prefs.node_lon) {
 		companion_mesh.prefs.node_lat = lat;
 		companion_mesh.prefs.node_lon = lon;
-		/* Log as integer degrees (Zephyr LOG doesn't support %f by default) */
+		/* Zephyr LOG has no %f by default */
 		int lat_deg = (int)lat;
 		int lon_deg = (int)lon;
 		int lat_frac = (int)((lat - lat_deg) * 1000000);
@@ -1217,7 +859,6 @@ static void gps_fix_callback(double lat, double lon, int64_t utc_time)
 			lat_deg, lat_frac, lon_deg, lon_frac);
 	}
 
-	/* Update UI with GPS data */
 	{
 		struct gps_position gpos;
 
@@ -1243,26 +884,22 @@ static void bt_ready(int err)
 		return;
 	}
 
+	/* Advertises only if still enabled: the ble_disabled pref was applied
+	 * before bt_enable() (disableBluetooth() is recorded until start). */
 #ifdef ZEPHCORE_LORA
 	zephcore_ble_start(companion_mesh.getDeviceName());
 #else
 	zephcore_ble_start(NULL);
 #endif
-	if (companion_mesh.prefs.ble_disabled) {
-		zephcore_ble_set_enabled(false);
-	}
 }
 #endif /* CONFIG_BT */
 
 int main(void)
 {
-	/* Clear any stale bootloader magic from previous sessions */
 	zephyr_board.clearBootloaderMagic();
 
-	/* USB CDC init up front so the host can enumerate, then block until the
-	 * host opens the port (DTR-high) — event-driven via the shared usbd
-	 * message callback.  Unplugged → 1 s timeout, banner is buffered for any
-	 * later attach. */
+	/* USB up first so the host can enumerate; wait up to 1 s for the port to
+	 * open (DTR), else the banner is buffered for a later attach. */
 #if ZEPHCORE_USB_STACK && DT_HAS_COMPAT_STATUS_OKAY(zephyr_cdc_acm_uart) && \
 	!IS_ENABLED(CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT) && \
 	(IS_ENABLED(CONFIG_USB_CDC_ACM) || IS_ENABLED(CONFIG_USBD_CDC_ACM_CLASS))
@@ -1271,38 +908,19 @@ int main(void)
 #endif
 	LOG_INF("=== ZephCore starting ===");
 
-	/* Log reset reason so we can diagnose random reboots */
-	char boot_cause_msg[96];  /* fits "Restarted:" + all six cause labels */
+	/* Restart-reason notice for the v-contact (cause captured at POST_KERNEL by
+	 * helpers/boot_info.c), queued once the mesh is up. A power-integrity
+	 * breadcrumb; a debugger reset or a button wake is quiet. Size: "Restarted:"
+	 * (10) + every label (238) + shutdown reason (29) + NUL. */
+	char boot_cause_msg[280];
 	boot_cause_msg[0] = '\0';
 	{
-		uint32_t cause;
-		if (hwinfo_get_reset_cause(&cause) == 0) {
-			LOG_INF("Reset cause: 0x%08x%s%s%s%s%s%s", cause,
-				(cause & RESET_PIN)       ? " PIN"       : "",
-				(cause & RESET_SOFTWARE)  ? " SOFTWARE"  : "",
-				(cause & RESET_BROWNOUT)  ? " BROWNOUT"  : "",
-				(cause & RESET_POR)       ? " POR"       : "",
-				(cause & RESET_WATCHDOG)  ? " WATCHDOG"  : "",
-				(cause & RESET_CPU_LOCKUP)? " LOCKUP"    : "");
-			hwinfo_clear_reset_cause();
-			/* Every known cause becomes a v-contact message once the mesh
-			 * is up (queued below, after RTC restore + prefs load) — the
-			 * message rides the offline queue only, so the "noise" of a
-			 * routine power-on costs nothing over the air and doubles as
-			 * a power-integrity breadcrumb (dead battery, loose contact).
-			 * A deliberate CLI/app reboot shows as SOFTWARE, doubling as
-			 * a "reboot completed" confirmation. */
-			if (cause & (RESET_PIN | RESET_SOFTWARE | RESET_BROWNOUT |
-				     RESET_POR | RESET_WATCHDOG | RESET_CPU_LOCKUP)) {
-				snprintf(boot_cause_msg, sizeof(boot_cause_msg),
-					 "Restarted:%s%s%s%s%s%s",
-					 (cause & RESET_PIN)        ? " PIN(reset button)" : "",
-					 (cause & RESET_SOFTWARE)   ? " SOFTWARE" : "",
-					 (cause & RESET_BROWNOUT)   ? " BROWNOUT" : "",
-					 (cause & RESET_POR)        ? " POR(power-on)" : "",
-					 (cause & RESET_WATCHDOG)   ? " WATCHDOG" : "",
-					 (cause & RESET_CPU_LOCKUP) ? " LOCKUP"   : "");
-			}
+		const uint32_t quiet = RESET_LOW_POWER_WAKE | RESET_DEBUG;
+
+		if ((zephcore_boot_reset_cause_labelled() & ~quiet) != 0) {
+			int n = snprintf(boot_cause_msg, sizeof(boot_cause_msg), "Restarted:");
+			(void)zephcore_boot_reset_cause_str(boot_cause_msg + n,
+							    sizeof(boot_cause_msg) - n, true);
 		}
 	}
 
@@ -1311,14 +929,11 @@ int main(void)
 	}
 	data_store.begin();
 
-	/* Fold a persisted shutdown reason into the boot notice.  Written just
-	 * before a previous low-battery System OFF when no app was connected to
-	 * receive it live (the offline queue doesn't survive power-off).  The
-	 * hardware reset cause on this boot is just POR, so without this the
-	 * reason would be lost. */
+	/* A low-battery shutdown with no app connected left its reason in flash
+	 * (see companion_shutdown_hook); the hardware cause cannot tell. */
 	{
-		uint8_t sdr = data_store.takeShutdownReason();
-		if (sdr == UI_SHUTDOWN_LOW_BATTERY) {
+		uint8_t sdr = zephcore_shutdown_reason();
+		if (sdr == ZC_SHUTDOWN_LOW_VOLTAGE) {
 			size_t l = strlen(boot_cause_msg);
 			snprintf(boot_cause_msg + l, sizeof(boot_cause_msg) - l,
 				 "%sLast shutdown: low battery",
@@ -1326,59 +941,23 @@ int main(void)
 		}
 	}
 
-	/* First-boot migration: fix NVS (BLE bonds) before bt_enable() runs.
-	 *
-	 * nRF52 stores BLE bonds in storage_partition (NVS) at 0xD0000.  UF2
-	 * flashing only writes pages covered by the binary, leaving whatever was
-	 * there before.  Old firmware (Arduino MeshCore, ZephCore ≤1.16.1) used
-	 * that region as app code; if those bytes accidentally pass Zephyr NVS
-	 * sector validation, settings_load() hangs and BLE never advertises.
-	 *
-	 * A marker file /lfs/_zc_init is written after the first clean boot.
-	 * If absent, we are on the first run of this ZephCore build:
-	 *
-	 *  • No prefs, or Arduino prefs (layout-incompatible): full format.
-	 *    Covers fresh installs and Arduino MeshCore migrations.
-	 *
-	 *  • Valid ZephCore prefs + /lfs/settings present: NVS erase only.
-	 *    The old file-based bonds backend (ZephCore ≤1.16.1) left this file;
-	 *    0xD0000 is old app code → must erase.  Identity/prefs/contacts
-	 *    are preserved; re-pair required (bonds were in /lfs/settings which
-	 *    the NVS backend ignores anyway).
-	 *
-	 *  • Valid ZephCore prefs + no /lfs/settings: NVS was already initialized
-	 *    by ZephCore ≥1.16.2 — skip format entirely, bonds survive. */
-	if (!data_store.hasInitMarker()) {
-		if (!data_store.hasPrefs() || data_store.prefsLookLikeArduino()) {
-			LOG_WRN("First ZephCore boot (%s) — formatting LFS + NVS",
-				data_store.hasPrefs() ? "Arduino prefs" : "no prefs");
-			data_store.formatFileSystem();
-			data_store.begin();
-		} else if (data_store.hasOldSettingsFile()) {
-			LOG_WRN("Pre-NVS ZephCore upgrade (found /lfs/settings) — erasing NVS");
-			data_store.formatNVSOnly();
-		} else {
-			LOG_INF("ZephCore upgrade with valid NVS — skipping format, bonds preserved");
-		}
-		data_store.writeInitMarker();
-	}
+	/* Before bt_enable(): a first boot may have to erase the BLE bond store. */
+	data_store.adoptVolume();
 
-	/* Initialize sensor manager (GPS, environment sensors) */
-	sensor_manager_init();
+	sensors.begin();
+#ifdef ZEPHCORE_LORA
+	zephyr_board.captureBootVoltage();
+#endif
 
-	/* Restore wall-clock time from a battery-backed hardware RTC if one is
-	 * present on I2C. Shown tagged "L" (local) until the next GPS/app/CLI
-	 * sync; no-op on boards without an RTC. */
+	/* Wall-clock time from a battery-backed RTC, if one answers on I2C. */
 	{
 		uint32_t rtc_epoch;
 		if (zephcore_rtc_restore(&rtc_epoch)) {
-			rtc_clock.setCurrentTime(rtc_epoch);
+			rtc_clock.seedCurrentTime(rtc_epoch);
 		}
 	}
 
-	/* Initialize UI subsystem (buttons, buzzer, display).
-	 * If display is present, ui_init() handles display init + auto-off.
-	 * If no display, fall back to raw OLED sleep for power saving. */
+	/* Buttons, buzzer, display; without a display UI, put any OLED to sleep. */
 	ui_init();
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_DESIGN_JOYSTICK)
 	joystick_ui_hooks_register(&joystick_ui_task, joystick_signal_refresh, joystick_signal_tx);
@@ -1387,7 +966,6 @@ int main(void)
 	oled_sleep();
 #endif
 
-	/* Register GPS callbacks (GPS state restored from prefs later) */
 	if (gps_is_available()) {
 		LOG_INF("GPS available");
 		gps_set_enable_callback(gps_enable_callback);
@@ -1395,43 +973,42 @@ int main(void)
 		gps_set_event_callback(gps_event_callback);
 	}
 
-	/* Log environment sensor availability */
 	if (env_sensors_available()) {
 		LOG_INF("Environment sensors available");
 	}
 
 #ifdef ZEPHCORE_LORA
-	/* Initialize prefs with defaults via the single source of truth
-	 * (initNodePrefs) so every field — including new ones added later — gets
-	 * its proper default. A hand-maintained subset here silently drifts: any
-	 * field not listed defaults to 0, and on upgrade the past-EOF read in
-	 * loadPrefs then keeps that 0 instead of the real default (this is what
-	 * zeroed cad_probe_interval / cad_auto and, earlier, the GPS settings). */
+	/* Defaults from initNodePrefs() only: a field defaulted here instead is
+	 * missed by its other callers, and a missing default reads back as 0 on
+	 * upgrade (that zeroed probe_interval and cad_auto once). The one override
+	 * lets a board's Kconfig GPS duty win over the 300 s companion figure. */
 	initNodePrefs(&companion_mesh.prefs);
-	/* Companion-specific overrides vs. initNodePrefs defaults: */
-	companion_mesh.prefs.apc_margin = 20;       /* mobile: more conservative than the 16 default */
-	companion_mesh.prefs.auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS; /* low-batt cutoff (0=off) */
-	companion_mesh.prefs.gps_interval = CONFIG_ZEPHCORE_GPS_POLL_INTERVAL_SEC; /* 5-min duty cycle (0=always-on) */
+	companion_mesh.prefs.gps_interval = CONFIG_ZEPHCORE_GPS_POLL_INTERVAL_SEC; /* 0 = always on */
 
-	/* Load prefs from storage */
 	data_store.loadPrefs(companion_mesh.prefs);
+	/* ESP32 light sleep: `powersaving off` holds a sleep lock. No-op elsewhere. */
+	zc_pm_set_powersaving(companion_mesh.prefs.powersaving_enabled != 0);
+	/* Until the first fix, the position is the configured one. */
+	sensors.node_lat = companion_mesh.prefs.node_lat;
+	sensors.node_lon = companion_mesh.prefs.node_lon;
 
-	/* Apply saved BLE PIN (0 = use Kconfig default) */
+	/* Saved BLE PIN (0 = Kconfig default) */
+#if IS_ENABLED(CONFIG_BT)
 	if (companion_mesh.prefs.ble_pin >= 100000 && companion_mesh.prefs.ble_pin <= 999999) {
 		zephcore_ble_set_passkey(companion_mesh.prefs.ble_pin);
 		LOG_INF("BLE passkey loaded from prefs: %06u", companion_mesh.prefs.ble_pin);
 	}
+#endif
 
-	/* Copy prefs to temp_prefs for radio (radio was initialized before companion_mesh) */
-	temp_prefs = companion_mesh.prefs;
+	/* The radio reads its preset through this from Radio::begin() on. */
+	lora_radio.setPrefs(&companion_mesh.prefs);
 
-	/* Load contacts and channels */
 	data_store.loadContacts(&companion_mesh);
 	data_store.loadChannels(&companion_mesh);
 
-	/* Add Public channel if no channels loaded (first boot) */
+	/* First boot: the Public channel */
 	if (companion_mesh.getNumChannels() == 0) {
-		// Public channel PSK: "izOH6cXN6mrJ5e26oRXNcg==" decoded
+		// "izOH6cXN6mrJ5e26oRXNcg==" decoded
 		static const uint8_t public_psk[16] = {
 			0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
 			0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72
@@ -1441,9 +1018,7 @@ int main(void)
 		LOG_INF("Added default Public channel");
 	}
 
-	/* Load or generate identity. First-boot keygen runs the layered
-	 * entropy mixer + Ed25519 derive + reserved-prefix guard inside
-	 * ZephyrRNG::generateFirstBootIdentity. */
+	/* First boot generates the identity (ZephyrRNG::generateFirstBootIdentity). */
 	mesh::LocalIdentity self_identity;
 	if (!data_store.loadMainIdentity(self_identity)) {
 		mesh::ZephyrRNG::generateFirstBootIdentity(self_identity);
@@ -1451,8 +1026,7 @@ int main(void)
 	}
 	companion_mesh.self_id = self_identity;
 
-	/* Set default node name from first 4 bytes of public key if not set.
-	 * Must happen after identity load so pub_key is available. */
+	/* Default node name: the first 4 bytes of the public key. */
 	if (companion_mesh.prefs.node_name[0] == '\0') {
 		snprintf(companion_mesh.prefs.node_name, sizeof(companion_mesh.prefs.node_name),
 			 "%02X%02X%02X%02X",
@@ -1460,119 +1034,75 @@ int main(void)
 			 self_identity.pub_key[2], self_identity.pub_key[3]);
 	}
 
-	/* Set callbacks */
-	companion_mesh.setWriteFrameCallback(write_frame);
-	companion_mesh.setPushCallback(push_callback);
 	companion_mesh.setBatteryCallback(get_battery_mv);
-	ui_set_battery_provider(get_battery_mv);
-	ui_set_power_source_provider([]() { return zephyr_board.isExternalPowered(); });
-	ui_set_auto_shutdown_mv(companion_mesh.prefs.auto_shutdown_mv);
-	ui_set_shutdown_hook(companion_shutdown_hook);
+	companion_mesh.setBoard(&zephyr_board);
+	ui_set_battery_provider(get_battery_mv, []() { return zephyr_board.getBattPercent(); });
 	companion_mesh.setRadioReconfigureCallback(radio_reconfigure);
 	companion_mesh.setPinChangeCallback([](uint32_t new_pin) {
+#if IS_ENABLED(CONFIG_BT)
 		zephcore_ble_set_passkey(new_pin);
+#else
+		ARG_UNUSED(new_pin);
+#endif
 	});
-	/* V-contact chat lines run the same CLI as the USB text sideband. */
-	companion_mesh.setVContactCLICallback(companion_cli_exec);
+	companion_mesh.setCLICallback(companion_cli_exec);
 	companion_mesh_ptr = &companion_mesh;
 
-	/* Set LoRa callbacks for event-driven packet processing */
 	lora_radio.setRxCallback(lora_rx_callback, nullptr);
 	lora_radio.setTxDoneCallback(lora_tx_done_callback, nullptr);
 	companion_mesh.setTxQueuedCallback(tx_queued_callback, nullptr);
 
-	/* Start mesh */
 	companion_mesh.begin();
 
-	/* Redirect radio prefs pointer to the live companion_mesh.prefs.
-	 * The radio was constructed with &temp_prefs (a one-time copy needed
-	 * for static init).  After begin(), point at the real prefs so that
-	 * CMD_SET_RADIO_PARAMS changes are visible to lora_radio.reconfigure(). */
-	lora_radio.setPrefs(&companion_mesh.prefs);
-
-	/* Queue the restart-reason notice from the v-contact. Deferred to here so
-	 * begin() has derived the v-contact key, prefs (enable flag) are loaded,
-	 * and the hardware-RTC restore above gives the message a sane timestamp.
-	 * It sits in the offline queue until the first app connect/sync. */
+	/* After begin(), which derives the v-contact key. */
 	if (boot_cause_msg[0] != '\0') {
 		companion_mesh.vcontactNotify(boot_cause_msg);
 	}
 
-	/* Push initial state to UI display */
-	ui_set_node_name(companion_mesh.prefs.node_name);
-	ui_set_radio_params(
-		lora_radio.getActiveFrequencyHz(),
-		lora_radio.getActiveSpreadingFactor(),
-		lora_radio.getActiveBandwidthKHzX10(),
-		lora_radio.getActiveCodingRate(),
-		lora_radio.getConfiguredTxPower(),
-		lora_radio.getNoiseFloor());
-#ifdef CONFIG_ZEPHCORE_APC
-	ui_set_radio_runtime(
-		lora_radio.getEffectiveTxPower(),
-		companion_mesh.isAPCEnabled(),
-		companion_mesh.getAPCReduction(),
-		(int16_t)(companion_mesh.getAPCMargin() * 10.0f),
-		companion_mesh.getAPCTargetMargin(),
-		lora_radio.getActiveSyncWord(),
-		lora_radio.getActivePreambleLength(),
-		lora_radio.isRxDutyCycleEnabled(),
-		lora_radio.isRadioReady(),
-		lora_radio.isInRecvMode(),
-		lora_radio.isTxActive());
-#else
-	ui_set_radio_runtime(
-		lora_radio.getEffectiveTxPower(),
-		false, 0, 0, companion_mesh.prefs.apc_margin,
-		lora_radio.getActiveSyncWord(),
-		lora_radio.getActivePreambleLength(),
-		lora_radio.isRxDutyCycleEnabled(),
-		lora_radio.isRadioReady(),
-		lora_radio.isInRecvMode(),
-		lora_radio.isTxActive());
+	/* Mounting orientation, as early as prefs allow (the splash may show
+	 * upright first). A panel that cannot rotate stays native. */
+	zephcore_input_set_flipped(companion_mesh.prefs.input_rotate != 0);
+#if IS_ENABLED(CONFIG_ZEPHCORE_UI_DISPLAY)
+	if (companion_mesh.prefs.display_rotate) {
+		mc_display_set_rotated(true);
+	}
 #endif
-	ui_set_radio_stats(lora_radio.getPacketsRecv(),
-			   lora_radio.getPacketsSent(),
-			   lora_radio.getPacketsRecvErrors());
-	ui_set_battery(zephyr_board.getBattMilliVolts(), 0);
+
+	ui_set_node_name(companion_mesh.prefs.node_name);
+	ui_push_radio_state(lora_radio);
+	ui_set_battery(zephyr_board.getBattMilliVolts(), zephyr_board.getBattPercent());
 	ui_set_gps_available(gps_is_available());
 	ui_set_gps_enabled(companion_mesh.prefs.gps_enabled != 0);
 	ui_set_ble_enabled(companion_mesh.prefs.ble_disabled != 1);  /* BLE starts advertising at boot */
 
-	/* Restore offgrid mode (client repeat) state from persisted prefs */
 	ui_set_offgrid_mode(companion_mesh.prefs.client_repeat != 0);
 	LOG_INF("offgrid mode: %s (from prefs)",
 		companion_mesh.prefs.client_repeat ? "on" : "off");
 
-	/* Restore buzzer mute state from persisted prefs, then play
-	 * startup chime only if buzzer is not muted.
-	 * buzzer_init() defaults to quiet=true, so we must always
-	 * call buzzer_set_quiet() to apply the saved preference. */
+	/* buzzer_init() starts quiet, so the saved mode is always applied. */
 #if IS_ENABLED(CONFIG_ZEPHCORE_UI_BUZZER)
-	buzzer_set_quiet(companion_mesh.prefs.buzzer_quiet);
-	ui_set_buzzer_quiet(companion_mesh.prefs.buzzer_quiet);
-	LOG_INF("buzzer: quiet=%s (from prefs)",
-		companion_mesh.prefs.buzzer_quiet ? "true" : "false");
+	{
+		uint8_t bmode = zephcore_buzzer_mode_from_prefs(companion_mesh.prefs.buzzer_quiet);
+		zephcore_buzzer_set_mode(bmode, false);
+		ui_set_buzzer_mode(bmode);
+		LOG_INF("buzzer: mode=%u (from prefs)", bmode);
+	}
 	ui_play_startup_chime();
 #endif
 
-	/* Restore LED enabled/disabled state from persisted prefs.
-	 * If LEDs were disabled, stop the heartbeat LED cycle. */
+	/* Straight to the LED gate: it also governs the TX LED and exists in every
+	 * build, UI or not. */
 	bool leds_off = companion_mesh.prefs.leds_disabled != 0;
-	ui_set_leds_disabled(leds_off);
+	zephcore_leds_set_disabled(leds_off);
+	zephcore_leds_set_radio_mode(companion_mesh.prefs.leds_radio_mode);
+	zephcore_leds_set_hb_mode(companion_mesh.prefs.leds_hb_mode);
 	ui_set_heartbeat_led(!leds_off);
 	LOG_INF("LEDs: %s (from prefs)", leds_off ? "disabled" : "enabled");
 
-	/* Restore GPS state from persisted prefs.
-	 * GPS hardware is powered at boot (bootloader/pull-up).
-	 * First, ensure power state matches prefs (powers off if disabled).
-	 * Then, if prefs say enabled, start the GPS state machine. */
+	/* The GPS is powered at boot: match its power to prefs, then start the
+	 * state machine if enabled. */
 	if (gps_is_available()) {
-		/* Apply persisted GPS duty interval (0 = always on) before the
-		 * state machine starts. */
 		gps_set_poll_interval_sec(companion_mesh.prefs.gps_interval);
-
-		/* Explicitly set power state at boot (handles disabled case) */
 		gps_ensure_power_state(companion_mesh.prefs.gps_enabled);
 
 		if (companion_mesh.prefs.gps_enabled) {
@@ -1583,43 +1113,38 @@ int main(void)
 
 	/* Apply RX boost and duty cycle from prefs */
 	lora_radio.setRxBoost(companion_mesh.prefs.rx_boost != 0);
+	lora_radio.setFemRxEnable(companion_mesh.prefs.fem_rxgain != 0);
 	lora_radio.enableRxDutyCycle(companion_mesh.prefs.rx_duty_cycle != 0);
 	lora_radio.setCadParams(companion_mesh.prefs.cad_auto != 0,
 				companion_mesh.prefs.cad_offset,
-				companion_mesh.prefs.cad_probe_interval,
-				companion_mesh.prefs.cad_busycap);
-#ifdef CONFIG_ZEPHCORE_APC
-	ui_set_radio_runtime(
-		lora_radio.getEffectiveTxPower(),
-		companion_mesh.isAPCEnabled(),
-		companion_mesh.getAPCReduction(),
-		(int16_t)(companion_mesh.getAPCMargin() * 10.0f),
-		companion_mesh.getAPCTargetMargin(),
-		lora_radio.getActiveSyncWord(),
-		lora_radio.getActivePreambleLength(),
-		lora_radio.isRxDutyCycleEnabled(),
-		lora_radio.isRadioReady(),
-		lora_radio.isInRecvMode(),
-		lora_radio.isTxActive());
-#else
-	ui_set_radio_runtime(
-		lora_radio.getEffectiveTxPower(),
-		false, 0, 0, companion_mesh.prefs.apc_margin,
-		lora_radio.getActiveSyncWord(),
-		lora_radio.getActivePreambleLength(),
-		lora_radio.isRxDutyCycleEnabled(),
-		lora_radio.isRadioReady(),
-		lora_radio.isInRecvMode(),
-		lora_radio.isTxActive());
-#endif
+				companion_mesh.prefs.probe_interval,
+				companion_mesh.prefs.cad_busycap,
+				companion_mesh.prefs.cad_base);
+	/* Persist the (offset, base) in force if setCadParams() re-anchored it
+	 * across a base-table change, so the next upgrade has an anchor too. */
+	if (companion_mesh.prefs.cad_base != lora_radio.cadBasePeak() ||
+	    companion_mesh.prefs.cad_offset != lora_radio.getCadOffset()) {
+		companion_mesh.prefs.cad_offset = lora_radio.getCadOffset();
+		companion_mesh.prefs.cad_base = lora_radio.cadBasePeak();
+		data_store.savePrefs(companion_mesh.prefs);
+	}
 
-	/* Restore runtime ADC multiplier override (0 = keep DT default) */
+	/* LR2021 side detectors (multi-SF RX). A set rejected for the current
+	 * SF/BW leaves them off; other radios report them unsupported. */
+	{
+		uint8_t n = 0;
+		while (n < EXTRA_SF_MAX && companion_mesh.prefs.extra_sf[n] != 0) n++;
+		if (n > 0 && !lora_radio.configSideDetectors(companion_mesh.prefs.extra_sf, n)) {
+			LOG_WRN("extra.sf %u SFs rejected for current SF/BW — side detectors off", n);
+		}
+	}
+	ui_push_radio_state(lora_radio);  /* side detectors changed the runtime state */
+
+	/* ADC multiplier override (0 = devicetree default) */
 	zephyr_board.setAdcMultiplier(companion_mesh.prefs.adc_multiplier);
 
-	/* Initialize mesh event object */
 	k_event_init(&mesh_events);
 
-	/* Initialize UI mesh actions module (pass mesh objects for deferred actions) */
 	ui_mesh_actions_init(&mesh_events, MESH_EVENT_UI_ACTION,
 			     &companion_mesh, &data_store,
 			     &lora_radio, &zephyr_board, &rtc_clock);
@@ -1629,61 +1154,46 @@ int main(void)
 #endif
 #endif
 
-	/* Initialize BLE adapter (registers auth callbacks) */
+	/* Register every transport this build has, as upstream's main.cpp does. */
+#if IS_ENABLED(CONFIG_BT)
 	zephcore_ble_init(&ble_cbs);
-
-	/*
-	 * USB CDC ACM companion transport.
-	 * Enabled when logging is on (debug builds) OR when explicitly requested
-	 * via CONFIG_ZEPHCORE_COMPANION_USB (e.g. prod builds on USB-capable boards).
-	 */
+	interface_manager.addInterface(InterfaceType::Bluetooth, &ble_interface);
+#endif
 #if ZEPHCORE_USB_STACK
-	zephcore_usb_companion_init(&mesh_events, MESH_EVENT_BLE_RX,
-				   &zephyr_board);
-	/* Mirror BLE connect/disconnect UI + cleanup for USB sessions. */
-	zephcore_usb_companion_set_session_start_cb(usb_on_session_start);
-	zephcore_usb_companion_set_session_end_cb(usb_on_session_end);
-	/* Resume the contact pump when the USB TX ring drains (≈ BLE on_tx_idle). */
-	zephcore_usb_companion_set_tx_drain_cb(usb_on_tx_drain);
-	/* Text CLI sideband — activates when first byte is not '<'. */
+	zephcore_usb_companion_init(&link_cbs);
+	/* The text CLI starts when the first byte is not '<'. */
 	zephcore_usb_companion_set_cli_line_cb(companion_cli_dispatch);
+	interface_manager.addInterface(InterfaceType::USB, &usb_interface);
+#endif
+#if IS_ENABLED(CONFIG_ZEPHCORE_TRANSPORT_TCP)
+	tcp_companion_init(&link_cbs);
+	interface_manager.addInterface(InterfaceType::WiFi, &tcp_interface);
 #endif
 
+	/* Enables every interface; the ble_disabled pref then turns BLE back off
+	 * before the stack starts advertising. */
+#ifdef ZEPHCORE_LORA
+	companion_mesh.startInterface(companion_serial);
+	if (companion_mesh.prefs.ble_disabled) {
+		interface_manager.disableBluetooth();
+	}
+#else
+	companion_serial.enable();
+#endif
+
+#if IS_ENABLED(CONFIG_ZEPHCORE_TRANSPORT_TCP)
+	tcp_companion_start(CONFIG_ZEPHCORE_TCP_PORT);
+#endif
+#if IS_ENABLED(CONFIG_ZEPHCORE_COMPANION_WIFI) && defined(ZEPHCORE_LORA)
+	companion_wifi_start(companion_mesh.prefs);
+#endif
 #if IS_ENABLED(CONFIG_BT)
 	if (bt_enable(bt_ready) != 0) {
 		LOG_ERR("bt_enable failed");
 	}
-#else
-	/* No BLE controller — TCP companion transport starts itself.
-	 * zephcore_ble_start() is provided by LinuxTCPTransport.c when
-	 * CONFIG_ZEPHCORE_TRANSPORT_TCP=y. */
-	zephcore_ble_start(companion_mesh.getDeviceName());
 #endif
 
-	/*
-	 * FULLY EVENT-DRIVEN architecture: main thread runs mesh event loop.
-	 * Mesh loop wakes IMMEDIATELY on events - NO POLLING for TX completion!
-	 *
-	 * Event sources:
-	 *   - MESH_EVENT_LORA_RX: LoRa packet received (from RX async callback)
-	 *   - MESH_EVENT_LORA_TX_DONE: LoRa TX complete (from TX poll work -> callback)
-	 *   - MESH_EVENT_HOUSEKEEPING: Periodic maintenance (noise floor, etc.)
-	 *   - MESH_EVENT_BLE_RX: BLE/USB frame (or USB text-CLI line) ready to parse.
-	 *     The BLE callback / USB adapter only assemble + queue the frame off-main;
-	 *     process_companion_rx() (and companion_cli_run()) parse it HERE on the
-	 *     main thread so mesh-state mutation never races loop().
-	 *   - MESH_EVENT_TX_DRAIN: outbound LoRa packet queued — wakes loop() to drain
-	 *   - MESH_EVENT_UI_ACTION / GPS_ACTION / PREFS_DIRTY: deferred work
-	 *     from non-main threads
-	 *
-	 * Other processing still uses work queues:
-	 *   - BLE TX: write_frame -> tx_drain_work (event-driven via notify callback)
-	 *   - Contact iteration: MESH_EVENT_CONTACT_ITER -> run_contact_iteration()
-	 *     on the main thread, paced by the BLE/USB tx-idle callbacks
-	 *
-	 * TX completion is now event-driven: radio polls at 5ms intervals internally
-	 * and fires callback when done. Much better than 100ms main loop polling!
-	 */
+	/* The main thread becomes the mesh event loop (see MESH_EVENT_*). */
 #ifdef ZEPHCORE_LORA
 	mesh_event_loop();  /* Never returns */
 #else

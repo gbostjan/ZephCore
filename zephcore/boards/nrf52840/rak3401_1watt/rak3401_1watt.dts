@@ -69,8 +69,16 @@
 	/* ---- Power control ---- */
 
 	/* 3V3_S rail — must be HIGH for GPS and IO-slot peripherals.
-	 * WB_IO2 (P1.02) doubles as GPS_RESET on the RAK1910 slot,
-	 * so it must remain HIGH when GPS is active. */
+	 *
+	 * Never duty-cycle this rail on THIS board: WB_IO2 (P1.02) also gates the
+	 * 5V boost feeding the SKY66122 PA, so dropping it to save GPS power kills
+	 * the 1W transmit path. That is why it is `regulator-boot-on` and is NOT
+	 * wired up as `chosen zephcore,gps-power`.
+	 *
+	 * (This pin also lands on RESET_N of a RAK1910/RAK12500 in Slot A, which is
+	 * why it is sometimes called "GPS reset". It is not one — u-blox specify
+	 * RESET_N as a reset only, not an enable, since the SiP draws significant
+	 * current while held in reset. See MeshCore PR #3051.) */
 	v3v3s_enable: v3v3s-enable {
 		compatible = "regulator-fixed";
 		regulator-name = "v3v3s-enable";
@@ -85,6 +93,13 @@
 		regulator-name = "lora-pwr-enable";
 		enable-gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
 		regulator-boot-on;
+		/* The FEM's requirement. It runs at boot (Zephyr 3b4821f1ba6,
+		 * pinned from 1.17.5; it was skipped before), but do not rely on
+		 * it alone: the real settle time comes from the SX126x driver's
+		 * own reset (5 ms NRESET pulse + 5 ms wait + BUSY poll) before any
+		 * SPI traffic, at LORA_INIT_PRIORITY 90 against this rail's 75.
+		 * Anything put behind this rail that does NOT reset-then-wait needs
+		 * zephyr,deferred-init instead; see meshtracker_x1's i2c0. */
 		startup-delay-us = <10000>;
 	};
 

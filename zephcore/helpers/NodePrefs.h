@@ -10,6 +10,44 @@
 
 #include <stdint.h>
 #include <string.h>
+#include "LoRaConfig.h"
+
+/* LEDS_RADIO_* / LEDS_HB_* mode values for the leds_radio_mode and leds_hb_mode
+ * fields below.  They live in led_gate.h because the heartbeat consumers are C
+ * and this header is C++; see the note there. */
+#include "led_gate.h"
+
+/* ── Accepted radio parameter ranges ──────────────────────────────────
+ *
+ * One definition, used by everything that accepts or validates a radio
+ * preset: the USB CLI, the BLE companion protocol, the observer CLI, and the
+ * load-time sanity checks in both datastores.
+ *
+ * It lives here because these ranges were previously copy-pasted into six
+ * places and drifted. That drift was not theoretical: when 2.4 GHz support
+ * landed, the setters were widened and the *loaders* were not, so a node
+ * accepted `set freq 2450`, saved it, and then silently reverted to factory
+ * defaults on the next boot because the load-time guard still capped at
+ * 960 MHz. A setter must never accept what the loader will throw away.
+ *
+ * FREQ spans both LR2021 RF paths — the sub-GHz one (150-960 MHz) and the
+ * high band (1.9-2.5 GHz). Boards whose radio cannot reach the high band are
+ * limited by their own driver, not by this range.
+ *
+ * BW_MAX is the one value that is per-build. Only the LR2021 implements the
+ * wide 203/406/812/1000 kHz set; every other driver here maps an unknown
+ * bandwidth to 125 kHz instead of refusing it, so accepting 812 on those
+ * boards would put a node on a channel width it never reported. */
+#define ZC_RADIO_FREQ_MIN_MHZ   150.0f
+#define ZC_RADIO_FREQ_MAX_MHZ   2500.0f
+#define ZC_RADIO_BW_MIN_KHZ     7.0f
+#ifdef CONFIG_ZEPHCORE_RADIO_LR2021
+	#define ZC_RADIO_BW_MAX_KHZ   1000.0f
+	#define ZC_RADIO_BW_RANGE_STR "7-1000"
+#else
+	#define ZC_RADIO_BW_MAX_KHZ   500.0f
+	#define ZC_RADIO_BW_RANGE_STR "7-500"
+#endif
 
 #define TELEM_MODE_DENY            0
 #define TELEM_MODE_ALLOW_FLAGS     1
@@ -35,6 +73,31 @@
  * per-level stats array). */
 #define CAD_OFFSET_MIN  (-8)
 #define CAD_OFFSET_MAX  12
+
+/* leds_disabled, as stored in the repeater/room-server/observer prefs layout.
+ *
+ * It occupies the byte that used to hold agc_reset_interval (offset 120),
+ * retired when periodic AGC recalibration was removed.  That byte is NOT
+ * reusable as a plain 0/1 boolean: the old command stored seconds/4, so a node
+ * upgrading from a build that had it configured has an arbitrary small integer
+ * sitting there, and a bare non-zero test would silently kill its LEDs.  Hence
+ * a magic encoding — anything that is not one of these two values is a legacy
+ * AGC interval and decodes to the default (LEDs on).  The first savePrefs()
+ * claims the byte for good.
+ *
+ * The companion layout is unaffected: it has always stored leds_disabled as a
+ * plain 0/1 at its own offset 93. */
+#define LEDS_PREF_ON    0xA0
+#define LEDS_PREF_OFF   0xA1
+
+/* Number of LR2021 side-detector slots stored in prefs.  Matches the chip's
+ * ConfigureSideDetectors limit of 3. */
+#define EXTRA_SF_MAX    3
+
+/* Display timezone offset range, whole hours from UTC.  Matches upstream
+ * MeshCore's `set tz.offset` so the same command works against both trees. */
+#define TZ_OFFSET_MIN   (-12)
+#define TZ_OFFSET_MAX   14
 
 struct NodePrefs {
 	/* ---- Common fields (both roles) ---- */
@@ -62,25 +125,102 @@ struct NodePrefs {
 	uint8_t flood_max_unscoped;     // hop limit for un-scoped (ROUTE_TYPE_FLOOD) floods
 	uint8_t flood_max_advert;       // hop limit for ADVERT floods (curbs advert churn)
 	uint8_t interference_threshold;
-	uint8_t agc_reset_interval;     // stored as secs / 4
+	uint8_t leds_disabled;          // 1 = all LEDs off (heartbeat, unread, LoRa TX)
+	uint8_t leds_radio_mode;        // LEDS_RADIO_* — activity LED source (0 = TX, as before)
+	uint8_t leds_hb_mode;           // LEDS_HB_* — heartbeat LED behaviour (0 = all, as before)
 	// Power saving
 	uint8_t powersaving_enabled;
+	/* 1 = powersaving_enabled is a real choice.  The field was stored but
+	 * did nothing before ESP32 light sleep honoured it (2026-09-26), so a
+	 * stored 0 without this marker takes the build's default once
+	 * (powersaving_upgrade). */
+	uint8_t powersaving_set;
 	// GPS settings
 	uint8_t gps_enabled;
+	/* Servers only: 1 = gps_enabled is a real choice. Servers before
+	 * slice 10 ran the GPS whatever gps_enabled said, so a prefs file
+	 * without this marker is upgraded to gps_enabled = 1 once. */
+	uint8_t gps_enabled_set;
 	uint32_t gps_interval;          // in seconds
 	uint8_t advert_loc_policy;
 	uint32_t discovery_mod_timestamp;
 	float adc_multiplier;
 	char owner_info[120];
 	uint8_t rx_boost;               // 1 = boosted RX gain (+3dB), 0 = power save
+	uint8_t fem_rxgain;             // 1 = external FEM LNA active during RX, 0 = off (power save)
 	uint8_t rx_duty_cycle;          // 1 = RX duty cycle, 0 = continuous RX
-	uint8_t apc_enabled;            // 1 = APC on, 0 = fixed TX power
-	uint8_t apc_margin;             // APC target link margin dB (6-30)
+	/* RESERVED — formerly apc_enabled / apc_margin (Adaptive Power Control,
+	 * removed in 1.16.6). These two bytes are still read and written at their
+	 * original offsets in both prefs layouts (companion new_prefs 94/95, server
+	 * prefs 292/293; helpers/PrefsCodec.cpp) because every field after them
+	 * is positional: dropping them would shift the rest of the layout and make
+	 * every already-deployed node misparse its saved prefs on upgrade.
+	 * Do not reuse for a new setting — an upgraded node still has the old APC
+	 * values sitting in these bytes. */
+	uint8_t _reserved_apc_enabled;
+	uint8_t _reserved_apc_margin;
 	uint8_t meshtimesync;           // 1 = mesh time-sync clock correction on (default off)
-	uint8_t cad_auto;               // 1 = adaptive-CAD staircase acts on probe stats (default off = dry-run)
-	int8_t cad_offset;              // operating detPeak offset from family base (-4..4)
-	uint8_t cad_probe_interval;     // seconds between CAD probes (0 = probing off, default 60)
-	uint8_t cad_busycap;            // airtime-protection: max % of TX attempts deferred before backing off detPeak (0 = off, default 25)
+	uint8_t cad_auto;               // 1 = adaptive-CAD staircase acts on probe stats (default ON)
+	int8_t cad_offset;              // operating detPeak offset from family base (CAD_OFFSET_MIN..MAX, -8..+12)
+	uint8_t probe_interval;         // seconds between periodic radio measurements:
+	                                // one noise-floor sample, and the CAD probe that
+	                                // consumes it (0 = CAD probing off, default 15)
+	uint8_t cad_busycap;            // faint-tolerance / airtime cap: raise detPeak once more than this %
+	                                // of QUIET-MOMENT PROBES trip on a faint signal (0 = off, default 15).
+	                                // Not "% of TX attempts deferred" -- probes are prefiltered to quiet
+	                                // moments, so strong traffic never enters the statistic at all.
+	/* LR2021 side detectors: extra spreading factors received concurrently
+	 * with `sf`, on the same bandwidth.  Zero-terminated list — the first 0
+	 * ends it, so an all-zero array means the feature is off (which is what
+	 * every node upgrading from a build without this field has).  Every
+	 * entry must be greater than `sf`, all distinct, spread <= 4; the
+	 * driver rejects anything else.  Ignored on non-LR2021 radios. */
+	uint8_t extra_sf[EXTRA_SF_MAX];
+
+	/* Physical mounting orientation.  Common to both roles: a repeater board
+	 * with an OLED (RAK4631, Heltec) can be mounted upside down just as a
+	 * companion can, and the joystick boards ship a repeater artifact too.
+	 *
+	 * display_rotate rotates the panel 180 degrees in hardware and is only
+	 * honoured on SSD1306/SH1106 (see MC_DISPLAY_ROTATE_SUPPORTED); other
+	 * panels report it unsupported rather than silently ignoring it.
+	 * input_rotate swaps the joystick/D-pad axes to match, and is kept
+	 * separate because the two are not always wanted together — a screen can
+	 * be remounted without moving the stick. */
+	uint8_t display_rotate;         // 1 = panel rotated 180 degrees
+	uint8_t input_rotate;           // 1 = joystick up/down and left/right swapped
+
+	/* Whole-hour offset from UTC, -12..+14, applied ONLY when formatting a
+	 * clock for the local display.  It must never reach RTCClock or any
+	 * timestamp that leaves this node: a negative offset applied to the clock
+	 * itself reads as a backward jump to every timestamp consumer at once
+	 * (advert timestamps, the repeater ACL's monotonic sender_timestamp gate,
+	 * discovery_mod_timestamp, MeshTimeSync), and a backward clock is a silent
+	 * mesh-wide mute.  The CLI's `clock` / `time` commands stay UTC for the
+	 * same reason -- they round-trip with each other and apps parse them.
+	 *
+	 * Whole hours only, matching upstream's `set tz.offset` so an app that
+	 * speaks to both trees behaves the same.  Half-hour zones (India +5:30,
+	 * Newfoundland -3:30) therefore cannot be expressed.
+	 *
+	 * Common to both roles: a repeater with an OLED shows a clock too.  On a
+	 * headless repeater the field is simply inert. */
+	int8_t tz_offset;
+
+	/* The family base detPeak that cad_offset was learned against (0 = never
+	 * stored, i.e. a node upgrading from a build without this field).
+	 *
+	 * cad_offset is a SIGNED OFFSET from a per-SF/per-bandwidth base table
+	 * that lives in the driver, so changing that table silently re-points a
+	 * stored offset at a different absolute detPeak.  The probe statistics
+	 * behind the offset are RAM-only and die at the reboot a firmware upgrade
+	 * involves, but the offset itself is persisted and survives — so after a
+	 * table change a converged node quietly starts operating somewhere it
+	 * never measured.  Recording the base turns that into something the
+	 * firmware can correct at boot (see LoRaRadio::setCadParams), instead
+	 * of a "run set cad.reset after upgrading" line in the release notes that
+	 * most users will not read. */
+	uint8_t cad_base;
 
 	/* ---- Companion-only fields ---- */
 	uint8_t manual_add_contacts;
@@ -94,7 +234,6 @@ struct NodePrefs {
 	uint8_t path_hash_mode;         // path mode 0-2
 	uint8_t autoadd_max_hops;       // 0 = no limit, N = up to N-1 hops
 	uint8_t loop_detect;            // LOOP_DETECT_{OFF,MINIMAL,MODERATE,STRICT}
-	uint8_t leds_disabled;          // 1 = LEDs off
 	char default_scope_name[31];    // companion: default flood scope region name ("" = null)
 	uint8_t default_scope_key[16];  // companion: default flood scope TransportKey
 	uint8_t ble_disabled;           // 1 = BLE advertising off
@@ -102,11 +241,206 @@ struct NodePrefs {
 	uint8_t wake_on_msg;            // 0 = don't wake display on message, 1 = wake (default)
 	uint16_t screen_off_secs;       // 0 = default (Kconfig), else 5–300
 	uint16_t auto_shutdown_mv;      // low-batt auto-shutdown threshold; 0 = off, else 2900–4200
+	/* 1 = auto_shutdown_mv is a choice made after the default moved from
+	 * 3300 to 3200 mV; a stored 3300 without it is the old default and
+	 * becomes 3200 once (PrefsJson, the legacy loader). */
+	uint8_t auto_shutdown_set;
 	uint8_t v_contact_enabled;      // v-contact (loopback admin chat via BLE/USB); 1 = on (default)
 	uint16_t v_battery_alert_mv;    // 0 = alert off; 0xFFFF = board default (auto_shutdown+200); else mV
+	/* App-owned ContactInfo.flags byte for the v-contact.  The v-contact never
+	 * enters the contacts table, so it has no record to hold the flags the app
+	 * sets via CMD_ADD_UPDATE_CONTACT -- bit 0 is the 'favourite' star, the
+	 * upper bits are telemetry permissions.  Kept here so a toggle survives
+	 * reconnects and reboots instead of being echoed back as 0. */
+	uint8_t v_contact_flags;
+	/* The WiFi companion's network (upstream's wifi_ssid / wifi_pwd /
+	 * wifi_enabled). Stored by every companion build, WiFi or not, so moving
+	 * between firmware never drops a saved network. */
+	char wifi_ssid[33];
+	char wifi_pwd[64];
+	uint8_t wifi_enabled;           // 1 = join wifi_ssid when set (upstream default)
 };
 
-/* Default prefs -- must match LoRaConfig.h defaults for radio interop. */
+/* Range guards for prefs that came off flash.
+ *
+ * The atomic replace in every savePrefs() plus littlefs's own CRCs make a torn
+ * write impossible, so this is not about power loss — it is about a blob that
+ * is structurally intact and semantically wrong.  Several of these fields make
+ * a node look bricked when they are: auto_shutdown_mv powers it off seconds
+ * after boot, ble_pin locks pairing out, and the char fields are stored as
+ * fixed-size blocks with no terminator in the file format, so an unterminated
+ * one runs every later %s off the end of the struct.
+ *
+ * Called by both prefs decoders (PrefsCodec.cpp).  Fields whose whole range is
+ * legal (autoadd_config bitmask, discovery_mod_timestamp, the v_contact_*
+ * sentinels) are deliberately left alone. */
+template <typename T>
+static inline T clampPref(T v, T lo, T hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* Floats need the NaN test spelled out: every comparison against NaN is false,
+ * so a plain clamp passes it straight through. */
+template <typename T>
+static inline T sanePrefFloat(T v, T lo, T hi, T fallback) {
+	if (v != v || v < lo || v > hi) return fallback;
+	return v;
+}
+
+/* A byte that is neither 0 nor 1 carries no user intent — take the default
+ * rather than clamping, which would round every garbage value up to "on". */
+template <typename T>
+static inline T saneBool(T v, T fallback) { return (v == 0 || v == 1) ? v : fallback; }
+
+/* Same idea as saneBool for a small enum: anything outside 0..max carries no
+ * user intent, so fall back to 0 — which every LEDS_* enum defines as the
+ * behaviour the firmware had before the setting existed. */
+static inline uint8_t saneEnum(uint8_t v, uint8_t max) { return (v <= max) ? v : 0; }
+
+/* The GPS duty interval, in the one range every setter and the GPS manager
+ * share: 0 = always on, else 10 s to 1 week (safely below the ms overflow). */
+/* The auto-shutdown default before 2026-09-25 (now 3200 mV): a stored
+ * 3300 without auto_shutdown_set is migrated (auto_shutdown_upgrade). */
+#define AUTO_SHUTDOWN_OLD_DEFAULT_MV 3300
+static inline void auto_shutdown_upgrade(NodePrefs *p) {
+#if defined(CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) && CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS > 0
+	if (!p->auto_shutdown_set && p->auto_shutdown_mv == AUTO_SHUTDOWN_OLD_DEFAULT_MV) {
+		p->auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS;
+	}
+#endif
+	p->auto_shutdown_set = 1;
+}
+
+/* `powersaving` gates ESP32 light sleep (helpers/pm_esp32_wake.c).  On a
+ * light-sleep build the default is on: those builds slept unconditionally
+ * before the switch existed, and the stored 0 carried no intent.  Elsewhere
+ * it is upstream's default, off. */
+#if defined(CONFIG_PM) && defined(CONFIG_SOC_FAMILY_ESPRESSIF_ESP32)
+#define POWERSAVING_DEFAULT 1
+#else
+#define POWERSAVING_DEFAULT 0
+#endif
+static inline void powersaving_upgrade(NodePrefs *p) {
+	if (!p->powersaving_set && p->powersaving_enabled == 0) {
+		p->powersaving_enabled = POWERSAVING_DEFAULT;
+	}
+	p->powersaving_set = 1;
+}
+
+#define GPS_INTERVAL_MIN_SEC 10u
+#define GPS_INTERVAL_MAX_SEC 604800u
+static inline uint32_t clampGpsInterval(uint32_t sec) {
+	if (sec == 0) return 0;
+	if (sec < GPS_INTERVAL_MIN_SEC) return GPS_INTERVAL_MIN_SEC;
+	return (sec > GPS_INTERVAL_MAX_SEC) ? GPS_INTERVAL_MAX_SEC : sec;
+}
+
+static inline void sanitizeNodePrefs(NodePrefs* p) {
+	p->node_name[sizeof(p->node_name) - 1] = '\0';
+	p->password[sizeof(p->password) - 1] = '\0';
+	p->guest_password[sizeof(p->guest_password) - 1] = '\0';
+	p->owner_info[sizeof(p->owner_info) - 1] = '\0';
+	p->default_scope_name[sizeof(p->default_scope_name) - 1] = '\0';
+	p->wifi_ssid[sizeof(p->wifi_ssid) - 1] = '\0';
+	p->wifi_pwd[sizeof(p->wifi_pwd) - 1] = '\0';
+	p->wifi_enabled = saneBool(p->wifi_enabled, (uint8_t)1);
+
+	p->airtime_factor = sanePrefFloat(p->airtime_factor, 0.0f, 9.0f, 9.0f);
+	p->rx_delay_base  = sanePrefFloat(p->rx_delay_base, 0.0f, 3600.0f, 0.0f);
+	p->adc_multiplier = sanePrefFloat(p->adc_multiplier, 0.0f, 30000.0f, 0.0f);
+	/* Range matches the CLI (0.0-2.0).  0.0 is a legal value meaning "reactive
+	 * backoff off" and must survive: this guard exists for NaN and corruption
+	 * only.  RepeaterDataStore used to coerce 0.0 -> 0.2 here, which silently
+	 * undid the documented way to disable the feature on every boot. */
+	p->backoff_multiplier = sanePrefFloat(p->backoff_multiplier, 0.0f, 2.0f, 0.2f);
+	p->node_lat = sanePrefFloat(p->node_lat, -90.0, 90.0, 0.0);
+	p->node_lon = sanePrefFloat(p->node_lon, -180.0, 180.0, 0.0);
+
+	p->cr           = clampPref<uint8_t>(p->cr, 5, 8);
+	p->tx_power_dbm = clampPref<int8_t>(p->tx_power_dbm, -9, 30);
+#ifdef CONFIG_ZEPHCORE_MAX_TX_POWER_DBM
+	if (p->tx_power_dbm > CONFIG_ZEPHCORE_MAX_TX_POWER_DBM) {
+		p->tx_power_dbm = (int8_t)CONFIG_ZEPHCORE_MAX_TX_POWER_DBM;
+	}
+#endif
+
+	/* Booleans and enums fall back to a safe value rather than being clamped
+	 * to their maximum: clamping is the wrong direction for anything that
+	 * grants a permission, hides the node, or turns a radio mode on.  A byte
+	 * that is neither 0 nor 1 carries no user intent, so the fallback is
+	 * simply the field's own default. */
+	p->client_repeat       = saneBool<uint8_t>(p->client_repeat, 0);
+	p->manual_add_contacts = saneBool<uint8_t>(p->manual_add_contacts, 0);
+	p->multi_acks          = saneBool<uint8_t>(p->multi_acks, 0);
+	p->buzzer_quiet        = saneBool<uint8_t>(p->buzzer_quiet, 0);
+	p->gps_enabled         = saneBool<uint8_t>(p->gps_enabled, 0);
+	p->gps_enabled_set     = saneBool<uint8_t>(p->gps_enabled_set, 0);
+	p->auto_shutdown_set   = saneBool<uint8_t>(p->auto_shutdown_set, 0);
+	p->rx_duty_cycle       = saneBool<uint8_t>(p->rx_duty_cycle, 0);
+	p->leds_disabled       = saneBool<uint8_t>(p->leds_disabled, 0);
+	p->leds_radio_mode     = saneEnum(p->leds_radio_mode, LEDS_RADIO_MAX);
+	p->leds_hb_mode        = saneEnum(p->leds_hb_mode, LEDS_HB_MAX);
+	p->meshtimesync        = saneBool<uint8_t>(p->meshtimesync, 0);
+	/* Fallback must be the initNodePrefs() default (ON).  It was 0, so a byte
+	 * that was neither 0 nor 1 silently switched adaptive CAD off instead of
+	 * restoring the default — left over from when the default was dry-run. */
+	p->cad_auto            = saneBool<uint8_t>(p->cad_auto, 1);
+	p->allow_read_only     = saneBool<uint8_t>(p->allow_read_only, 0);
+	p->powersaving_enabled = saneBool<uint8_t>(p->powersaving_enabled, POWERSAVING_DEFAULT);
+	p->powersaving_set     = saneBool<uint8_t>(p->powersaving_set, 0);
+	p->display_rotate      = saneBool<uint8_t>(p->display_rotate, 0);
+	p->input_rotate        = saneBool<uint8_t>(p->input_rotate, 0);
+	/* Defaults that are on, not off. */
+	p->rx_boost            = saneBool<uint8_t>(p->rx_boost, 1);
+	p->fem_rxgain          = saneBool<uint8_t>(p->fem_rxgain, 1);
+	p->wake_on_msg         = saneBool<uint8_t>(p->wake_on_msg, 1);
+	p->v_contact_enabled   = saneBool<uint8_t>(p->v_contact_enabled, 1);
+	/* Never let a corrupt byte take the radio off the air or hide BLE — both
+	 * remove the only ways left to fix the node. */
+	p->ble_disabled        = saneBool<uint8_t>(p->ble_disabled, 0);
+
+	/* Permission and privacy enums: out of range means deny/withhold. */
+	if (p->telemetry_mode_base > TELEM_MODE_ALLOW_ALL) p->telemetry_mode_base = TELEM_MODE_DENY;
+	if (p->telemetry_mode_loc  > TELEM_MODE_ALLOW_ALL) p->telemetry_mode_loc  = TELEM_MODE_DENY;
+	if (p->telemetry_mode_env  > TELEM_MODE_ALLOW_ALL) p->telemetry_mode_env  = TELEM_MODE_DENY;
+	if (p->advert_loc_policy   > ADVERT_LOC_PREFS)     p->advert_loc_policy   = ADVERT_LOC_NONE;
+
+	if (p->loop_detect    > LOOP_DETECT_STRICT) p->loop_detect    = LOOP_DETECT_MINIMAL;
+	/* Fallback must be the initNodePrefs() default (1 = 2-byte hashes). It was
+	 * 0, so a corrupt byte silently dropped the node to 1-byte path hashes --
+	 * a value no role defaults to, and one the CLI would not report as the
+	 * default either. */
+	if (p->path_hash_mode > 2)                  p->path_hash_mode = 1;
+	p->autoadd_max_hops    = clampPref<uint8_t>(p->autoadd_max_hops, 0, 64);
+	p->flood_max           = clampPref<uint8_t>(p->flood_max, 0, 64);
+	p->flood_max_unscoped  = clampPref<uint8_t>(p->flood_max_unscoped, 0, 64);
+	p->flood_max_advert    = clampPref<uint8_t>(p->flood_max_advert, 0, 64);
+	p->cad_busycap         = clampPref<uint8_t>(p->cad_busycap, 0, 90);
+	/* Neutral, not the boundary — a garbage offset is not a request to run
+	 * the CAD staircase at one end of its range. */
+	if (p->cad_offset < CAD_OFFSET_MIN || p->cad_offset > CAD_OFFSET_MAX) p->cad_offset = 0;
+	/* UTC, not a boundary zone, for a byte that carries no user intent. */
+	if (p->tz_offset < TZ_OFFSET_MIN || p->tz_offset > TZ_OFFSET_MAX) p->tz_offset = 0;
+	if (p->probe_interval != 0 && p->probe_interval < 10) p->probe_interval = 10;
+
+	/* 6-digit BLE passkey — anything else is rejected at pairing time and
+	 * leaves no way back in over BLE. */
+	if (p->ble_pin > 999999) p->ble_pin = 0;
+	/* 0 is always-on, so a corrupt value clamps to the week, not to 0. */
+	p->gps_interval = clampGpsInterval(p->gps_interval);
+	/* 0 = board/Kconfig default on both, else the range the UI offers. */
+	if (p->display_brightness != 0) p->display_brightness = clampPref<uint8_t>(p->display_brightness, 10, 100);
+	if (p->screen_off_secs != 0) p->screen_off_secs = clampPref<uint16_t>(p->screen_off_secs, 5, 300);
+	/* 0 = off.  Outside the cell range it either never fires or powers the
+	 * node off the moment it boots — the one that looks like a dead device. */
+	if (p->auto_shutdown_mv != 0 &&
+	    (p->auto_shutdown_mv < 2900 || p->auto_shutdown_mv > 4200)) {
+#ifdef CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS
+		p->auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS;
+#else
+		p->auto_shutdown_mv = 0;
+#endif
+	}
+}
+
 static inline void initNodePrefs(NodePrefs* prefs) {
 	memset(prefs, 0, sizeof(NodePrefs));
 	prefs->airtime_factor = 9.0f;  /* Arduino formula: duty% = 100 / (af + 1) → 10% */
@@ -120,20 +454,22 @@ static inline void initNodePrefs(NodePrefs* prefs) {
 #ifdef CONFIG_ZEPHCORE_GUEST_PASSWORD
 	strncpy(prefs->guest_password, CONFIG_ZEPHCORE_GUEST_PASSWORD, sizeof(prefs->guest_password) - 1);
 #endif
-	/* Radio params - MUST match LoRaConfig.h for interop with companion nodes */
-	prefs->freq = 869.618f;           // LoRaConfig::FREQ_HZ / 1000000.0
-	prefs->bw = 62.5f;                // LoRaConfig::BANDWIDTH
-	prefs->sf = 8;                    // LoRaConfig::SPREADING_FACTOR
-	prefs->cr = 8;                    // CR 4/8 (MeshCore uses 5-8 for CR 4/5 through 4/8)
-#ifdef CONFIG_ZEPHCORE_DEFAULT_TX_POWER_DBM
-	prefs->tx_power_dbm = CONFIG_ZEPHCORE_DEFAULT_TX_POWER_DBM;
-#else
-	prefs->tx_power_dbm = 22;         // LoRaConfig::TX_POWER_DBM
-#endif
+	/* Radio params */
+	prefs->freq = mesh::LoRaConfig::FREQ_MHZ;
+	prefs->bw = mesh::LoRaConfig::BANDWIDTH_KHZ;
+	prefs->sf = mesh::LoRaConfig::SPREADING_FACTOR;
+	prefs->cr = mesh::LoRaConfig::CODING_RATE;   /* 5-8 = CR 4/5 through 4/8 */
+	prefs->tx_power_dbm = mesh::LoRaConfig::TX_POWER_DBM;
 	prefs->disable_fwd = 0;
 	prefs->advert_interval = 0;       // 0 = periodic local advert off; else minutes = value * 2
 	prefs->flood_advert_interval = 47;  // hours
 	prefs->rx_delay_base = 0.0f;
+	/* Must match mesh::ContentionTracker::DEFAULT_BACKOFF_MULT.  Left at the
+	 * memset 0 (= backoff disabled) until now, with RepeaterDataStore coercing
+	 * 0.0 -> 0.2 on load to paper over it — which also undid a deliberate 0.0.
+	 * Companions never apply this (only Repeater/RoomServer call
+	 * setBackoffMultiplier), so setting it here changes no existing node. */
+	prefs->backoff_multiplier = 0.2f;
 	prefs->tx_delay_factor = 0.5f;
 	prefs->direct_tx_delay_factor = 0.3f;
 	prefs->allow_read_only = 0;
@@ -141,22 +477,56 @@ static inline void initNodePrefs(NodePrefs* prefs) {
 	prefs->flood_max = 64;            // max hops for flood packets (0 = blocking all!)
 	prefs->flood_max_unscoped = 64;  // un-scoped flood hop limit (defaults to flood_max)
 	prefs->flood_max_advert = 8;     // ADVERT flood hop limit (upstream default)
+	/* 2-byte path hashes (mode + 1 = hash size) for everything this node
+	 * originates.  ZephCore's default, not upstream's -- Arduino MeshCore
+	 * ships 0 (1-byte) for every role, which collides far more often on a
+	 * dense mesh.  It lived only in the RepeaterMesh and RoomServerMesh
+	 * constructors until now, so a fresh companion quietly originated 1-byte
+	 * floods and reported mode 0 to the app, and `set path.hash.mode default`
+	 * wrote 0 even on a repeater that had booted at 1.  Deployed nodes keep
+	 * whatever they stored: path_hash_mode sits at a fixed prefs offset that
+	 * always loads, so this only changes a factory-fresh node. */
+	prefs->path_hash_mode = 1;       // 2-byte path hashes
 	prefs->interference_threshold = 0;
-	prefs->agc_reset_interval = 0;
-	prefs->powersaving_enabled = 0;
+	prefs->leds_disabled = 0;         // LEDs on
+	prefs->leds_radio_mode = LEDS_RADIO_TX;  // activity LED on transmit, as before
+	prefs->leds_hb_mode = LEDS_HB_ALL;       // heartbeat + unread, as before
+	prefs->powersaving_enabled = POWERSAVING_DEFAULT;
+	prefs->powersaving_set = 1;
 	prefs->gps_enabled = 0;
 	prefs->gps_interval = 300;        // 5 minutes
 	prefs->advert_loc_policy = ADVERT_LOC_NONE;
 	prefs->adc_multiplier = 0.0f;
 	prefs->rx_boost = 1;              // Default to boosted RX for better sensitivity
+	/* Default ON: the FEM's chip-enable has always been asserted for RX on the
+	 * boards that have one, so 1 is the historical behaviour and the only safe
+	 * default -- 0 costs the FEM's RX gain (~16 dB on SKY66122). */
+	prefs->fem_rxgain = 1;
 	prefs->rx_duty_cycle = 0;         // Default OFF — continuous RX for best reliability
-	prefs->apc_enabled = 0;           // Default OFF — fixed TX power
-	prefs->apc_margin = 16;           // Default 16 dB target link margin
+	prefs->_reserved_apc_enabled = 0; // reserved (was APC), see NodePrefs
+	prefs->_reserved_apc_margin = 0;  // reserved (was APC), see NodePrefs
 	prefs->cad_auto = 1;              // Default ON — adaptive staircase acts on probe stats
 	prefs->cad_offset = 0;            // Start at family base detPeak (SF+13 on SX126x)
-	prefs->cad_probe_interval = 15;   // 15 s → staircase responds to change in ~1-2 h
-	prefs->cad_busycap = 25;          // back off detPeak once >25% of TX attempts are deferred
+	prefs->probe_interval = 15;       // floor sample + CAD probe; staircase responds in ~1-2 h
+	prefs->cad_busycap = 15;          // back off detPeak once >15% of quiet-moment probes trip on faint signals
 	prefs->wake_on_msg = 1;           // Default ON — wake display when message arrives
+	prefs->display_rotate = 0;        // Default OFF — panel in the stock case orientation
+	prefs->input_rotate = 0;          // Default OFF — joystick axes as the board wires them
 	prefs->v_contact_enabled = 1;     // Default ON — v-contact loopback admin chat (companion)
 	prefs->v_battery_alert_mv = 0xFFFF; // Sentinel: derive from board auto-shutdown threshold
+	prefs->wifi_enabled = 1;          // as upstream: WiFi still stays off until an SSID is set
+	/* Companion-only feature, and main_companion.cpp used to assign this by
+	 * hand right after calling us — so no node ever ran without it.  It lives
+	 * here now because a default listed only at one call site is invisible to
+	 * every other caller of initNodePrefs(), which is the exact drift that
+	 * zeroed probe_interval and cad_auto in the past.  Matches what
+	 * sanitizeNodePrefs() already uses.
+	 * 0 means disabled and is a legal stored value, so sanitize passes it
+	 * through untouched — this default only applies to a fresh prefs struct. */
+#ifdef CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS
+	prefs->auto_shutdown_mv = CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS;
+	prefs->auto_shutdown_set = 1;
+#else
+	prefs->auto_shutdown_mv = 0;
+#endif
 }

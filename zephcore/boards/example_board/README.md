@@ -12,10 +12,12 @@ Supported Boards
 | RAK4631              | `west build -b rak4631 zephcore`          | UF2 drag-drop or `west flash` |
 | RAK3401 1W           | `west build -b rak3401_1watt zephcore`    | UF2 drag-drop or `west flash` |
 | Wio Tracker L1       | `west build -b wio_tracker_l1 zephcore`   | UF2 drag-drop or `west flash` |
+| Wio Tracker L1 Pro 1W | `west build -b wio_tracker_l1_1w zephcore` | UF2 drag-drop or `west flash` |
 | SenseCAP Solar       | `west build -b sensecap_solar zephcore`    | UF2 drag-drop or `west flash` |
 | XIAO nRF52840        | `west build -b xiao_nrf52840 zephcore`     | UF2 drag-drop or `west flash` |
 | ProMicro SX1262      | `west build -b promicro_sx1262 zephcore`   | UF2 drag-drop or `west flash` |
 | T1000-E              | `west build -b t1000_e zephcore`          | UF2 drag-drop or `west flash` |
+| SenseCAP MeshTracker X1 | `west build -b meshtracker_x1 zephcore` | UF2 drag-drop or `west flash` |
 | ThinkNode M1         | `west build -b thinknode_m1 zephcore`     | UF2 drag-drop or `west flash` |
 | ThinkNode M3         | `west build -b thinknode_m3 zephcore`     | UF2 drag-drop or `west flash` |
 | ThinkNode M6         | `west build -b thinknode_m6 zephcore`     | UF2 drag-drop or `west flash` |
@@ -26,6 +28,8 @@ Supported Boards
 | LilyGo T-Impulse Plus | `west build -b lilygo_timpulse_plus zephcore` | UF2 drag-drop or `west flash` |
 | Heltec T114          | `west build -b heltec_t114 zephcore`      | UF2 drag-drop or `west flash` |
 | Heltec Mesh Node T096 | `west build -b heltec_t096 zephcore`     | UF2 drag-drop or `west flash` |
+| Heltec Mesh Node T1   | `west build -b heltec_t1 zephcore`       | UF2 drag-drop or `west flash` |
+| muzi works R1 Neo    | `west build -b muziworks_r1neo zephcore`  | UF2 drag-drop or `west flash` |
 
 **Heltec T114 screenless:** append `boards/nrf52840/heltec_t114/no_display.conf` to `EXTRA_CONF_FILE` for units without the TFT module.
 
@@ -39,16 +43,27 @@ SWD flash: `west flash` (requires J-Link, pyocd, or nrfjprog connected).
 | XIAO ESP32-C3        | `west build -b xiao_esp32c3 zephcore`                   | `west flash`    |
 | XIAO ESP32-C6        | `west build -b xiao_esp32c6/esp32c6/hpcore zephcore`    | `west flash`    |
 | LilyGo TLoRa C6      | `west build -b lilygo_tlora_c6/esp32c6/hpcore zephcore` | `west flash`    |
+| LilyGo T3S3 (SX1262) | `west build -b lilygo_t3s3/esp32s3/procpu zephcore`     | `west flash`    |
 | XIAO ESP32-S3        | `west build -b xiao_esp32s3/esp32s3/procpu zephcore`     | `west flash`    |
 | Station G2           | `west build -b station_g2/esp32s3/procpu zephcore`       | `west flash`    |
 | Heltec V3            | `west build -b heltec_wifi_lora32_v3/esp32s3/procpu zephcore` | `west flash` |
 | Heltec V4.2 (GC1109 PA)  | `west build -b heltec_wifi_lora32_v4/esp32s3/procpu zephcore`  | `west flash` |
 | Heltec V4.3 (KCT8103L PA) | `west build -b heltec_wifi_lora32_v43/esp32s3/procpu zephcore` | `west flash` |
+| Heltec V4-R8 (KCT8103L PA, 8MB octal PSRAM) | `west build -b heltec_wifi_lora32_v4_r8/esp32s3/procpu zephcore` | `west flash` |
 | Heltec Wireless Tracker V1.1 | `west build -b heltec_wireless_tracker/esp32s3/procpu zephcore` | `west flash` |
 | Heltec Wireless Tracker V2 | `west build -b heltec_wireless_tracker_v2/esp32s3/procpu zephcore` | `west flash` |
 | LilyGo T-Beam v1.2     | `west build -b ttgo_tbeam/esp32/procpu zephcore`               | `west flash` |
+| ThinkNode M9           | `west build -b thinknode_m9/esp32s3/procpu zephcore`           | `west flash` |
+| Meshnology W12 (LR2021) | `west build -b meshnology_w12/esp32s3/procpu zephcore`        | `west flash` |
 
 **Heltec V3 console:** ZephCore routes console/shell to `uart0` on V3. Use the UART serial port for boot logs and CLI.
+
+**Meshnology W12:** the only board here with an LR2021 *and* an external PA, and
+the only ESP32 board whose TX power is capped well below the chip maximum —
+4 dBm at the chip is ~30 dBm at the antenna through the GC1109 front end. It has
+no USB-UART bridge, so esptool cannot auto-reset a companion build into download
+mode; use `start dfu`, a 1200-baud touch, or hold BOOT. Full port notes and the
+vendor schematic live in `devdocs/w12/`.
 
 **Heltec V4.2 vs V4.3:** The hardware revision is printed on the PCB silkscreen. If
 unclear, check GPIO2's default pull: the V4.2 GC1109 PA has an internal pull-down
@@ -94,7 +109,9 @@ for `0x1000`, since they use simple-boot in the release build too.
 
 ### SX127x Boards (loramac-node backend)
 
-ZephCore supports SX1272/SX1276/SX1278 via the loramac-node backend — a separate radio path from the native SX126x driver used by all other boards. The TTGO LoRa32 is the reference implementation:
+ZephCore can drive SX1272/SX1276/SX1278 via the loramac-node backend — a separate radio path from the native SX126x driver used by all other boards. The TTGO LoRa32 is the only board exercising it.
+
+**This path is source-only and unsupported.** No release publishes firmware for it, it is not in `build.sh` or the Mesh America catalog, and it has no RX duty cycle and no RX gain boost. Treat it as a starting point to maintain yourself, not as a supported target.
 
 | Board          | Build string                                   | Flash        |
 |----------------|------------------------------------------------|--------------|
@@ -106,7 +123,7 @@ SX127x boards require these `board.conf` overrides (the `zephcore_common.conf` d
 CONFIG_LORA_MODULE_BACKEND_NATIVE=n
 CONFIG_LORA_MODULE_BACKEND_LORAMAC_NODE=y
 CONFIG_ZEPHCORE_RADIO_SX127X=y
-CONFIG_ZEPHCORE_LORA_RX_DUTY_CYCLE=n   # lora_recv_duty_cycle not implemented for SX127x
+CONFIG_ZEPHCORE_LORA_RX_DUTY_CYCLE=n   # lora_recv_duty_cycle_async not implemented for SX127x
 CONFIG_ZEPHCORE_DEFAULT_TX_POWER_DBM=17 # PA_BOOST max without external PA
 ```
 
@@ -128,9 +145,23 @@ revision.
 | Board               | Build string                                                           | Flash           |
 |----------------------|------------------------------------------------------------------------|-----------------|
 | XIAO nRF54L15        | `west build -b xiao_nrf54l15/nrf54l15/cpuapp zephcore --no-sysbuild` | `west flash`    |
+| MinewSemi ME25LS02   | `west build -b me25ls02/nrf54l15/cpuapp zephcore --no-sysbuild`      | SWD (`west flash`) |
+| Semtech LR2021 LoRa Plus EVK | `west build -b seeed_lr2021_evk/nrf54l15/cpuapp zephcore --no-sysbuild` | `west flash`    |
 
 Requires J-Link or CMSIS-DAP (built into XIAO board via SAMD11 bridge).
 The `--no-sysbuild` flag is required (no MCUboot support yet).
+
+The LR2021 EVK is the Seeed/Semtech kit (SKU 100039980): a XIAO nRF54L15 plus the
+LoRa Plus Expansion Board plus a Wio-LR2021 module, all in XIAO sockets sharing one
+set of D0..D10 nets. It is a distinct board from `xiao_nrf54l15` above, which is the
+same MCU on a Wio-SX1262 carrier with incompatible wiring. Two hardware gotchas
+before first boot: the **IDCC jumper** must be fitted or the radio has no power, and
+the **LF U.FL pigtail** must be connected before transmitting. The board's `.dts`
+header carries the full pin map and the reasoning behind each choice.
+
+The SoC has no USB peripheral at all, so none of these boards has a UF2 or DFU path — `zephyr.hex`
+links at RRAM base 0x0 and is the complete image, written over SWD. On the ME25LS02's MX25LE02
+carrier the USB-C port is a CH340x UART bridge (console only), so it needs an external probe.
 
 ### MG24 (Silicon Labs)
 
@@ -167,15 +198,18 @@ STM32WL caveats — different from every other ZephCore platform:
   `CONFIG_BT=n`. The console/CLI and the companion protocol both run over
   **USART1**, bridged to USB-C by the onboard USB-UART chip.
 - **Repeater** uses the USART CLI (add `repeater.conf`). The **companion** speaks
-  MeshCore serial framing over the same UART via `SerialCompanionTransport.c`
-  (a drop-in `zephcore_ble_*` provider, auto-selected because `CONFIG_BT=n`) —
-  no BLE pairing, the official serial client connects directly.
+  MeshCore serial framing over the same UART through the wired companion
+  transport (`ZephyrCompanionUSB.cpp`, UART backend: the board's
+  `zephcore,companion-uart` chosen node selects `CONFIG_ZEPHCORE_COMPANION_SERIAL`
+  when there is no Bluetooth) — no BLE pairing, the official serial client
+  connects directly, and a terminal gets the text CLI.
 - **RAM-bound, not flash-bound:** 64KB SRAM. The companion's contact/queue
   arrays are capped hard in `board.conf` (`MAX_CONTACTS=24`, `OFFLINE_QUEUE_SIZE=8`).
   AES tables live in ROM (`MBEDTLS_AES_ROM_TABLES`) to reclaim ~8KB SRAM.
 - **TRNG only (no HW CSPRNG):** the STM32 TRNG is enabled as the entropy source
   and `CSPRNG_ENABLED` auto-resolves on top; `ZephyrRNG` further conditions
-  identity seeds with jitter + AES-CTR.
+  identity seeds with AES-CTR (the timing stages are skipped — SysTick has no
+  independent slow clock — so the TRNG-fed CSPRNG stages carry the seed).
 - **No MCUboot / UF2:** single app partition at flash origin + a LittleFS volume
   (see `board.overlay`). Flash over SWD/ST-Link with `west flash` (OpenOCD).
 
@@ -244,8 +278,11 @@ Steps:
   2. Copy board.conf and board.overlay from THIS directory
   3. Uncomment the sections matching your platform
   4. Fill in YOUR pin numbers and partition layout
-  5. Add board detection to CMakeLists.txt (platform detection block, ~line 270):
-     Add `BOARD MATCHES "your_board"` to the correct platform line
+  5. Add a zephcore.yml manifest (copy one from a similar board; schema in
+     zephcore/scripts/board_manifest.py). No CMake edit is needed: the
+     boards/<platform>/ directory the board lives in selects its platform.
+     Leave out `release:` until the board is validated on hardware, then run
+     `python zephcore/scripts/board_manifest.py check`.
   6. Build and iterate!
 
 
@@ -334,9 +371,6 @@ should ONLY contain settings that can't be inferred from hardware:
     CONFIG_FUEL_GAUGE=y                 Boards with AXP2101 or other I2C fuel gauge
     CONFIG_ZEPHCORE_DEFAULT_TX_POWER_DBM  Boards with external PA
     CONFIG_ZEPHCORE_MAX_TX_POWER_DBM      Boards with external PA
-    CONFIG_ZEPHCORE_APC                   Adaptive Power Control — OFF by default.
-                                          Reduces TX power when echo SNR shows excess margin.
-                                          See apc.md for details on target margin tuning.
 
   AUTO-DETECTED (do NOT set in board.conf):
     CONFIG_PWM                          Auto from DT buzzer nodelabel

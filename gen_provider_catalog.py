@@ -53,41 +53,9 @@ MAKERS = {
     "uniteng": "UnitEng",
     "Ikoka": "Ikoka",
     "femtofox": "Femtofox",
-}
-
-# Manufacturer per device name.
-MAKER_BY_DEVICE = {
-    "RAK WisBlock / WisMesh (RAK 4631)": "rak",
-    "RAK WisMesh 1W Booster (3401 + 13302)": "rak",
-    "RAK WisMesh Tag": "rak",
-    "Seeed Studio Wio Tracker L1 Pro": "seeed",
-    "Seeed Studio SenseCAP T1000-E": "seeed",
-    "Seeed Studio SenseCAP Solar": "seeed",
-    "Seeed Studio Xiao nRF52 WIO": "seeed",
-    "Seeed Studio Xiao C3": "seeed",
-    "Seeed Studio Xiao S3 WIO": "seeed",
-    "Seeed Studio Xiao ESP32-C6": "seeed",
-    "Elecrow ThinkNode M1": "elecrow",
-    "Elecrow ThinkNode M3": "elecrow",
-    "Elecrow ThinkNode M6": "elecrow",
-    "Ikoka Nano": "Ikoka",
-    "LilyGo T-Echo": "lilygo",
-    "LilyGo T-Beam (SX1262)": "lilygo",
-    "LilyGo T-Impulse Plus": "lilygo",
-    "LilyGo T-Lora C6": "lilygo",
-    "ProMicro nrf52 (faketec)": "promicro",
-    "Heltec T114": "heltec",
-    "Heltec Mesh Node T096": "heltec",
-    "Heltec v3": "heltec",
-    "Heltec v4": "heltec",
-    "Heltec v4.3": "heltec",
-    "Heltec Wireless Tracker": "heltec",
-    "Heltec Wireless Tracker v2": "heltec",
-    "GAT-IoT GAT562 30s": "gat-iot",
-    "UnitEng Station G2": "uniteng",
-    "Femtofox (Luckfox Pico Mini)": "femtofox",
-    "RAK6421 WisMesh (Raspberry Pi)": "rak",
-    "RAK6421 WisMesh (Raspberry Pi 5)": "rak",
+    "muziworks": "muzi works",
+    "minewsemi": "MinewSemi",
+    "meshnology": "Meshnology",
 }
 
 DESCRIPTION = (
@@ -102,7 +70,17 @@ DESCRIPTION = (
 # merge). Reused from the configurator's own image set via jsDelivr -- a stable,
 # CORS-clean absolute URL. `<img>` display isn't CORS-restricted, but the spec
 # asks for absolute URLs. Boards without dedicated art use the neutral lora icon.
+# An `img` starting with http is taken as a full URL and used as-is (vendor
+# product shots), instead of being resolved against IMG_BASE.
 IMG_BASE = "https://cdn.jsdelivr.net/gh/meshcore-dev/flasher.meshcore.io@main/img"
+
+# Art we ship ourselves, for devices the configurator has no picture of. Source
+# of truth is this repo's img/ dir; build.sh copies it into firmware/ so it is
+# published alongside the firmware, and the URL is resolved against --url-base
+# like every other asset -- so nothing here hardcodes a host. Vendor product
+# shots are copied in rather than hot-linked: a vendor CDN path is theirs to
+# reshuffle, and a tile whose picture 404s is worse than one that never had it.
+# Set `own_img` (a bare filename) instead of `img` to use one.
 
 # A single custom role for the native-Linux companion, which speaks TCP rather
 # than BLE/USB. Custom roles render with a plain label and never map to the
@@ -117,77 +95,78 @@ CUSTOM_ROLES = {
 }
 
 # ---------------------------------------------------------------------------
-# Board -> device mapping
+# Board -> device mapping, from the board manifests
 #
-# `stem`   : the exact filename stem build.sh emits (board_clean_for_path).
-# `kind`   : nrf | esp32 | linux -- drives device type, file types, extensions.
+# Every published board has a `catalog:` section in its manifest
+# (zephcore/boards/<platform>/<board>/zephcore.yml, Linux presets
+# zephcore/boards/linux_native/<preset>.zephcore.yml; schema in
+# zephcore/scripts/board_manifest.py). Each entry below carries:
+# `stem`   : the exact filename stem build.sh emits (target with / -> -).
+# `kind`   : nrf | esp32 | nrf54l | mg24 | stm32wl | linux -- drives device
+#            type, file types, extensions.
 # `device` : the MeshCore-canonical device name to FOLD into, or a new tile name.
+#            Folding is by exact name, so a `new` tile named to MeshCore's
+#            convention merges by itself the day MeshCore adds that device.
+# `maker`  : key of MAKERS (the hardware manufacturer).
 # `new`    : True if this device is not in the official catalog (its own tile).
+# `img`    : filename in MeshCore's own image set (resolved against IMG_BASE).
+# `own_img`: filename we ship from this repo's img/ dir (resolved against
+#            --url-base). Takes precedence over `img`.
 # `variant`: optional filename infix (e.g. "noscreen") + shown as subTitle.
 # `subtitle`: optional role-row subTitle to disambiguate hardware variants.
+# `softdevice`: nRF52 only, 6 or 7, from the board's CONFIG_ZEPHCORE_SD_FWID.
 # ---------------------------------------------------------------------------
 
-BOARDS = [
-    # --- nRF52: fold into existing MeshCore devices -----------------------
-    dict(stem="rak4631",          kind="nrf", device="RAK WisBlock / WisMesh (RAK 4631)"),
-    dict(stem="rak3401_1watt",    kind="nrf", device="RAK WisMesh 1W Booster (3401 + 13302)"),
-    dict(stem="wio_tracker_l1",   kind="nrf", device="Seeed Studio Wio Tracker L1 Pro"),
-    dict(stem="t1000_e",          kind="nrf", device="Seeed Studio SenseCAP T1000-E"),
-    dict(stem="thinknode_m1",     kind="nrf", device="Elecrow ThinkNode M1"),
-    dict(stem="thinknode_m3",     kind="nrf", device="Elecrow ThinkNode M3"),
-    dict(stem="thinknode_m6",     kind="nrf", device="Elecrow ThinkNode M6"),
-    dict(stem="rak_wismesh_tag",  kind="nrf", device="RAK WisMesh Tag"),
-    dict(stem="ikoka_nano_30dbm", kind="nrf", device="Ikoka Nano", subtitle="30 dBm"),
-    dict(stem="sensecap_solar",   kind="nrf", device="Seeed Studio SenseCAP Solar"),
-    dict(stem="xiao_nrf52840",    kind="nrf", device="Seeed Studio Xiao nRF52 WIO"),
-    dict(stem="lilygo_techo",     kind="nrf", device="LilyGo T-Echo"),
-    dict(stem="promicro_sx1262",  kind="nrf", device="ProMicro nrf52 (faketec)"),
-    dict(stem="heltec_t114",      kind="nrf", device="Heltec T114"),
-    dict(stem="heltec_t114",      kind="nrf", device="Heltec T114",
-         variant="noscreen", subtitle="No screen"),
-    dict(stem="gat562_30s",       kind="nrf", device="GAT-IoT GAT562 30s"),
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "zephcore", "scripts"))
+import board_manifest  # noqa: E402
 
-    # --- nRF52: new ZephCore-only hardware (own tile) ---------------------
-    dict(stem="lilygo_timpulse_plus", kind="nrf", device="LilyGo T-Impulse Plus", new=True, img="lora.svg"),
-    dict(stem="heltec_t096",          kind="nrf", device="Heltec Mesh Node T096",  new=True, img="lora.svg"),
+KIND = {"nrf52": "nrf", "esp32": "esp32", "nrf54l": "nrf54l",
+        "mg24": "mg24", "stm32wl": "stm32wl", "linux": "linux"}
+KIND_ORDER = ["nrf", "esp32", "nrf54l", "mg24", "stm32wl", "linux"]
+SD_FWID = {0x00B6: 6, 0x0123: 7}   # S140 v6.1.1 / v7.3.0
 
-    # --- ESP32 (sysbuild/MCUboot, -merged.bin): fold ---------------------
-    dict(stem="xiao_esp32c3",                      kind="esp32", device="Seeed Studio Xiao C3"),
-    dict(stem="xiao_esp32s3-esp32s3-procpu",       kind="esp32", device="Seeed Studio Xiao S3 WIO"),
-    dict(stem="station_g2-esp32s3-procpu",         kind="esp32", device="UnitEng Station G2"),
-    dict(stem="heltec_wifi_lora32_v3-esp32s3-procpu", kind="esp32", device="Heltec v3"),
-    dict(stem="heltec_wifi_lora32_v4-esp32s3-procpu", kind="esp32", device="Heltec v4"),
-    dict(stem="heltec_wireless_tracker-esp32s3-procpu",    kind="esp32", device="Heltec Wireless Tracker"),
-    dict(stem="heltec_wireless_tracker_v2-esp32s3-procpu", kind="esp32", device="Heltec Wireless Tracker v2"),
-    # Classic ESP32 T-Beam: ships -merged.bin (full-flash, 0x0) too.
-    dict(stem="ttgo_tbeam-esp32-procpu",           kind="esp32", device="LilyGo T-Beam (SX1262)"),
 
-    # --- ESP32: new ZephCore-only hardware (own tile) --------------------
-    dict(stem="xiao_esp32c6-esp32c6-hpcore",   kind="esp32", device="Seeed Studio Xiao ESP32-C6", new=True, img="xiao_esp32c6.svg"),
-    dict(stem="lilygo_tlora_c6-esp32c6-hpcore", kind="esp32", device="LilyGo T-Lora C6",           new=True, img="lilygo_tlora_c6.svg"),
-    dict(stem="heltec_wifi_lora32_v43-esp32s3-procpu", kind="esp32", device="Heltec v4.3",         new=True, img="heltec_v4.svg"),
+def softdevice_of(board):
+    text = open(os.path.join(board.board_dir, "board.conf"), encoding="utf-8").read()
+    m = re.search(r"^CONFIG_ZEPHCORE_SD_FWID=(0x[0-9A-Fa-f]+)", text, re.M)
+    if not m or int(m.group(1), 16) not in SD_FWID:
+        raise SystemExit(f"{board.name}: no known CONFIG_ZEPHCORE_SD_FWID in board.conf")
+    return SD_FWID[int(m.group(1), 16)]
 
-    # --- Native Linux (noflash, download only): new tiles ----------------
-    dict(stem="zephcore_linux_femtofox",   kind="linux", device="Femtofox (Luckfox Pico Mini)", new=True, img="lora.svg"),
-    dict(stem="zephcore_linux_rak6421",    kind="linux", device="RAK6421 WisMesh (Raspberry Pi)", new=True, img="rpi.svg"),
-    dict(stem="zephcore_linux_rak6421_pi5", kind="linux", device="RAK6421 WisMesh (Raspberry Pi 5)", new=True, img="rpi.svg"),
-]
 
-DEVICE_TYPE = {"nrf": "nrf52", "esp32": "esp32", "linux": "noflash"}
+def load_catalog_boards():
+    """Catalog entries in tile order: platform group, folded before new, then name."""
+    out = []
+    for b in board_manifest.load_boards():
+        if b.release is None or b.catalog is None:
+            continue
+        c = b.catalog
+        base = dict(stem=b.stem, kind=KIND[b.platform], device=c["device"], maker=c["maker"])
+        for k in ("new", "img", "own_img", "subtitle"):
+            if c.get(k):
+                base[k] = c[k]
+        if b.platform == "nrf52":
+            base["softdevice"] = softdevice_of(b)
+        out.append(base)
+        for v in b.release.get("variants") or []:
+            e = dict(base, variant=v["id"])
+            e.pop("subtitle", None)
+            if v.get("subtitle"):
+                e["subtitle"] = v["subtitle"]
+            out.append(e)
+    out.sort(key=lambda e: (KIND_ORDER.index(e["kind"]), bool(e.get("new")), e["device"].lower(),
+                            e.get("variant") or ""))
+    return out
+
+
+DEVICE_TYPE = {"nrf": "nrf52", "esp32": "esp32", "linux": "noflash",
+               "nrf54l": "noflash", "mg24": "noflash", "stm32wl": "noflash"}
 
 # nRF52 erase package (spec §4a). ZephCore's LittleFS layout differs from MeshCore's,
 # so the official erase would wipe the wrong region — we point `erase` at ZephCore's
 # own formatter tool instead. The formatter is SoftDevice-specific (partition map
 # differs between SD v6 and v7), so each board maps to its SD's formatter .zip.
 # Files are published to firmware-dist by build.sh (stable names, no hash).
-SOFTDEVICE = {
-    "rak4631": 6, "rak3401_1watt": 6, "thinknode_m1": 6, "thinknode_m3": 6,
-    "thinknode_m6": 6, "rak_wismesh_tag": 6, "lilygo_techo": 6,
-    "lilygo_timpulse_plus": 6, "promicro_sx1262": 6, "heltec_t114": 6,
-    "heltec_t096": 6, "gat562_30s": 6,
-    "wio_tracker_l1": 7, "t1000_e": 7, "ikoka_nano_30dbm": 7,
-    "sensecap_solar": 7, "xiao_nrf52840": 7,
-}
 FORMATTER_FILE = {6: "SoftDevice_v6_formatter.zip", 7: "SoftDevice_v7_formatter.zip"}
 
 # Companion firmware is a single image that serves both transports (and, on
@@ -196,6 +175,14 @@ COMPANION_ROLES = {
     "nrf":   ["companionBle", "companionUsb"],
     "esp32": ["companionBle", "companionUsb"],
     "linux": ["companionTcp"],
+    # nRF54L15 has no USB peripheral -- the companion is BLE-only there.
+    "nrf54l": ["companionBle"],
+    # MG24 has BLE (Silabs controller blob) but no USB device peripheral.
+    "mg24": ["companionBle"],
+    # STM32WL has neither BLE nor USB: the companion is MeshCore serial framing
+    # on USART1, which reaches the host as a plain serial port over the board's
+    # USB-UART bridge.
+    "stm32wl": ["companionUsb"],
 }
 
 HASH_RE = r"[0-9a-f]{7,40}"
@@ -235,6 +222,16 @@ def files_for(assets, board, token):
         update = find_file(assets, stem, token, variant, r"-update\.bin")
         if update:
             out.append(("flash-update", update, "Update (app only; keeps settings)"))
+    elif kind == "nrf54l":
+        hexf = find_file(assets, stem, token, variant, r"\.hex")
+        if hexf:
+            out.append(("download", hexf,
+                        "Firmware image -- flash over SWD (no USB bootloader on this SoC)"))
+    elif kind in ("mg24", "stm32wl"):
+        hexf = find_file(assets, stem, token, variant, r"\.hex")
+        if hexf:
+            out.append(("download", hexf,
+                        "Firmware image -- flash over SWD (no bootloader on this board)"))
     elif kind == "linux":
         elf = find_file(assets, stem, token, variant, r"")
         if elf:
@@ -265,7 +262,7 @@ def build(assets, url_base, version):
         dev["firmware"].append(opt)
         used_roles.add(role)
 
-    for board in BOARDS:
+    for board in load_catalog_boards():
         name = board["device"]
         subtitle = board.get("subtitle")
         comp = files_for(assets, board, "companion")
@@ -276,7 +273,7 @@ def build(assets, url_base, version):
             continue
 
         if name not in devices:
-            maker = MAKER_BY_DEVICE[name]   # KeyError if a device is unmapped
+            maker = board["maker"]
             used_makers.add(maker)
             dev = {
                 "maker": maker,
@@ -285,7 +282,9 @@ def build(assets, url_base, version):
                 "type": DEVICE_TYPE[board["kind"]],
                 "firmware": [],
             }
-            if board.get("img"):
+            if board.get("own_img"):
+                dev["tooltip"] = f"<img class='device' src='{base}/{board['own_img']}'>"
+            elif board.get("img"):
                 dev["tooltip"] = f"<img class='device' src='{IMG_BASE}/{board['img']}'>"
             devices[name] = dev
             order.append(name)
@@ -295,7 +294,7 @@ def build(assets, url_base, version):
         # nRF52 boards get ZephCore's own SoftDevice-specific formatter as `erase`.
         erase = None
         if board["kind"] == "nrf":
-            erase = f"{base}/{FORMATTER_FILE[SOFTDEVICE[board['stem']]]}"
+            erase = f"{base}/{FORMATTER_FILE[board['softdevice']]}"
 
         if comp:
             for role in COMPANION_ROLES[board["kind"]]:

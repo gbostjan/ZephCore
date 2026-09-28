@@ -71,25 +71,15 @@ void ui_notify(enum ui_event event);
 void ui_set_msg_count(uint16_t count);
 
 /**
- * Update BLE connection status.
- *
- * @param connected  true if BLE peer is connected
- * @param name       BLE device name (can be NULL)
- */
-void ui_set_ble_status(bool connected, const char *name);
-
-/**
  * Update radio parameters for display.
  */
 void ui_set_radio_params(uint32_t freq_hz, uint8_t sf, uint16_t bw_khz_x10,
 			 uint8_t cr, int8_t tx_power, int16_t noise_floor);
 
 /**
- * Update extended live radio/APC details for display.
+ * Update extended live radio details for display.
  */
-void ui_set_radio_runtime(int8_t effective_tx_power, bool apc_enabled,
-			  int8_t apc_reduction, int16_t apc_margin_x10,
-			  uint8_t apc_target_margin, uint8_t sync_word,
+void ui_set_radio_runtime(uint8_t sync_word,
 			  uint16_t preamble_len, bool rx_duty_cycle,
 			  bool radio_ready, bool in_rx, bool tx_active);
 
@@ -115,6 +105,15 @@ void ui_set_battery(uint16_t mv, uint8_t pct);
  * @param epoch  Unix timestamp (0 = time not set, hides clock)
  */
 void ui_set_clock(uint32_t epoch);
+
+/**
+ * Set the whole-hour offset from UTC used when formatting the on-device
+ * clock.  Display only: the epoch handed to ui_set_clock() stays UTC, and
+ * nothing here may ever reach RTCClock or a packet timestamp.
+ *
+ * @param hours  Offset from UTC, TZ_OFFSET_MIN..TZ_OFFSET_MAX (0 = UTC)
+ */
+void ui_set_tz(int8_t hours);
 
 /**
  * Record a recently heard contact for the "recent" page.
@@ -165,9 +164,9 @@ void ui_set_gps_state(uint8_t state, uint32_t last_fix_age_s, uint32_t next_sear
 void ui_set_ble_enabled(bool enabled);
 
 /**
- * Set buzzer quiet state (for display page).
+ * Set notification mode (for display page).
  */
-void ui_set_buzzer_quiet(bool quiet);
+void ui_set_buzzer_mode(uint8_t mode);
 
 /**
  * Set LEDs disabled state (for display page).
@@ -200,7 +199,7 @@ void ui_set_offgrid_mode(bool enabled);
  * Register a battery-voltage provider used by ui_refresh_battery().
  * provider() must return millivolts (0 if no battery hardware).
  */
-void ui_set_battery_provider(uint16_t (*provider)(void));
+void ui_set_battery_provider(uint16_t (*mv)(void), uint8_t (*pct)(void));
 
 /**
  * Lazy battery refresh: re-read the ADC only if cached value is stale.
@@ -210,63 +209,12 @@ void ui_set_battery_provider(uint16_t (*provider)(void));
 void ui_refresh_battery(void);
 
 /**
- * Prepare the device for sys_poweroff(): stop heartbeat LED, blank the
- * display, power off GPS + sensor regulators, hold LoRa in HW reset,
- * configure SENSE on sw0 (nRF only) for button wakeup.
- *
- * Caller is responsible for any shutdown chime BEFORE this call and the
- * final sys_poweroff() AFTER. Both UI variants share this so the System
- * OFF state is consistent regardless of which UI design is compiled in.
+ * The low-battery warning screen, just before an auto-shutdown
+ * (app/PowerPolicy.cpp). hold: keep it up 3 s on an OLED (it blanks
+ * the moment power drops; e-paper keeps it anyway); false while the
+ * main loop still has a notice to deliver. Nothing without a display.
  */
-void ui_prepare_for_system_off(void);
-
-/**
- * Register a power-source provider used by ui_auto_shutdown_check().
- * provider() must return true when the device is externally powered
- * (USB/charger present), false on battery. NULL = always treat as battery.
- */
-void ui_set_power_source_provider(bool (*provider)(void));
-
-/**
- * Set the runtime low-battery auto-shutdown threshold in millivolts.
- * 0 disables the check. Seeded at boot from prefs (which default to
- * CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS) and updated live by the CLI.
- * No-op on builds where the feature is compiled out (non-nRF52).
- */
-void ui_set_auto_shutdown_mv(uint16_t mv);
-
-/* Reason codes passed to the shutdown hook. */
-#define UI_SHUTDOWN_LOW_BATTERY  1
-
-/* Grace period (ms) the poweroff is deferred by when the hook asks for it
- * (an app is connected and a live notice was queued), so the notify→fetch→
- * send round-trip can complete before power is cut. */
-#define UI_SHUTDOWN_GRACE_MS     1000
-
-/**
- * Register a pre-shutdown hook, called from ui_auto_shutdown_check() just
- * before power-off. The companion uses it to report the shutdown to the
- * connected app (v-contact). Return value:
- *   true  = an app is connected and a live notice was queued — defer the
- *           poweroff by UI_SHUTDOWN_GRACE_MS so the app can fetch it.
- *   false = nothing to deliver live (persist to flash instead) — power off
- *           immediately.
- * The hook runs on the main thread and must not block.
- */
-typedef bool (*ui_shutdown_fn)(int reason);
-void ui_set_shutdown_hook(ui_shutdown_fn fn);
-
-/**
- * Low-battery auto-shutdown check (companion only).
- *
- * Call from the periodic housekeeping tick — it self-throttles its own ADC
- * sampling, so calling it every tick is cheap (no extra polling). When
- * CONFIG_ZEPHCORE_AUTO_SHUTDOWN_MILLIVOLTS is 0 this is a no-op. Otherwise,
- * if the battery is below the threshold AND not externally powered, it shows
- * a brief warning (3 s on OLED, instant-persist on e-paper) and powers off
- * via ui_prepare_for_system_off() + sys_poweroff().
- */
-void ui_auto_shutdown_check(void);
+void ui_show_low_battery(bool hold);
 
 /**
  * Drop the battery-refresh freshness timestamp. The next
@@ -307,6 +255,43 @@ void ui_notify_channel_msg(const char *channel_name, const char *text,
  * Rich UIs use this to start RTT timers; simpler ones ignore it.
  */
 void ui_notify_packet_sent(void);
+
+/* ===== Input axis flip =====
+ *
+ * A case that mounts the board upside down (e.g. the Meshnology N37E kit)
+ * rotates the joystick along with the screen, so "up" on the stick walks the
+ * menu down.  This flips the two axes back.
+ *
+ * Kept separate from the display rotation on purpose: the two are not always
+ * wanted together — a panel can be remounted alone, and boards whose display
+ * cannot rotate can still benefit from the axis swap.
+ *
+ * The state lives in ui_common.c so both UI variants (button and joystick)
+ * share one source of truth; each variant's input callback runs its raw
+ * event code through zephcore_input_map_code() before decoding it.
+ */
+
+/**
+ * Enable or disable the joystick/D-pad axis swap.
+ *
+ * @param flipped true to swap up/down and left/right
+ */
+void zephcore_input_set_flipped(bool flipped);
+
+/**
+ * @return true if the input axes are currently swapped.
+ */
+bool zephcore_input_is_flipped(void);
+
+/**
+ * Map a raw Zephyr INPUT_KEY_* code through the current axis flip.
+ * Returns @p code unchanged when the flip is off or the code is not
+ * a directional key.
+ *
+ * @param code Raw input event code
+ * @return The code the UI should decode
+ */
+uint16_t zephcore_input_map_code(uint16_t code);
 
 #ifdef __cplusplus
 }

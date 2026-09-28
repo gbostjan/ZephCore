@@ -85,12 +85,112 @@ bool mc_display_is_on(void);
  */
 bool mc_display_is_epd(void);
 
-/* Color overlay support is compiled only when the devicetree has a raw
- * RGB565 TFT under the `tft` nodelabel (the runtime probe still verifies
- * pixel format and readiness).  Boards without one get constant-false /
- * mono-fallback inlines so every color code path — including the ~3.8 KB
- * overlay op queue in display.c — is dropped at compile time. */
-#define MC_DISPLAY_COLOR_PANEL DT_NODE_EXISTS(DT_NODELABEL(tft))
+/* Color overlay support is compiled only when the devicetree points at a raw
+ * RGB565 TFT (the runtime probe still verifies pixel format and readiness).
+ * Boards without one get constant-false / mono-fallback inlines so every
+ * color code path — including the ~3.8 KB overlay op queue in display.c —
+ * is dropped at compile time.
+ *
+ * Two ways to name the panel, in priority order:
+ *
+ *   1. chosen { zephcore,color-tft = <&some_panel>; }
+ *   2. the `tft` nodelabel on the panel node
+ *
+ * (1) exists for boards whose panel node lives in an upstream Zephyr DTS:
+ * an overlay cannot add a nodelabel to an existing node, but it can always
+ * set a chosen property.  (2) is kept because every in-tree board that had
+ * color before this indirection names its panel `tft:` — they need no edit.
+ */
+#if DT_HAS_CHOSEN(zephcore_color_tft)
+#define MC_DISPLAY_COLOR_NODE DT_CHOSEN(zephcore_color_tft)
+#elif DT_NODE_EXISTS(DT_NODELABEL(tft))
+#define MC_DISPLAY_COLOR_NODE DT_NODELABEL(tft)
+#else
+#define MC_DISPLAY_COLOR_NODE DT_INVALID_NODE
+#endif
+
+#define MC_DISPLAY_COLOR_PANEL DT_NODE_EXISTS(MC_DISPLAY_COLOR_NODE)
+
+/*
+ * The panel node mc_display_init() will bind to, resolved at compile time in
+ * the same priority order the runtime lookup uses.  Only needed to ask
+ * compile-time questions about the panel; the device handle itself still
+ * comes from the runtime lookup.
+ */
+#if DT_HAS_CHOSEN(zephyr_display)
+#define MC_DISPLAY_NODE DT_CHOSEN(zephyr_display)
+#elif DT_NODE_EXISTS(DT_NODELABEL(sh1106))
+#define MC_DISPLAY_NODE DT_NODELABEL(sh1106)
+#elif DT_NODE_EXISTS(DT_NODELABEL(ssd1306))
+#define MC_DISPLAY_NODE DT_NODELABEL(ssd1306)
+#else
+#define MC_DISPLAY_NODE DT_INVALID_NODE
+#endif
+
+/*
+ * 180-degree rotation support, decided at compile time from the panel.
+ *
+ * Deliberately an allow-list of the two families where the rotation is a
+ * hardware remap the driver actually implements: display_ssd1306.c flips
+ * SEGMENT_MAP + COM_OUTPUT_SCAN (two bytes on the wire, framebuffer
+ * untouched, no per-frame cost), and that driver backs both solomon,ssd1306
+ * and sinowealth,sh1106.
+ *
+ * Other panel families are excluded on purpose rather than probed:
+ *   - st7735r/st7789v (our mono-tft boards) return -ENOTSUP upstream for
+ *     anything but NORMAL, so a probe would just fail;
+ *   - ssd16xx e-paper *accepts* ROTATED_180 but implements it by flipping
+ *     the RAM entry mode only, which reverses byte order without reversing
+ *     bit order inside each byte — the 8 pixels a byte spans stay in their
+ *     original order.  It would report success and render wrong, which is
+ *     worse than reporting unsupported.
+ *
+ * The geometry test on top of the family check matters as much as the family
+ * check itself.  Both remaps reverse the controller's *entire* addressable
+ * range, not the part a given panel happens to use, so the flip only lands
+ * back on the glass when the visible window is centred in that range:
+ *
+ *   - Vertically, that means the panel uses the full multiplex height from
+ *     page 0.  Boards that window a small panel into a larger controller do
+ *     not: lilygo_timpulse_plus is a 64x32 glass on a 128x64 SSD1306 driven
+ *     at page-offset 4 with multiplex-ratio 63, so its content sits on COM
+ *     32..63.  Reversing the COM scan moves it to COM 31..0 — off the bonded
+ *     region entirely, i.e. a blank screen.  `page-offset == 0` and
+ *     `height == multiplex-ratio + 1` is exactly the "uses the whole
+ *     controller" condition, and it excludes that board.
+ *   - Horizontally the surviving boards are already centred: the SSD1306
+ *     ones are a full 128 columns at segment-offset 0, and the SH1106 ones
+ *     are 128 columns at segment-offset 2 in 132 columns of RAM — the
+ *     standard 2-either-side layout these modules ship with.
+ */
+#if DT_NODE_HAS_COMPAT(MC_DISPLAY_NODE, solomon_ssd1306) || \
+	DT_NODE_HAS_COMPAT(MC_DISPLAY_NODE, sinowealth_sh1106)
+#define MC_DISPLAY_ROTATE_SUPPORTED                             \
+	(DT_PROP_OR(MC_DISPLAY_NODE, page_offset, 1) == 0 &&        \
+	 DT_PROP_OR(MC_DISPLAY_NODE, height, 0) ==                  \
+		 DT_PROP_OR(MC_DISPLAY_NODE, multiplex_ratio, 0) + 1)
+#else
+#define MC_DISPLAY_ROTATE_SUPPORTED 0
+#endif
+
+/**
+ * Rotate the panel 180 degrees, for cases that mount the screen upside down
+ * (e.g. the Meshnology N37E kit for the Wio Tracker L1).
+ *
+ * Takes effect on the next frame; the caller does not need to redraw.  On
+ * panels outside MC_DISPLAY_ROTATE_SUPPORTED this is a no-op that reports
+ * the failure instead of pretending to have rotated.
+ *
+ * @param rotated true for 180 degrees, false for the panel's native orientation
+ * @return 0 on success, -ENOTSUP if the panel cannot rotate, -ENODEV if no
+ *         display was initialized, or the driver's negative errno
+ */
+int mc_display_set_rotated(bool rotated);
+
+/**
+ * @return true if the panel is currently rotated 180 degrees.
+ */
+bool mc_display_is_rotated(void);
 
 /**
  * @return true when a raw RGB565-capable color panel is available for
@@ -102,6 +202,29 @@ bool mc_display_has_color(void);
 static inline bool mc_display_has_color(void)
 {
 	return false;
+}
+#endif
+
+/**
+ * Glyph cell size of the color overlay renderer in pixels.  The 6x8 font
+ * is upscaled 1.5x under CONFIG_ZEPHCORE_DISPLAY_LARGE_FONT, so this can
+ * differ from the CFB font metrics — layout math for color pages must use
+ * these, not mc_display_font_width/height().  On monochrome builds
+ * mc_display_color_text() falls back to the CFB path, so these fall back
+ * to the CFB metrics too.
+ */
+#if MC_DISPLAY_COLOR_PANEL
+uint8_t mc_display_color_font_width(void);
+uint8_t mc_display_color_font_height(void);
+#else
+static inline uint8_t mc_display_color_font_width(void)
+{
+	return mc_display_font_width();
+}
+
+static inline uint8_t mc_display_color_font_height(void)
+{
+	return mc_display_font_height();
 }
 #endif
 
@@ -130,7 +253,8 @@ void mc_display_text(int x, int y, const char *text, bool invert);
 #define MC_COLOR_ORANGE   0xfd20
 #define MC_COLOR_RED      0xf800
 #define MC_COLOR_BLUE     0x001f
-#define MC_COLOR_GRAY     0x8410
+#define MC_COLOR_GRAY       0x8410  /* true mid-gray — small-TFT gamma may crush it near-black */
+#define MC_COLOR_LIGHT_GRAY 0xef7d  /* ~93% white — reads as soft white on small TFTs */
 
 /**
  * Draw text using RGB565 color when supported. On non-color displays this

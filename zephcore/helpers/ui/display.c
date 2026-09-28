@@ -48,6 +48,7 @@ LOG_MODULE_REGISTER(zephcore_display, CONFIG_ZEPHCORE_BOARD_LOG_LEVEL);
 static const struct device *disp_dev;
 static bool disp_on;
 static bool disp_initialized;
+static bool disp_rotated;     /* panel flipped 180 degrees (upside-down mount) */
 
 /* Runtime display geometry (queried from driver) */
 static uint16_t disp_width;
@@ -60,6 +61,17 @@ static bool     is_epd;       /* true for e-paper displays */
 static bool     has_color;    /* true when a raw RGB565 TFT is available */
 
 const uint8_t *zephcore_font_6x8_glyph(uint8_t c);
+
+#if IS_ENABLED(CONFIG_ZEPHCORE_DISPLAY_LARGE_FONT)
+#define COLOR_FONT_SCALE_NUM 3
+#define COLOR_FONT_SCALE_DEN 2
+#else
+#define COLOR_FONT_SCALE_NUM 1
+#define COLOR_FONT_SCALE_DEN 1
+#endif
+
+#define COLOR_FONT_W (6 * COLOR_FONT_SCALE_NUM / COLOR_FONT_SCALE_DEN)
+#define COLOR_FONT_H (8 * COLOR_FONT_SCALE_NUM / COLOR_FONT_SCALE_DEN)
 
 #define COLOR_TEXT_MAX_CHARS 32
 #define COLOR_MAX_OPS        72
@@ -85,7 +97,7 @@ static uint8_t color_op_count;
 static uint16_t color_line[COLOR_MAX_WIDTH];
 
 static const struct device *color_dev =
-	DEVICE_DT_GET_OR_NULL(DT_NODELABEL(tft));
+	DEVICE_DT_GET_OR_NULL(MC_DISPLAY_COLOR_NODE);
 #endif /* MC_DISPLAY_COLOR_PANEL */
 
 /* Optional symmetric inset (pixels).  Shrinks reported width/height and
@@ -257,23 +269,31 @@ static void color_write_rect_now(int x, int y, int w, int h, uint16_t color)
 
 static void color_write_char_now(int x, int y, uint8_t c, uint16_t color)
 {
-	uint16_t glyph_buf[6 * 8];
+	uint16_t glyph_buf[COLOR_FONT_W * COLOR_FONT_H];
 	const uint8_t *glyph = zephcore_font_6x8_glyph(c);
 	uint16_t fg = sys_cpu_to_be16(color);
 	uint16_t bg = sys_cpu_to_be16(MC_COLOR_BLACK);
 
-	for (int row = 0; row < 8; row++) {
-		for (int col = 0; col < 6; col++) {
-			bool on = (glyph[col] >> row) & 0x01;
-			glyph_buf[row * 6 + col] = on ? fg : bg;
+	/* Nearest-neighbour upscale of the 6x8 glyph, mapped dest→src so
+	 * every output pixel is written exactly once (a src→dest block copy
+	 * with a fractional scale overwrites neighbouring blocks and thins
+	 * strokes unevenly). */
+	for (int py = 0; py < COLOR_FONT_H; py++) {
+		int row = py * COLOR_FONT_SCALE_DEN / COLOR_FONT_SCALE_NUM;
+
+		for (int px = 0; px < COLOR_FONT_W; px++) {
+			int col = px * COLOR_FONT_SCALE_DEN / COLOR_FONT_SCALE_NUM;
+
+			glyph_buf[py * COLOR_FONT_W + px] =
+				((glyph[col] >> row) & 0x01) ? fg : bg;
 		}
 	}
 
 	const struct display_buffer_descriptor desc = {
 		.buf_size = sizeof(glyph_buf),
-		.width = 6,
-		.height = 8,
-		.pitch = 6,
+		.width = COLOR_FONT_W,
+		.height = COLOR_FONT_H,
+		.pitch = COLOR_FONT_W,
 	};
 
 	display_write(color_dev, (uint16_t)(x + DISP_INSET),
@@ -286,13 +306,13 @@ static void color_write_text_now(int x, int y, const char *text, uint16_t color)
 		return;
 	}
 
-	for (const char *p = text; *p; p++, x += 6) {
+	for (const char *p = text; *p; p++, x += COLOR_FONT_W) {
 		uint8_t c = (uint8_t)*p;
 
 		if (c < 32) {
 			c = '?';
 		}
-		if (x + 6 > (int)mc_display_width() || y + 8 > (int)mc_display_height()) {
+		if (x + COLOR_FONT_W > (int)mc_display_width() || y + COLOR_FONT_H > (int)mc_display_height()) {
 			break;
 		}
 		color_write_char_now(x, y, c, color);
@@ -562,6 +582,18 @@ uint8_t mc_display_font_height(void)
 	return font_h;
 }
 
+#if MC_DISPLAY_COLOR_PANEL
+uint8_t mc_display_color_font_width(void)
+{
+	return COLOR_FONT_W;
+}
+
+uint8_t mc_display_color_font_height(void)
+{
+	return COLOR_FONT_H;
+}
+#endif
+
 void mc_display_on(void)
 {
 	if (!disp_initialized) {
@@ -602,6 +634,43 @@ bool mc_display_is_on(void)
 bool mc_display_is_epd(void)
 {
 	return is_epd;
+}
+
+int mc_display_set_rotated(bool rotated)
+{
+#if !MC_DISPLAY_ROTATE_SUPPORTED
+	ARG_UNUSED(rotated);
+	return -ENOTSUP;
+#else
+	if (!disp_initialized) {
+		return -ENODEV;
+	}
+	if (rotated == disp_rotated) {
+		return 0;
+	}
+
+	/* Panel-level remap: the driver rewrites SEGMENT_MAP + COM_OUTPUT_SCAN
+	 * and the existing framebuffer contents come back out mirrored on both
+	 * axes.  Nothing to redraw, and no cost on subsequent frames. */
+	int ret = display_set_orientation(disp_dev,
+					  rotated ? DISPLAY_ORIENTATION_ROTATED_180
+						  : DISPLAY_ORIENTATION_NORMAL);
+
+	if (ret) {
+		LOG_WRN("display rotate %s failed: %d",
+			rotated ? "180" : "normal", ret);
+		return ret;
+	}
+
+	disp_rotated = rotated;
+	LOG_INF("display rotated %s", rotated ? "180" : "normal");
+	return 0;
+#endif
+}
+
+bool mc_display_is_rotated(void)
+{
+	return disp_rotated;
 }
 
 #if MC_DISPLAY_COLOR_PANEL

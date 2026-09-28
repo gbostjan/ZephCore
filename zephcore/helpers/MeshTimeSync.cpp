@@ -6,7 +6,6 @@
 
 #include "MeshTimeSync.h"
 
-#include <adapters/clock/ZephyrRTCDiscover.h>
 #include <helpers/time_sync.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -81,7 +80,7 @@ bool MeshTimeSync::wouldAccept(const uint8_t *pubkey, uint32_t advert_ts) const
 }
 
 void MeshTimeSync::onAdvertHeard(const uint8_t *pubkey, uint32_t advert_ts,
-                                 uint8_t hops, uint32_t uptime_secs)
+				 uint8_t hops, uint32_t uptime_secs)
 {
 	if (hops > HOP_CAP) return;
 
@@ -144,8 +143,8 @@ void MeshTimeSync::onAdvertHeard(const uint8_t *pubkey, uint32_t advert_ts,
 }
 
 MeshTimeSync::Consensus MeshTimeSync::computeConsensus(uint32_t local_time,
-                                                       uint32_t uptime_secs,
-                                                       bool bootstrap) const
+						       uint32_t uptime_secs,
+						       bool bootstrap) const
 {
 	Consensus c;
 	memset(&c, 0, sizeof(c));
@@ -209,7 +208,7 @@ MeshTimeSync::Consensus MeshTimeSync::computeConsensus(uint32_t local_time,
 }
 
 MeshTimeSync::Verdict MeshTimeSync::evaluateNow(uint32_t local_time,
-                                                uint32_t uptime_secs) const
+						uint32_t uptime_secs) const
 {
 	Verdict v;
 	memset(&v, 0, sizeof(v));
@@ -349,7 +348,6 @@ bool MeshTimeSync::runTick(mesh::RTCClock &rtc)
 	}
 	uint32_t new_time = (uint32_t)nt;
 	rtc.setCurrentTime(new_time);
-	zephcore_rtc_save(new_time);
 	time_sync_report(TIME_SYNC_MESH);
 	noteStepApplied(v.delta, up, v.bootstrap);
 	LOG_WRN("stepped clock %+ld s (%s, votes %u/%u) -> %u",
@@ -415,8 +413,12 @@ const char *MeshTimeSync::reasonStr(Reason r)
 }
 
 int MeshTimeSync::formatStatus(char *out, size_t cap, uint32_t local_time,
-                               uint32_t uptime_secs, bool enabled) const
+			       uint32_t uptime_secs, bool enabled) const
 {
+	if (cap == 0) {
+		return 0;
+	}
+
 	Verdict v = evaluateNow(local_time, uptime_secs);
 	const Consensus &c = v.consensus;
 

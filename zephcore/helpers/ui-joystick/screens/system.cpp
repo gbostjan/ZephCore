@@ -9,6 +9,7 @@
 #include "screen_helpers.h"
 #include <adapters/gps/ZephyrGPSManager.h>
 #include <helpers/time_sync.h>
+#include <helpers/ui/display.h>
 #include <helpers/ui/ui_mesh_actions.h>
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
@@ -26,7 +27,18 @@ enum SysDevItem { SYSDEV_BUZZER=0, SYSDEV_BLUETOOTH, SYSDEV_OFFGRID, SYSDEV_LEDS
 
 #define DFU_CONFIRM_WINDOW_MS 3000
 /* Display submenu items */
-enum SysDspItem { SYSDSP_BRIGHT=0, SYSDSP_SCROFF, SYSDSP_BATT, SYSDSP_WAKE, SYSDSP_COUNT };
+/* SYSDSP_ROTATE is present only where the panel can flip itself in hardware
+ * (SSD1306 / SH1106 — see MC_DISPLAY_ROTATE_SUPPORTED).  Offering a row that
+ * always fails would be worse than not offering it, and dropping it at
+ * compile time keeps the flash cost at zero on the other boards.
+ * SYSDSP_INPUT_ROTATE is unconditional: the axis swap is ours, not the
+ * panel's, so it works everywhere — including boards whose screen cannot
+ * rotate but whose stick still ends up upside down in a custom case. */
+enum SysDspItem { SYSDSP_BRIGHT=0, SYSDSP_SCROFF, SYSDSP_BATT, SYSDSP_WAKE,
+#if MC_DISPLAY_ROTATE_SUPPORTED
+									SYSDSP_ROTATE,
+#endif
+									SYSDSP_INPUT_ROTATE, SYSDSP_COUNT };
 /* Info submenu items */
 enum SysInfoItem { SYSINFO_TIME=0, SYSINFO_STATS, SYSINFO_RADIO, SYSINFO_COUNT };
 /* Power submenu items */
@@ -92,6 +104,10 @@ int SystemScreen::render(JoystickDisplay &display)
 		items[SYSDSP_SCROFF] = scroff_label;
 		items[SYSDSP_BATT] = batt_label;
 		items[SYSDSP_WAKE] = _task->getWakeOnMsg() ? "Wake on msg: ON" : "Wake on msg: OFF";
+#if MC_DISPLAY_ROTATE_SUPPORTED
+		items[SYSDSP_ROTATE] = _task->getDisplayRotate() ? "Rotate 180: ON" : "Rotate 180: OFF";
+#endif
+		items[SYSDSP_INPUT_ROTATE] = _task->getInputRotate() ? "Flip input: ON" : "Flip input: OFF";
 		renderSubMenu(display, "Display", _selected, items, SYSDSP_COUNT);
 		return 500;
 	}
@@ -213,6 +229,19 @@ bool SystemScreen::handleInput(char c)
 				_task->toggleWakeOnMsg();
 				_task->showAlert(_task->getWakeOnMsg() ? "Wake on msg: ON" : "Wake on msg: OFF", 1000);
 				return true;
+#if MC_DISPLAY_ROTATE_SUPPORTED
+			case SYSDSP_ROTATE:
+				if (!_task->toggleDisplayRotate()) {
+					_task->showAlert("Rotate unsupported", 1500);
+					return true;
+				}
+				_task->showAlert(_task->getDisplayRotate() ? "Rotate 180: ON" : "Rotate 180: OFF", 1000);
+				return true;
+#endif
+			case SYSDSP_INPUT_ROTATE:
+				_task->toggleInputRotate();
+				_task->showAlert(_task->getInputRotate() ? "Flip input: ON" : "Flip input: OFF", 1000);
+				return true;
 			default: return false;
 			}
 		}
@@ -299,11 +328,31 @@ int SystemTimeScreen::render(JoystickDisplay &display)
 	display.setTextSize(1);
 	display.setColor(JoystickDisplay::GREEN);
 
-	char timeText[16], dateText[16];
-	formatUnixDateTime(_rtc->getCurrentTime(), timeText, sizeof(timeText), dateText, sizeof(dateText));
+	/* The RTC is UTC; the offset is applied here, at format time only.  It
+	 * must never reach the clock itself -- see NodePrefs::tz_offset. */
+	NodePrefs *prefs = _task->getPrefs();
+	int8_t tz = prefs ? prefs->tz_offset : 0;
+	uint32_t epoch = _rtc->getCurrentTime();
+
+	/* Before a sync getCurrentTime() returns bare uptime, and a negative
+	 * offset would underflow it into a garbage far-future date.  Same
+	 * "time is set" threshold (2025-01-01) the other UI uses. */
+	if (epoch > 1735689600) {
+		epoch += (int32_t)tz * 3600;
+	} else {
+		tz = 0;
+	}
+
+	char timeText[16], dateText[16], tzText[8];
+	formatUnixDateTime(epoch, timeText, sizeof(timeText), dateText, sizeof(dateText));
+	if (tz == 0) {
+		strcpy(tzText, "UTC");
+	} else {
+		snprintf(tzText, sizeof(tzText), "UTC%+d", (int)tz);
+	}
 
 	const char *labels[4] = { "Time:", "Date:", "TZ:", "Source:" };
-	const char *values[4] = { timeText, dateText, "UTC",
+	const char *values[4] = { timeText, dateText, tzText,
 							   time_sync_display_label() };
 	int y = kContentY + 2;
 	for (int i = 0; i < 4; i++) {
